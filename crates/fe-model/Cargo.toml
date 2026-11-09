@@ -1,0 +1,20 @@
+[package]
+name = "fe-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fe-cuda.workspace = true
+fe-site.workspace = true
+fe-exl3 = { path = "../fe-exl3" }
+fe-fp4 = { path = "../fe-fp4" }
+fe-fabric = { path = "../fe-fabric" }
+fe-gdn = { path = "../fe-gdn" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memmap2.workspace = true
+
+[build-dependencies]
+fe-kbuild.workspace = true

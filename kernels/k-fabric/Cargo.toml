@@ -1,0 +1,15 @@
+[package]
+name = "k-fabric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TP2 exchange kernels: RoCE one-shot gather-sum (stage, doorbell, wait, rank-ordered sum)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kcommon = { path = "../kcommon" }
+
+[lints]
+workspace = true

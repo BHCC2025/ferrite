@@ -1,0 +1,37 @@
+# Workspace version of crates/fe-server/Cargo.toml: when folding fe-server into the ferrite workspace,
+# `mv Cargo.workspace.toml Cargo.toml && rm Cargo.lock` in this directory.
+[package]
+name = "fe-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAI-compatible HTTP server for the ferrite inference engine"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+futures = "0.3.34"
+minijinja = { version = "3.0.5", features = ["json", "preserve_order", "loop_controls", "serde"] }
+minijinja-contrib = { version = "3.0.5", features = ["pycompat"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tokenizers.workspace = true
+fe-site.workspace = true
+fe-cuda = { workspace = true, optional = true }
+fe-model = { workspace = true, optional = true }
+fe-dflash = { path = "../fe-dflash", optional = true }
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-stream = "0.1.19"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[features]
+# --features ferrite: the real engine (core's fe_model::sched::Scheduler as --engine ferrite, and
+# fe-server's BatchEngine over fe_model::model::Engine as --engine ferrite-batch).
+ferrite = ["dep:fe-cuda", "dep:fe-model", "dep:fe-dflash"]
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,19 @@
+[package]
+name = "fe-dflash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DFlash2 block drafter (z-lab Qwen3.8-27B-DFlash2) for ferrite speculative decoding"
+
+[dependencies]
+fe-cuda.workspace = true
+fe-site.workspace = true
+fe-model.workspace = true
+fe-fp4 = { path = "../fe-fp4" }
+fe-fabric = { path = "../fe-fabric" }
+anyhow.workspace = true
+serde_json.workspace = true
+tokenizers.workspace = true
+
+[build-dependencies]
+fe-kbuild.workspace = true

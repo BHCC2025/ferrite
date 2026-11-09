@@ -1,0 +1,196 @@
+{
+ "title": "Ferrite on two DGX Sparks",
+ "subtitle": "QWEN3.8-27B  \u00b7  GREEDY  \u00b7  FIXED PROMPTS  \u00b7  MEDIANS OF 3 RUNS",
+ "fe_name": "Ferrite",
+ "grid": [
+  3,
+  2
+ ],
+ "contexts": [
+  2048,
+  8192,
+  32768,
+  65536,
+  122880
+ ],
+ "ctx_labels": [
+  "2K",
+  "8K",
+  "32K",
+  "64K",
+  "120K"
+ ],
+ "panels": [
+  {
+   "title": "Code generation, 1 request",
+   "unit": "tokens / second while generating",
+   "contexts": [
+    2048,
+    32768
+   ],
+   "ctx_labels": [
+    "2K",
+    "32K"
+   ],
+   "ystep": 100,
+   "ymax": 400.0,
+   "fe": [
+    [
+     273.4,
+     272.7,
+     274.7
+    ],
+    [
+     237.5,
+     226.6,
+     242.3
+    ]
+   ]
+  },
+  {
+   "title": "Code generation, 4 requests",
+   "unit": "tokens / second while generating, all four combined",
+   "contexts": [
+    2048,
+    32768
+   ],
+   "ctx_labels": [
+    "2K",
+    "32K"
+   ],
+   "ystep": 100,
+   "ymax": 600.0,
+   "fe": [
+    [
+     473.0,
+     463.5,
+     474.2
+    ],
+    [
+     339.6,
+     336.0,
+     346.5
+    ]
+   ]
+  },
+  {
+   "title": "Prompt processing",
+   "unit": "prompt tokens / second, cold cache",
+   "contexts": [
+    2048,
+    8192,
+    32768,
+    65536,
+    122880
+   ],
+   "ctx_labels": [
+    "2K",
+    "8K",
+    "32K",
+    "64K",
+    "120K"
+   ],
+   "ystep": 1000,
+   "ymax": 5000.0,
+   "fe": [
+    [
+     3544.4,
+     3481.8,
+     3571.8
+    ],
+    [
+     3334.6,
+     3319.8,
+     3354.2
+    ],
+    [
+     2798.9,
+     2794.3,
+     2810.6
+    ],
+    [
+     2321.4,
+     2320.6,
+     2325.6
+    ],
+    [
+     1792.4,
+     1792.4,
+     1794.4
+    ]
+   ]
+  },
+  {
+   "title": "Prose generation, 1 request",
+   "unit": "tokens / second, replies that don't echo the prompt",
+   "contexts": [
+    2048,
+    32768
+   ],
+   "ctx_labels": [
+    "2K",
+    "32K"
+   ],
+   "ystep": 20,
+   "ymax": 120.0,
+   "fe": [
+    [
+     76.5,
+     75.8,
+     78.9
+    ],
+    [
+     80.9,
+     71.5,
+     90.3
+    ]
+   ]
+  },
+  {
+   "title": "Prose generation, 4 requests",
+   "unit": "tokens / second per request, replies that don't echo",
+   "contexts": [
+    2048,
+    32768
+   ],
+   "ctx_labels": [
+    "2K",
+    "32K"
+   ],
+   "ystep": 20,
+   "ymax": 80.0,
+   "fe": [
+    [
+     50.8,
+     47.8,
+     52.4
+    ],
+    [
+     44.8,
+     44.2,
+     54.2
+    ]
+   ]
+  },
+  {
+   "type": "text",
+   "title": "Code edits",
+   "unit": "1,500 tokens, mostly copied from the prompt",
+   "lines": [
+    [
+     "1 request",
+     "582 tok/s"
+    ],
+    [
+     "4 requests",
+     "481 tok/s combined"
+    ]
+   ],
+   "foot": "the agent case: speculative decoding drafts the copied text"
+  }
+ ],
+ "method": "Medians of 3 runs (prose: replies that don't echo the prompt); bars: min to max. Generation rates leave out prompt processing.",
+ "method2": "Two DGX Sparks  \u00b7  Qwen3.8-27B: EXL3 3.0 bpw decode + NVFP4 prompt weights  \u00b7  DFlash2 + copy rows  \u00b7  4 x 128K  \u00b7  Nov 2026",
+ "kl": "KL vs BF16: code 0.021  \u00b7  text 0.040  \u00b7  16K 0.024",
+ "kl2": "lower is better  \u00b7  speculative decoding is lossless"
+}

@@ -1,0 +1,11 @@
+# Local site settings: copy this file to tools/site.local.sh (git ignores that name) and set what differs on your
+# machines. tools/site.sh reads it before its own defaults; FERRITE_SITE_FILE=/path/to/file names another file.
+# The values below are examples (192.0.2.0/24 is a documentation address range).
+
+# FERRITE_MODELS=/data/models                  # the folder holding the three model folders
+# FERRITE_PEER=peer-host                       # node B's ssh host (two-node mode)
+# FERRITE_TP_HOST=192.0.2.10                   # node A's address on the RoCE link (unset: detected from both nodes)
+# FERRITE_NET_IF=enp1s0f0np0                   # that link's interface (NCCL)
+# FERRITE_ROCE_HCA=rocep1s0f0,roceP2p1s0f0     # one or two RDMA devices on it
+# FERRITE_ROCE_GID=3                           # the RoCE v2 GID index of FERRITE_TP_HOST on them
+# FERRITE_NCCL_LIB=/opt/nccl/lib/libnccl.so.2  # when libnccl.so.2 is not on the loader path

@@ -1,0 +1,15 @@
+[package]
+name = "k-gdn-tp2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "k-gdn's chunked GDN kernels for one rank of a two-way head split (same source, halved dims)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kcommon = { path = "../kcommon" }
+
+[lints]
+workspace = true

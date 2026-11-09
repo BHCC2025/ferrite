@@ -1,0 +1,48 @@
+# Ferrite model manifest, read by scripts/fetch-models.sh.
+#   @ <folder> <repo> <revision> <role>   one line per model repository (folder = name under $FERRITE_MODELS)
+#   <folder> <file> <bytes> <sha256>      every file that is verified after the download
+# The NVFP4 and DFlash2 entries are the pinned upstream revisions (their safetensors hashes equal the Hub's LFS
+# sha256). The EXL3 entries describe the quant as it is uploaded: its folder as Ferrite was tested with it, README.md =
+# docs/model-card.md and a sha256sums.txt. scripts/hf-upload.sh stages that set and checks it against these lines
+# (--update-manifest rewrites them after the model card changes); pin the uploaded revision here.
+@ Qwen3.8-27B-EXL3-3.0bpw-mix BHCC2025/Qwen3.8-27B-EXL3-3.0bpw-mix 5ce0a825996da2ba9d2718cb4c089d071090c110 quant
+@ nvidia-Qwen3.8-27B-NVFP4 nvidia/Qwen3.8-27B-NVFP4 482ca0f3832238542f8f5295dde86b5f22711d80 prompt
+@ z-lab-Qwen3.8-27B-DFlash2 z-lab/Qwen3.8-27B-DFlash2 50307d4c4cde6860d4eee73e2547cd786fe8e8a4 draft
+Qwen3.8-27B-EXL3-3.0bpw-mix chat_template.jinja 8952 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041
+Qwen3.8-27B-EXL3-3.0bpw-mix config.json 4645 653674c4c2cf8d9e66d742b9ed67f895d527e1bc3104d3697fb680d7c27579de
+Qwen3.8-27B-EXL3-3.0bpw-mix generation_config.json 202 e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e
+Qwen3.8-27B-EXL3-3.0bpw-mix LICENSE 11544 bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a
+Qwen3.8-27B-EXL3-3.0bpw-mix merges.txt 3353259 a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d
+Qwen3.8-27B-EXL3-3.0bpw-mix model-00001-of-00002.safetensors 8580110225 284c49fa625086d45f0ab889425a1fd18bf1d77b971d70cfc03b6f2fd788a43d
+Qwen3.8-27B-EXL3-3.0bpw-mix model-00002-of-00002.safetensors 4729655777 37e2a1edc29f65cb4a051fc5c164ac7401d7080798517d9f3d6752c126852d8d
+Qwen3.8-27B-EXL3-3.0bpw-mix model.safetensors.index.json 295620 9b4254c540d63f0ee6a4f60a0f9ccd94949f62f6c693cd95108852e6625e3373
+Qwen3.8-27B-EXL3-3.0bpw-mix preprocessor_config.json 390 27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516
+Qwen3.8-27B-EXL3-3.0bpw-mix quantization_config.json 629064 7e5fc034d2fb0b4cea640e91dd0804c4cdbec958cc2432febf3fbb27cf4d4b65
+Qwen3.8-27B-EXL3-3.0bpw-mix README.md 12030 643e3b35df7f718ceda1af3f8eb08a423c5802e443430ed42acae477c397aed5
+Qwen3.8-27B-EXL3-3.0bpw-mix tokenizer_config.json 17928 b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27
+Qwen3.8-27B-EXL3-3.0bpw-mix tokenizer.json 12809320 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3
+Qwen3.8-27B-EXL3-3.0bpw-mix video_preprocessor_config.json 385 7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13
+Qwen3.8-27B-EXL3-3.0bpw-mix vocab.json 6722759 ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003
+Qwen3.8-27B-EXL3-3.0bpw-mix sha256sums.txt 1298 b58ec20bbbe40d50ae08450ee126a7a6b83d2d5ca5a3ab98b2c419fcf7bb84f7
+nvidia-Qwen3.8-27B-NVFP4 chat_template.jinja 8952 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041
+nvidia-Qwen3.8-27B-NVFP4 config.json 87506 71fa01bb64de20971045cd82a82c0ebb25a54e1b0a3f09ef23cf5479e9c54df8
+nvidia-Qwen3.8-27B-NVFP4 generation_config.json 214 8a3a817a9d330f6f9e62f048fe62a48594946c4a5c4cb314a8011316d5094986
+nvidia-Qwen3.8-27B-NVFP4 .gitattributes 1570 34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930
+nvidia-Qwen3.8-27B-NVFP4 hf_quant_config.json 53760 5f4aaa9e462ddb26a9790ab459eee69d100b9ade7541f0c86038e925c013f80b
+nvidia-Qwen3.8-27B-NVFP4 LICENSE 11544 bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a
+nvidia-Qwen3.8-27B-NVFP4 merges.txt 3353259 a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d
+nvidia-Qwen3.8-27B-NVFP4 model-00001-of-00003.safetensors 9965652544 7d0fd155118901373eb0fd13ed3aae68f95be747bc205be72ebc41739c25ee80
+nvidia-Qwen3.8-27B-NVFP4 model-00002-of-00003.safetensors 9985757064 98a7e9486baa860c792c9463a770cb9d017696bdd17606300a5b9334149f4c27
+nvidia-Qwen3.8-27B-NVFP4 model-00003-of-00003.safetensors 1970287672 0506ad35dc21469708e7813bd76c592cef08bd0317b4a1fe899745ebe2435271
+nvidia-Qwen3.8-27B-NVFP4 model.safetensors.index.json 214866 7aa103a2582b7d26631988de33dea19e8a308ee9c239e8e14feb374af30905e2
+nvidia-Qwen3.8-27B-NVFP4 preprocessor_config.json 390 27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516
+nvidia-Qwen3.8-27B-NVFP4 processor_config.json 1191 d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1
+nvidia-Qwen3.8-27B-NVFP4 README.md 9578 2dc5368ce2dda4393818fc3c6e587d588ec7b7f599b1f3a326d97dc271e3866d
+nvidia-Qwen3.8-27B-NVFP4 tokenizer_config.json 1121 e5d078b00e6c1223b32444db8c1001dc71d86ceef8ee706b5bf084c3a43a1f9c
+nvidia-Qwen3.8-27B-NVFP4 tokenizer.json 12809320 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3
+nvidia-Qwen3.8-27B-NVFP4 video_preprocessor_config.json 385 7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13
+nvidia-Qwen3.8-27B-NVFP4 vocab.json 6722759 ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003
+z-lab-Qwen3.8-27B-DFlash2 config.json 1239 873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980
+z-lab-Qwen3.8-27B-DFlash2 .gitattributes 1581 8e63f02a5caa4dbc92838d44dddcfa2c1b76f355503fcbeaa3d6512f7fe132ef
+z-lab-Qwen3.8-27B-DFlash2 model.safetensors 3848817896 67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c
+z-lab-Qwen3.8-27B-DFlash2 README.md 5397 0c06405ffff835f4da26115114a6dd7bb4a8b8a6881c17edd3a1086a99281269

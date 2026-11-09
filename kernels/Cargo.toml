@@ -1,0 +1,31 @@
+# GPU kernel workspace (nvptx64-nvidia-cuda, nightly). Built by crates/fe-kbuild from the host build scripts;
+# never part of the host workspace. Every kernels/k-* crate is one PTX module (one owner each).
+[workspace]
+resolver = "3"
+members = ["kcommon", "k-*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "allow"
+static_mut_refs = "allow"
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+incremental = false
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+panic = "abort"

@@ -1,0 +1,14 @@
+[package]
+name = "k-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kcommon = { path = "../kcommon" }
+
+[lints]
+workspace = true

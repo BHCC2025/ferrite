@@ -1,0 +1,8 @@
+[package]
+name = "fe-site"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Site settings (model folders, the TP2 fabric) from FERRITE_* environment variables, with defaults."
+
+[dependencies]

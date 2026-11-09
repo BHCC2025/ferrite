@@ -1,0 +1,15 @@
+[package]
+name = "k-core-tp2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "k-core attention / GDN kernels for one rank of a two-way head split (same sources, halved dims)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kcommon = { path = "../kcommon" }
+
+[lints]
+workspace = true

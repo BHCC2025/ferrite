@@ -1,0 +1,27 @@
+# Host workspace. GPU kernels live in kernels/ (a separate nightly nvptx workspace built by crates/fe-kbuild).
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["kernels"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+fe-cuda = { path = "crates/fe-cuda" }
+fe-kbuild = { path = "crates/fe-kbuild" }
+fe-model = { path = "crates/fe-model" }
+fe-site = { path = "crates/fe-site" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+codegen-units = 16

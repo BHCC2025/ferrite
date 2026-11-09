@@ -1,0 +1,15 @@
+[package]
+name = "fe-gdn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chunked gated-delta-rule recurrence for GDN prompt rows (Rust kernels in kernels/k-gdn)"
+
+[dependencies]
+fe-cuda.workspace = true
+fe-site.workspace = true
+anyhow.workspace = true
+fe-fp4 = { path = "../fe-fp4" }
+
+[build-dependencies]
+fe-kbuild.workspace = true

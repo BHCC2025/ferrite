@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferrite: a Rust inference engine for DGX Spark</title>
+<meta name="description" content="Ferrite is an LLM inference engine for NVIDIA DGX Spark, written in Rust from the HTTP server down to the GPU kernels. It serves Qwen3.8-27B on one Spark or two over RoCE behind an OpenAI-compatible API.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fffaf6" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f0907" media="(prefers-color-scheme: dark)">
+<link rel="canonical" href="https://bhcc2025.github.io/ferrite/">
+<link rel="icon" href="assets/ferrite-mark.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/site.css">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Ferrite: a Rust inference engine for DGX Spark">
+<meta property="og:description" content="Rust from the HTTP server down to the GPU kernels. Qwen3.8-27B on one or two DGX Sparks, OpenAI-compatible API.">
+<meta property="og:url" content="https://bhcc2025.github.io/ferrite/">
+<meta property="og:image" content="https://bhcc2025.github.io/ferrite/assets/ferrite-social-preview-1280x640.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="assets/ferrite-mark.svg" alt="" width="30" height="30">ferrite</a>
+    <nav class="nav" aria-label="Sections">
+      <a href="#design">Design</a>
+      <a href="#numbers">Numbers</a>
+      <a href="#agents">Agents</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="#credits">Credits</a>
+      <a href="https://github.com/BHCC2025/ferrite">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <div class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Inference engine &middot; NVIDIA DGX Spark</p>
+      <h1>Rust <span class="grad">all the way down.</span></h1>
+      <p class="lead"><strong>Ferrite</strong> is an LLM inference engine for NVIDIA DGX Spark (GB10), written in Rust from the
+        HTTP server down to the GPU kernels. It serves <strong>Qwen3.8-27B</strong> on one Spark or across two connected over
+        RoCE, behind an OpenAI-compatible API with streaming, thinking, tool calls, a prompt cache and 128K context.</p>
+      <div class="actions">
+        <a class="btn primary" href="#quickstart">Quickstart</a>
+        <a class="btn" href="https://github.com/BHCC2025/ferrite">Source on GitHub</a>
+        <a class="btn" href="#numbers">Measured numbers</a>
+      </div>
+      <ul class="tags" aria-label="At a glance">
+        <li>Rust GPU kernels</li>
+        <li>sm_121a</li>
+        <li>EXL3 3.0 bpw</li>
+        <li>NVFP4 prompts</li>
+        <li>DFlash2</li>
+        <li>TP2 over RoCE</li>
+        <li>Apache-2.0</li>
+      </ul>
+      <figure class="banner">
+        <img src="assets/ferrite-banner.png" alt="ferrite: a Rust inference engine, down to the GPU kernels. Qwen3.8-27B on NVIDIA DGX Spark, one or two nodes: 473 tok/s code with 4 streams, 582 tok/s code edits, 128K context, KL 0.021 against BF16.">
+      </figure>
+      <p class="note"><strong>Status: experimental.</strong> One model (Qwen3.8-27B), one GPU (GB10, <code>sm_121a</code>).
+        At most 4 requests run at once with DFlash2 drafting; more wait in a queue. It works, but expect rough edges.
+        Issues and measurements from other Sparks are welcome.</p>
+    </div>
+  </div>
+
+  <section id="why" aria-labelledby="why-h">
+    <div class="wrap why">
+      <div>
+        <p class="kicker">Why it exists</p>
+        <h2 id="why-h">How far down can Rust go?</h2>
+        <p>Ferrite started as an experiment by a <a href="https://github.com/ashhart/TensorFold">TensorFold</a> contributor:
+          how far down the stack can Rust go in a real inference engine, all the way into the GPU kernels, and what does it
+          cost? Much of what makes Ferrite work was learned from TensorFold and exllamav3 first.</p>
+        <p>If you want a mature engine that serves many models, use TensorFold. Ferrite is a focused, single-model look at
+          the Rust question.</p>
+      </div>
+      <div class="card">
+        <h3>What is Rust, and what is not</h3>
+        <p><strong>Rust:</strong> every GPU kernel, the CUDA driver bindings, the model and scheduler, speculative decoding,
+          the two-node fabric (RDMA over libibverbs), the tokenizer and the HTTP server.</p>
+        <p><strong>Not Rust:</strong> NVIDIA's <code>ptxas</code> assembler (at build time), the CUDA driver itself,
+          libibverbs, and NCCL for two-node prompt batches. The full ledger, with reasons and replacement plans, is in
+          <a href="https://github.com/BHCC2025/ferrite/blob/main/NON-RUST.md">NON-RUST.md</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="design" aria-labelledby="design-h">
+    <div class="wrap">
+      <p class="kicker">Design</p>
+      <h2 id="design-h">From a Rust crate to a GB10 kernel</h2>
+      <p class="intro">The kernels are ordinary Rust crates. rustc's <code>nvptx64-nvidia-cuda</code> backend turns them into
+        PTX, NVIDIA's <code>ptxas</code> assembles that for <code>sm_121a</code>, and the cubins are embedded in the server
+        binary and launched through a thin Rust binding to the CUDA driver.</p>
+      <ol class="pipeline" aria-label="Kernel build pipeline">
+        <li><b>kernels/k-*</b><span>GPU kernels as Rust crates</span></li>
+        <li><b>rustc nvptx64</b><span>nightly toolchain, target-cpu sm_121a</span></li>
+        <li><b>PTX</b><span>one module per kernel crate</span></li>
+        <li><b>ptxas -arch=sm_121a</b><span>CUDA 13, build time only</span></li>
+        <li><b>fe-server</b><span>cubins embedded, launched via the CUDA driver API</span></li>
+      </ol>
+
+      <div class="cards">
+        <article class="card">
+          <h3><span class="n">01</span>EXL3 decode GEMVs</h3>
+          <p>Decode reads Qwen3.8-27B as an EXL3 quant at 3.0 bits per weight (a mixed-width quant with a 5-bit head) at
+            about 90% of GB10's memory bandwidth.</p>
+          <p>The matrix-vector kernels batch up to 48 rows into one weight decode, and every row stays bit-identical to
+            single-row decoding.</p>
+        </article>
+        <article class="card">
+          <h3><span class="n">02</span>NVFP4 / FP8 prompt GEMMs</h3>
+          <p>Prompts run through NVIDIA's NVFP4/FP8 checkpoint on tensor-core GEMMs written in Rust (block-scaled
+            <code>mma.sync</code>: NVFP4 with ue4m3 block scales, FP8 e4m3), with the activation quantizers on the
+            GPU too.</p>
+          <p>Without that checkpoint, Ferrite rebuilds bf16 prompt weights from the EXL3 quant.</p>
+        </article>
+        <article class="card">
+          <h3><span class="n">03</span>Chunked Gated DeltaNet</h3>
+          <p>Qwen3.8's linear-attention layers carry a recurrent state per request. Prompt rows go through them in chunks
+            of 32 rows, using the chunkwise WY / UT form of the delta rule on TF32 tensor cores (a 3xTF32 split for
+            fp32 accuracy), and the state is written back for decoding.</p>
+        </article>
+        <article class="card">
+          <h3><span class="n">04</span>DFlash2 verify trees and copy rows</h3>
+          <p>Lossless speculative decoding. The DFlash2 block drafter proposes tokens that are verified as best-first trees
+            in one pass of the big model.</p>
+          <p>Copy rows propose the continuation of earlier text, which pays off most on code edits. The model's own MTP
+            head is the fallback.</p>
+        </article>
+        <article class="card">
+          <h3><span class="n">05</span>Two Sparks over RoCE</h3>
+          <p>With two nodes, each Spark holds half of every layer. Small reductions go over RDMA through a Rust proxy
+            kernel, and NCCL takes the large prompt batches. Node A runs the server, node B follows.</p>
+        </article>
+        <article class="card">
+          <h3><span class="n">06</span>OpenAI-compatible server</h3>
+          <p>Chat completions with streaming, thinking on or off, tool calls, 128K context and up to 4 requests at once
+            (more wait in a queue). Any OpenAI-compatible client works: Open WebUI, Continue, Cline and other coding
+            agents.</p>
+          <p>A request's output does not depend on what else is running, and speculation never changes the text. Both
+            are checked before every merge.</p>
+        </article>
+        <article class="card">
+          <h3><span class="n">07</span>Prompt cache for agents</h3>
+          <p>Each conversation is snapshotted at turn boundaries and resumes from the longest match. A conversation
+            that loses its slot is parked in a memory pool, and a system prompt shared by several agents is computed
+            once.</p>
+          <p>Prompts are cut at the same points with or without a resume, so a resumed reply is the same, token for
+            token, as one computed in full.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section id="numbers" aria-labelledby="numbers-h">
+    <div class="wrap">
+      <p class="kicker">Measured</p>
+      <h2 id="numbers-h">Ferrite's numbers</h2>
+      <p class="intro">Two DGX Sparks connected over RoCE, Qwen3.8-27B, greedy decoding, fixed prompts. Medians of 3-5
+        runs. Generation figures are tokens per second while generating; prompt processing is listed separately.
+        End-to-end figures that include the time to the first token are in
+        <a href="https://github.com/BHCC2025/ferrite/blob/main/docs/benchmarks.md#results">docs/benchmarks.md</a>.</p>
+
+      <div class="stats">
+        <div class="stat"><div class="v">473<small>tok/s</small></div><div class="k">Code, 4 requests (aggregate)</div></div>
+        <div class="stat"><div class="v">273<small>tok/s</small></div><div class="k">Code, 1 request</div></div>
+        <div class="stat"><div class="v">582<small>tok/s</small></div><div class="k">Code edits, 1 request</div></div>
+        <div class="stat"><div class="v">~3,550<small>tok/s</small></div><div class="k">Prompt processing, 2K context</div></div>
+        <div class="stat"><div class="v">0.021</div><div class="k">KL divergence vs BF16, code (lower is better)</div></div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th scope="col">Workload</th><th scope="col" class="num">Ferrite</th></tr></thead>
+          <tbody>
+            <tr><td>Code, 4 requests (aggregate)</td><td class="num">473</td></tr>
+            <tr><td>Code, 1 request</td><td class="num">273</td></tr>
+            <tr><td>Code, 1 request, 32K context</td><td class="num">238</td></tr>
+            <tr><td>Code edits, 1 request (rewrite a file it was shown)</td><td class="num">582</td></tr>
+            <tr><td>Code edits, 4 requests (aggregate)</td><td class="num">481</td></tr>
+            <tr><td>Prose, 1 request</td><td class="num">76</td></tr>
+            <tr><td>Prompt processing, 2K / 32K context</td><td class="num">~3,550 / ~2,800</td></tr>
+            <tr><td>KL divergence vs BF16 (code / text / 16K context), lower is better</td><td class="num">0.021 / 0.040 / 0.024</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <figure class="figure">
+        <img src="assets/ferrite-bench.png" alt="Ferrite speed by context length on two DGX Sparks: code generation with 1 and 4 requests, prose generation with 1 request, and prompt processing, in tokens per second.">
+      </figure>
+      <p class="caption">Speed by context length. Medians, with the minimum and maximum as bars.</p>
+
+      <div class="two-col">
+        <div>
+          <h3>Reading these numbers</h3>
+          <ul class="plain">
+            <li>Speculative decoding speed depends on the text. Code and edits are faster than prose.</li>
+            <li>The prose figure counts only replies that don't fall into echoing the prompt, which the standard benchmark
+              prose prompt tends to cause.</li>
+            <li>Sampling (temperature above 0) accepts fewer drafted tokens than greedy decoding.</li>
+            <li>On a single Spark, generation runs at roughly half to two-thirds of the two-node speed: about 208 tok/s for
+              4-request code with prompt processing counted in (313 on two Sparks, counted the same way).</li>
+          </ul>
+        </div>
+        <div>
+          <h3>How they were measured</h3>
+          <p class="muted">One request's generation is timed from its first token to its last (500 tokens); four
+            requests give their combined rate after the last one's first token. Prompt processing is timed to the first
+            token with a cold prompt cache, and accuracy is the KL divergence of the next-token distribution against
+            the BF16 model over fixed code, text and long-context sequences. The method, the clients and how to reproduce
+            them are in <a href="https://github.com/BHCC2025/ferrite/blob/main/docs/benchmarks.md">docs/benchmarks.md</a>.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="agents" aria-labelledby="agents-h">
+    <div class="wrap">
+      <p class="kicker">Agents</p>
+      <h2 id="agents-h">The prompt cache at work</h2>
+      <p class="intro">Four coding agents at once on two Sparks, sharing a ~13K-token system prompt and running 2-3 turns
+        each (<code>tools/bench/agents.py</code>), with the prompt cache on instead of off. The cache is on by default;
+        <code>FERRITE_CACHE=0</code> turns it off. Its park pool is 12 GB on one Spark and 24 GB on each of two
+        (<code>FERRITE_PARK_GB</code> overrides), and it shrinks if needed to keep 20 GB of memory available.</p>
+      <div class="stats">
+        <div class="stat"><div class="v">-74%</div><div class="k">Prompt tokens computed (thinking on: -86%)</div></div>
+        <div class="stat"><div class="v">5.1<small>s</small></div><div class="k">First turn, time to first token (was 16.4 s)</div></div>
+        <div class="stat"><div class="v">0.4-0.6<small>s</small></div><div class="k">Later turns, time to first token</div></div>
+        <div class="stat"><div class="v">92<small>tok/s</small></div><div class="k">Combined output (was 46.5; thinking on: 36.9 to 108)</div></div>
+      </div>
+      <p class="muted">How it works, what it guarantees and its limits are in
+        <a href="https://github.com/BHCC2025/ferrite/blob/main/docs/prompt-cache.md">docs/prompt-cache.md</a>.</p>
+    </div>
+  </section>
+
+  <section id="quickstart" aria-labelledby="quickstart-h">
+    <div class="wrap">
+      <p class="kicker">Quickstart</p>
+      <h2 id="quickstart-h">Serve Qwen3.8-27B on a Spark</h2>
+      <p class="intro">Needs a DGX Spark (GB10) with DGX OS, NVIDIA driver 580+, at least 95 GB of available memory and
+        38 GB of disk. One command takes a fresh Spark to a running server: it checks the machine, installs Ferrite and
+        the models, starts the server and tests it. No <code>sudo</code>, and it can be run again.</p>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash</code></pre>
+      <p class="note"><strong>Install with your AI agent.</strong> Paste this into your coding agent on the Spark:<br>
+        <code>Install Ferrite on this DGX Spark by following https://github.com/BHCC2025/ferrite/blob/main/AGENTS.md exactly; stop and ask me if any check fails.</code></p>
+      <p class="muted">Or step by step, from the release tarball (no Rust or CUDA toolchain needed):</p>
+<pre><code><span class="c"># 1. unpack the release and check the machine</span>
+tar xzf ferrite-&lt;version&gt;-dgx-spark-aarch64.tar.gz
+cd ferrite-&lt;version&gt;-dgx-spark-aarch64
+scripts/check-deps.sh
+
+<span class="c"># 2. download the models (about 38 GB) into $FERRITE_MODELS</span>
+export FERRITE_MODELS=$HOME/models
+scripts/fetch-models.sh
+
+<span class="c"># 3. serve an OpenAI-compatible API on :8000 (model id "spark")</span>
+scripts/serve.sh
+curl -s localhost:8000/v1/models</code></pre>
+
+      <div class="two-col">
+        <div>
+          <h3>Two Sparks</h3>
+          <p class="muted">Same Ferrite folder and model folders on both nodes, passwordless ssh from node A to node B,
+            NCCL on both. Then on node A:</p>
+<pre><code>FERRITE_PEER=&lt;node-b&gt; tools/serve-tp2.sh</code></pre>
+          <p class="muted">The two-node scripts detect the RoCE devices, interface and GID the nodes share;
+            <code>tools/site.sh</code> prints every resolved setting.</p>
+        </div>
+        <div>
+          <h3>Build from source</h3>
+          <p class="muted">Stable Rust for the host crates, the kernels' pinned nightly (<code>nightly-2026-11-04</code>)
+            with <code>rust-src</code>, <code>llvm-tools</code> and <code>llvm-bitcode-linker</code>, and CUDA 13's
+            <code>ptxas</code>. The check script installs the Rust toolchains.</p>
+<pre><code>scripts/check-deps.sh --build --install
+cargo build --release -p fe-server --features ferrite -p fe-cli</code></pre>
+        </div>
+      </div>
+      <p>Point any OpenAI-compatible client at <code>http://&lt;spark&gt;:8000/v1</code>. The full guide, with every setting,
+        client examples and troubleshooting, is in
+        <a href="https://github.com/BHCC2025/ferrite/blob/main/docs/quickstart.md">docs/quickstart.md</a>.</p>
+
+      <h3 id="models">Models</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th scope="col">Role</th><th scope="col">Hugging Face repository</th></tr></thead>
+          <tbody>
+            <tr><td>Decode weights: EXL3 mixed 3.0 bpw (5-bit head)</td>
+              <td><a href="https://huggingface.co/BHCC2025/Qwen3.8-27B-EXL3-3.0bpw-mix"><code>BHCC2025/Qwen3.8-27B-EXL3-3.0bpw-mix</code></a></td></tr>
+            <tr><td>Prompt weights: NVFP4/FP8 (optional)</td>
+              <td><a href="https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4"><code>nvidia/Qwen3.8-27B-NVFP4</code></a></td></tr>
+            <tr><td>Draft model: DFlash2</td>
+              <td><a href="https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2"><code>z-lab/Qwen3.8-27B-DFlash2</code></a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">All three are Apache-2.0 and derive from
+        <a href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen/Qwen3.8-27B</a> (Apache-2.0). Without the NVIDIA
+        checkpoint, Ferrite processes prompts with bf16 weights rebuilt from the EXL3 quant, at about half the prompt
+        speed.</p>
+    </div>
+  </section>
+
+  <section id="credits" aria-labelledby="credits-h">
+    <div class="wrap">
+      <p class="kicker">Credits</p>
+      <h2 id="credits-h">Built on other people's work</h2>
+      <p class="intro">Ferrite stands on a lot of other people's work.
+        <a href="https://github.com/BHCC2025/ferrite/blob/main/CREDITS.md">CREDITS.md</a> lists every project and
+        paper it drew on and exactly what it took from each. The largest debts:</p>
+      <ul class="credits">
+        <li class="first"><b><a href="https://github.com/ashhart/TensorFold">TensorFold</a></b>
+          <span>Ferrite grew out of work on TensorFold. Its kernel designs, the hybrid of NVFP4 prompt processing with EXL3
+            decode, the DFlash2 verify tree and copy rows all came from there, as did much of the two-Spark approach.
+            Thank you.</span></li>
+        <li><b><a href="https://github.com/turboderp-org/exllamav3">exllamav3</a></b>
+          <span>The EXL3 format, its kernels and the quantization tools, plus the QTIP trellis quantization it builds
+            on.</span></li>
+        <li><b><a href="https://github.com/z-lab/dflash">DFlash2</a></b>
+          <span>By z-lab and inco.ai: the block draft model behind the speculative decoding.</span></li>
+        <li><b><a href="https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4">NVIDIA NVFP4 checkpoint</a></b>
+          <span>The NVFP4/FP8 prompt weights, made with NVIDIA Model Optimizer.</span></li>
+        <li><b><a href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen3.8</a></b>
+          <span>The model itself, by the Qwen team.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="license" aria-labelledby="license-h">
+    <div class="wrap">
+      <h2 id="license-h">License</h2>
+      <p>Ferrite is licensed under Apache-2.0. See
+        <a href="https://github.com/BHCC2025/ferrite/blob/main/LICENSE">LICENSE</a> and
+        <a href="https://github.com/BHCC2025/ferrite/blob/main/NOTICE">NOTICE</a>, which carries the notices of the
+        projects Ferrite builds on.</p>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <span>&copy; 2026 The Ferrite Authors &middot; Apache-2.0</span>
+    <nav aria-label="Project links">
+      <a href="https://github.com/BHCC2025/ferrite">GitHub</a>
+      <a href="https://github.com/BHCC2025/ferrite/blob/main/docs/quickstart.md">Quickstart</a>
+      <a href="https://github.com/BHCC2025/ferrite/blob/main/docs/benchmarks.md">Benchmarks</a>
+      <a href="https://github.com/BHCC2025/ferrite/blob/main/CREDITS.md">Credits</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

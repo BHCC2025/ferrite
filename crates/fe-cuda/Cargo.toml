@@ -1,0 +1,8 @@
+[package]
+name = "fe-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thin owned bindings to the CUDA driver API (libcuda)."
+
+[dependencies]

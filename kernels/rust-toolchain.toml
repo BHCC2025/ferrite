@@ -1,0 +1,7 @@
+# The GPU kernels build with this exact nightly: rustc 1.101.0-nightly (708c94ef0 2026-11-03). The nvptx backend and
+# the build-std / asm features they use move between nightlies, so the date is pinned; scripts/check-deps.sh --build
+# checks it (--install installs it with the components and target below).
+[toolchain]
+channel = "nightly-2026-11-04"
+components = ["rust-src", "llvm-tools", "llvm-bitcode-linker"]
+targets = ["nvptx64-nvidia-cuda"]

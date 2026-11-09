@@ -1,0 +1,16 @@
+[package]
+name = "fe-fabric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TP2 collectives between the two Sparks: TCP bootstrap, NCCL baseline, RoCE one-shot path"
+
+[dependencies]
+fe-cuda.workspace = true
+fe-site.workspace = true
+fe-exl3 = { path = "../fe-exl3" }
+anyhow.workspace = true
+libc = "0.2"
+
+[build-dependencies]
+fe-kbuild.workspace = true

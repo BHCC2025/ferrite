@@ -1,0 +1,15 @@
+[package]
+name = "fe-fp4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NVFP4 / FP8 prompt (prefill) linears: ModelOpt checkpoint loading, CPU reference, Rust GEMM kernels, cuBLASLt baseline"
+
+[dependencies]
+fe-cuda.workspace = true
+fe-site.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+fe-kbuild.workspace = true

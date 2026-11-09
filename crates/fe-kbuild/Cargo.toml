@@ -1,0 +1,6 @@
+[package]
+name = "fe-kbuild"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Build-script helper: compile a kernels/k-* crate to PTX (nightly nvptx) and assemble it to a cubin."
