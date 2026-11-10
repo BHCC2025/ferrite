@@ -1,0 +1,9 @@
+[package]
+name = "kxcommon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Device-side helpers for the Rust Xe2 (B70) kernels: ids, sub-groups, SLM + barriers, block IO, DPAS, 2D block IO, conversions, math."
+
+[lints]
+workspace = true

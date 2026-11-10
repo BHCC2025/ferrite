@@ -1,0 +1,28 @@
+[package]
+name = "fe-xe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3.8-27B forward on the Intel Arc Pro B70 (Level Zero + Rust SPIR-V kernels, XQ weights)"
+publish = false
+
+# Host crate. The device runtime is fe-ze (Level Zero, dlopen'ed: builds without the GPU); kernels come from kernels-xe as SPIR-V.
+# Nothing here links CUDA: `cargo build -p fe-xe` builds on a machine without it.
+[dependencies]
+fe-xq = { path = "../fe-xq" }
+fe-ze = { path = "../fe-ze" }
+# crates/fe-model/src/config.rs (included by path) reads the site settings
+fe-site.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+# musl-derived f32 cos / sin: bit-identical to Zig's, which arc-engine's RoPE tables use (src/rope.rs)
+libm = "0.2"
+
+[build-dependencies]
+# kernels-xe (kx-core, kx-xq) -> SPIR-V, embedded by src/kx.rs
+fe-kbuild-xe = { path = "../fe-kbuild-xe" }
+
+[features]
+# Test only: run the forward on arc-engine's reference SPIR-V (kernels/xpu/*.spv) to validate the host side bit for bit against the
+# oracle and to swap Rust kernels in one at a time. Never the engine path (NON-RUST.md).
+ref-spv = []

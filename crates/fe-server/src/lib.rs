@@ -19,3 +19,5 @@ pub mod template;
 pub mod tokenizer;
 pub mod toolcall;
 pub mod util;
+#[cfg(feature = "xe")]
+pub mod xe;

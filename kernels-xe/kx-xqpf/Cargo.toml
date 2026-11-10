@@ -1,0 +1,15 @@
+[package]
+name = "kx-xqpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "XQ prompt-window GEMM (Rust port of arc-engine xq_pfg.cl): pre-scaled fp16 W x k-major fp16 Xt on DPAS, work-group tiled; 256-GRF build."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kxcommon = { path = "../kxcommon" }
+
+[lints]
+workspace = true

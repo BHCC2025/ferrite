@@ -169,6 +169,20 @@ async fn chat_thinking_off() {
 }
 
 #[tokio::test]
+async fn no_timings_key_without_engine_timings() {
+    // the mock (like the CUDA engines) reports no timings: no `timings` key anywhere, stream or not
+    let Some(s) = state() else { return };
+    let body = json!({"messages": [{"role": "user", "content": "hello"}]});
+    let full = post_json(&s, "/v1/chat/completions", body.clone()).await;
+    assert!(full.get("timings").is_none());
+    let mut sb = body.clone();
+    sb["stream"] = json!(true);
+    sb["stream_options"] = json!({"include_usage": true});
+    let (_, bytes) = post(&s, "/v1/chat/completions", sb).await;
+    assert!(!String::from_utf8_lossy(&bytes).contains("timings"));
+}
+
+#[tokio::test]
 async fn chat_stream_matches_non_stream() {
     let Some(s) = state() else { return };
     let body = json!({"messages": [{"role": "system", "content": "Be nice."}, {"role": "user", "content": "Ünïcödé please"}]});

@@ -1,0 +1,33 @@
+# GPU kernel workspace for the Intel Arc Pro B70 (Xe2). Rust kernels are compiled by the pinned nightly for the
+# amdgcn-amd-amdhsa *carrier* target (LLVM bitcode only), then crates/fe-kbuild-xe retargets the IR to spirv64 and
+# llvm-spirv makes the Level Zero SPIR-V module. Never part of the host workspace. One kx-* crate = one SPIR-V module.
+[workspace]
+resolver = "3"
+members = ["kxcommon", "kx-*"]
+
+[workspace.package]
+license = "Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "allow"
+static_mut_refs = "allow"
+improper_ctypes = "allow"
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+incremental = false
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+panic = "abort"

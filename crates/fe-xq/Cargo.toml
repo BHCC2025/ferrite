@@ -1,0 +1,13 @@
+[package]
+name = "fe-xq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "XQ weight format (Intel Arc B70): checkpoint loader, device packing, CPU reference"
+publish = false
+
+# Host-only: no GPU runtime, no CUDA. fe-xe uploads what this crate packs.
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+memmap2.workspace = true

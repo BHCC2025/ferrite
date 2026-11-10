@@ -100,7 +100,7 @@ async fn serve(args: Args) -> Result<()> {
             },
         ))
     } else {
-        if args.engine == "fake" { fake_engine(&args, &tok)? } else { real_engine(&args)? }
+        if args.engine == "fake" { fake_engine(&args, &tok)? } else if args.engine == "xe" || args.engine == "xe-batch" { xe_engine(&args)? } else { real_engine(&args)? }
     };
     let info = engine.info();
     let cfg = ServerConfig {
@@ -172,6 +172,27 @@ fn real_engine(args: &Args) -> Result<Arc<dyn Engine>> {
 fn real_engine(_: &Args) -> Result<Arc<dyn Engine>> {
     bail!("this fe-server was built without the real engine: run with --mock, or build inside the ferrite \
            workspace with --features ferrite (see README)")
+}
+
+/// `--engine xe`: the Intel Arc B70 engine (fe-xe), shaped like arc-engine's server (fe_server::xe::XeEngine); `--engine xe-batch`: fe-xe behind the
+/// BatchEngine (one slot, prompt windows of --prefill-chunk rows, plain decode).
+#[cfg(feature = "xe")]
+fn xe_engine(args: &Args) -> Result<Arc<dyn Engine>> {
+    use fe_server::batch::{BatchConfig, BatchEngine};
+    let dir = args.weights_dir.clone().unwrap_or_else(|| args.model_dir.clone());
+    let (ctx, rcap) = (args.max_model_len, args.prefill_chunk.clamp(16, 4096));
+    if args.engine == "xe" {
+        // arc-engine's serving shape: FIFO, GDN-state checkpoints, speculative decoding (env: FE_XE_K, FE_XE_CKPT_SLOTS, MTP_DHEAD)
+        let opts = fe_server::xe::XeOpts::from_env(ctx, rcap)?;
+        return Ok(Arc::new(fe_server::xe::XeEngine::start(&dir, opts)?));
+    }
+    let cfg = BatchConfig { name: "xe-batch".into(), prefill_chunk: rcap };
+    Ok(Arc::new(BatchEngine::spawn(cfg, move || fe_server::xe::XeModel::load(&dir, ctx, rcap))?))
+}
+
+#[cfg(not(feature = "xe"))]
+fn xe_engine(_: &Args) -> Result<Arc<dyn Engine>> {
+    bail!("this fe-server was built without the B70 engine: build with --features xe")
 }
 
 async fn shutdown() {

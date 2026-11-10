@@ -1,0 +1,10 @@
+[package]
+name = "fe-kbuild-xe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Build-script helper: compile a kernels-xe/kx-* crate (Rust, nightly, amdgcn carrier IR) to OpenCL-flavour SPIR-V for Level Zero."
+
+[[bin]]
+name = "kbuild-xe"
+path = "src/main.rs"

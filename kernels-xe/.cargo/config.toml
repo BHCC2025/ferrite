@@ -1,0 +1,11 @@
+# Carrier target: rustc's LLVM has no SPIR-V backend. gfx1100 is arbitrary (no AMD code is ever used). rustc runs no LLVM
+# passes (-C no-prepopulate-passes): fe-kbuild-xe optimizes the IR for spirv64 after the retarget. Panics abort in
+# place (no formatting machinery, no function pointers in the module).
+[build]
+target = "amdgcn-amd-amdhsa"
+
+[target.amdgcn-amd-amdhsa]
+rustflags = ["-C", "target-cpu=gfx1100", "--emit=llvm-bc", "-C", "no-prepopulate-passes", "-Zunstable-options", "-Cpanic=immediate-abort"]
+
+[unstable]
+build-std = ["core"]

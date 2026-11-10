@@ -22,6 +22,8 @@ fe-site.workspace = true
 fe-cuda = { workspace = true, optional = true }
 fe-model = { workspace = true, optional = true }
 fe-dflash = { path = "../fe-dflash", optional = true }
+fe-xe = { path = "../fe-xe", optional = true }
+fe-xdf = { path = "../fe-xdf", optional = true }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = "0.1.19"
 tracing = "0.1.44"
@@ -31,6 +33,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # --features ferrite: the real engine (core's fe_model::sched::Scheduler as --engine ferrite, and
 # fe-server's BatchEngine over fe_model::model::Engine as --engine ferrite-batch).
 ferrite = ["dep:fe-cuda", "dep:fe-model", "dep:fe-dflash"]
+# --features xe: the Intel Arc B70 engine (crates/fe-xe) as --engine xe; xe-ref adds arc-engine reference kernels (test only)
+xe = ["dep:fe-xe", "dep:fe-xdf"]
+xe-ref = ["xe", "fe-xe/ref-spv"]
 
 [dev-dependencies]
 http-body-util = "0.1"

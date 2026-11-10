@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Download the model repositories Ferrite serves from into one folder and verify them.
 #
-#   scripts/fetch-models.sh [options] [quant|prompt|draft ...]
+#   scripts/fetch-models.sh [options] [quant|prompt|draft|xq ...]
 #
 # Folders created under $FERRITE_MODELS (default /var/tmp/models; FERRITE_EXL3_DIR / FERRITE_NVFP4_DIR /
 # FERRITE_DRAFT_DIR place them one by one, see tools/site.sh), all three needed for the default setup:
@@ -9,6 +9,10 @@
 #   nvidia-Qwen3.8-27B-NVFP4      prompt  NVIDIA's NVFP4 checkpoint: prompt (prefill) GEMMs and the draft head (~21 GB)
 #   z-lab-Qwen3.8-27B-DFlash2     draft   z-lab's DFlash2 block drafter for speculative decoding (~3.6 GB)
 # Name roles to fetch only some of them (default: all three).
+# The Intel Arc Pro B70 engine (docs/arc-b70.md) uses a fourth folder instead of the first two, fetched only by name
+# (`scripts/fetch-models.sh xq draft`):
+#   Qwen3.8-27B-XQ-5.0bpw-mix     xq      XQ 5.0 bpw mix: the weights of the Arc engine and its MTP draft head (~30 GB;
+#                                         FERRITE_XQ_DIR places it)
 #
 # Options:
 #   --verify-only   check the folders against scripts/models.manifest without downloading
@@ -41,7 +45,7 @@ while [ $# -gt 0 ]; do
     --no-verify) mode=fetch-only ;;
     --make-manifest) mode=manifest ;;
     -h|--help) usage; exit 0 ;;
-    quant|prompt|draft) roles+=("$1") ;;
+    quant|prompt|draft|xq) roles+=("$1") ;;
     *) die "unknown argument '$1' (see --help)" ;;
   esac
   shift
@@ -52,7 +56,8 @@ done
 # repo lines: folder repo revision role; dir_of: where a role's folder lives (tools/site.sh)
 repo_line() { awk -v r="$1" '$1 == "@" && $5 == r { print $2, $3, $4; exit }' "$manifest"; }
 dir_of() {
-  case $1 in quant) echo "$FERRITE_EXL3_DIR" ;; prompt) echo "$FERRITE_NVFP4_DIR" ;; draft) echo "$FERRITE_DRAFT_DIR" ;; esac
+  case $1 in quant) echo "$FERRITE_EXL3_DIR" ;; prompt) echo "$FERRITE_NVFP4_DIR" ;; draft) echo "$FERRITE_DRAFT_DIR" ;;
+    xq) echo "$FERRITE_XQ_DIR" ;; esac
 }
 
 if [ $mode = manifest ]; then
@@ -103,7 +108,7 @@ if [ $mode != verify ]; then
   cli=$(hf_cli) || die "the Hugging Face CLI (hf) is not installed: python3 -m venv ~/.venvs/hf && ~/.venvs/hf/bin/pip install -U huggingface_hub"
   need=0
   for role in "${roles[@]}"; do
-    case $role in quant) need=$((need + 14)) ;; prompt) need=$((need + 22)) ;; draft) need=$((need + 4)) ;; esac
+    case $role in quant) need=$((need + 14)) ;; prompt) need=$((need + 22)) ;; draft) need=$((need + 4)) ;; xq) need=$((need + 31)) ;; esac
   done
   avail=$(df -BG --output=avail "$models" | tail -1 | tr -dc 0-9)
   [ "$avail" -ge "$need" ] || echo "fetch-models: warning: $avail GB free under $models, about $need GB needed" >&2
@@ -134,4 +139,7 @@ done
 if [ $status != 0 ]; then
   die "verification failed; re-run without --verify-only to fetch again (the CLI resumes partial files)"
 fi
-echo "fetch-models: done. Start a server with: FERRITE_MODELS=$models scripts/serve.sh"
+case " ${roles[*]} " in
+  *" xq "*) echo "fetch-models: done. Start a server with: FERRITE_MODELS=$models scripts/serve-xe.sh" ;;
+  *) echo "fetch-models: done. Start a server with: FERRITE_MODELS=$models scripts/serve.sh" ;;
+esac

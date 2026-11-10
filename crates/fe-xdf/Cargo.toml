@@ -1,0 +1,18 @@
+[package]
+name = "fe-xdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DFlash2 block drafter (z-lab Qwen3.8-27B-DFlash2) for fe-xe on the Intel Arc Pro B70: XQ drafter weights, draft forward, speculative generation"
+publish = false
+
+# Host crate, no CUDA: `cargo build -p fe-xdf`. Kernels: kernels-xe/kx-dflash (SPIR-V, embedded).
+[dependencies]
+fe-xe = { path = "../fe-xe" }
+fe-xq = { path = "../fe-xq" }
+fe-ze = { path = "../fe-ze" }
+anyhow.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+fe-kbuild-xe = { path = "../fe-kbuild-xe" }

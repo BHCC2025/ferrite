@@ -1,0 +1,14 @@
+[package]
+name = "kx-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kxcommon = { path = "../kxcommon" }
+
+[lints]
+workspace = true

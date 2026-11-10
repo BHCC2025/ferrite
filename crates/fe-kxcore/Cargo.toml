@@ -1,0 +1,14 @@
+[package]
+name = "fe-kxcore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host side of kernels-xe/kx-core (the Qwen3.8 non-GEMV kernels on the B70): the SPIR-V modules, launch wrappers with arc-engine's grids and arguments, and the bitwise / timing checks against arc-engine's OpenCL modules."
+publish = false
+
+[dependencies]
+fe-ze = { path = "../fe-ze" }
+anyhow.workspace = true
+
+[build-dependencies]
+fe-kbuild-xe = { path = "../fe-kbuild-xe" }

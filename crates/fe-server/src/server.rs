@@ -18,7 +18,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::{ApiError, ChatRequest, CompletionRequest, SamplingRequest, parse_body};
-use crate::engine::{CancelToken, Engine, FinishReason, GenEvent, GenRequest, SamplingParams, TokenSink};
+use crate::engine::{CancelToken, Engine, FinishReason, GenEvent, GenRequest, SamplingParams, Timings, TokenSink};
 use crate::parser::{Delta, OutputParser, ParserConfig, Parsed};
 use crate::stop::StopMatcher;
 use crate::template::{ChatTemplate, normalize_messages};
@@ -627,6 +627,8 @@ struct Outcome {
     error: Option<String>,
     completion_tokens: usize,
     cached_prompt_tokens: usize,
+    /// the engine's timings, if it reports them (`timings` in the response; absent otherwise)
+    timings: Option<Timings>,
 }
 
 enum Step {
@@ -686,9 +688,9 @@ impl Driver {
                         // the server ended it (stop string / max_tokens): stop the engine, and take its
                         // final event for the prompt-cache count
                         self.running.cancel.cancel();
-                        let cached = self.engine_finish().await;
+                        let (cached, timings) = self.engine_finish().await;
                         let reason = self.pipe.server_finish.unwrap_or("stop");
-                        Step::Final(d, self.outcome(reason, None, 0, cached))
+                        Step::Final(d, self.outcome(reason, None, 0, cached).with_timings(timings))
                     }
                     Err(e) => {
                         self.running.cancel.cancel();
@@ -705,7 +707,7 @@ impl Driver {
                     (None, FinishReason::Cancelled) => ("stop", None, 0),
                     (None, FinishReason::Error(e)) => ("stop", Some(e.clone()), 0),
                 };
-                Step::Final(d, self.outcome(reason, err, extra, f.cached_prompt_tokens))
+                Step::Final(d, self.outcome(reason, err, extra, f.cached_prompt_tokens).with_timings(f.timings.clone()))
             }
             None => {
                 let d = self.pipe.close(&tok).unwrap_or_default();
@@ -714,18 +716,18 @@ impl Driver {
         }
     }
 
-    /// Wait (briefly) for the engine's `Finished` after a server-side stop; returns its cached-prompt count.
-    async fn engine_finish(&mut self) -> usize {
+    /// Wait (briefly) for the engine's `Finished` after a server-side stop; returns its cached-prompt count and timings.
+    async fn engine_finish(&mut self) -> (usize, Option<Timings>) {
         let deadline = tokio::time::sleep(std::time::Duration::from_secs(2));
         tokio::pin!(deadline);
         loop {
             tokio::select! {
                 ev = self.running.rx.recv() => match ev {
-                    Some(GenEvent::Finished(f)) => return f.cached_prompt_tokens,
+                    Some(GenEvent::Finished(f)) => return (f.cached_prompt_tokens, f.timings),
                     Some(GenEvent::Tokens(_)) => continue,
-                    None => return 0,
+                    None => return (0, None),
                 },
-                _ = &mut deadline => return 0,
+                _ = &mut deadline => return (0, None),
             }
         }
     }
@@ -749,7 +751,14 @@ impl Driver {
                 tps
             ),
         }
-        Outcome { finish_reason: reason, error, completion_tokens, cached_prompt_tokens: cached }
+        Outcome { finish_reason: reason, error, completion_tokens, cached_prompt_tokens: cached, timings: None }
+    }
+}
+
+impl Outcome {
+    fn with_timings(mut self, t: Option<Timings>) -> Outcome {
+        self.timings = t;
+        self
     }
 }
 
@@ -787,6 +796,11 @@ impl Prepared {
 
     /// One streamed chunk carrying `choice` (or no choices, for the usage chunk).
     fn chunk(&self, model: &str, choice: Option<Json>, usage: Option<Json>) -> String {
+        self.chunk_t(model, choice, usage, None)
+    }
+
+    /// A chunk, with the engine's `timings` when it reports them (no key otherwise: the JSON is then exactly `chunk`'s).
+    fn chunk_t(&self, model: &str, choice: Option<Json>, usage: Option<Json>, timings: Option<&Timings>) -> String {
         let mut c = json!({
             "id": self.id,
             "object": self.object(true),
@@ -798,6 +812,9 @@ impl Prepared {
             c["usage"] = u;
         } else if self.include_usage {
             c["usage"] = Json::Null;
+        }
+        if let Some(t) = timings {
+            c["timings"] = t.to_json();
         }
         c.to_string()
     }
@@ -816,12 +833,12 @@ impl Prepared {
         self.chunk(model, Some(choice), None)
     }
 
-    fn final_chunk(&self, model: &str, reason: &str) -> String {
+    fn final_chunk(&self, model: &str, reason: &str, timings: Option<&Timings>) -> String {
         let choice = match self.kind {
             Kind::Chat => json!({"index": 0, "delta": {}, "logprobs": null, "finish_reason": reason}),
             Kind::Completion => json!({"index": 0, "text": "", "logprobs": null, "finish_reason": reason}),
         };
-        self.chunk(model, Some(choice), None)
+        self.chunk_t(model, Some(choice), None, timings)
     }
 }
 
@@ -869,9 +886,9 @@ fn stream_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> Respo
                 if let Some(e) = &o.error {
                     let _ = tx.send(sse(ApiError::internal(e.clone()).body().to_string())).await;
                 } else {
-                    let _ = tx.send(sse(p.final_chunk(&model, o.finish_reason))).await;
+                    let _ = tx.send(sse(p.final_chunk(&model, o.finish_reason, o.timings.as_ref()))).await;
                     if p.include_usage {
-                        let _ = tx.send(sse(p.chunk(&model, None, Some(usage(p.prompt_ids.len(), &o))))).await;
+                        let _ = tx.send(sse(p.chunk_t(&model, None, Some(usage(p.prompt_ids.len(), &o)), o.timings.as_ref()))).await;
                     }
                 }
                 let _ = tx.send(sse("[DONE]".to_string())).await;
@@ -880,9 +897,13 @@ fn stream_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> Respo
         }
     });
     // SSE comment lines every 15 s keep idle-timeout clients alive through queueing and long prefills
-    Sse::new(ReceiverStream::new(rx))
+    let mut resp = Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
-        .into_response()
+        .into_response();
+    // SSE is UTF-8 by definition, but clients that go by the header (python requests: text/* without a charset is ISO-8859-1)
+    // would decode every multi-byte character into mojibake: say it
+    resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/event-stream; charset=utf-8"));
+    resp
 }
 
 async fn full_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> Response {
@@ -939,6 +960,10 @@ async fn full_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> R
             })
         }
     };
+    let mut body = body;
+    if let Some(t) = &outcome.timings {
+        body["timings"] = t.to_json();
+    }
     AxJson(body).into_response()
 }
 
@@ -976,6 +1001,58 @@ async fn run(state: Arc<AppState>, prepared: Result<Prepared, ApiError>, t_start
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared(include_usage: bool) -> Prepared {
+        Prepared {
+            kind: Kind::Chat,
+            id: "chatcmpl-x".into(),
+            created: 1,
+            prompt_ids: vec![1, 2, 3],
+            snapshots: Vec::new(),
+            params: SamplingParams::default(),
+            stops: Vec::new(),
+            include_stop: false,
+            skip_special: true,
+            parser: None,
+            stream: true,
+            include_usage,
+            echo: None,
+        }
+    }
+
+    #[test]
+    fn timings_absent_leaves_the_json_unchanged() {
+        // engines without timings (the CUDA engines, the mock): the chunks are byte for byte what they were
+        for iu in [false, true] {
+            let p = prepared(iu);
+            let choice = json!({"index": 0, "delta": {}, "logprobs": null, "finish_reason": "stop"});
+            assert_eq!(p.final_chunk("m", "stop", None), p.chunk("m", Some(choice), None));
+            let u = json!({"prompt_tokens": 3});
+            assert_eq!(p.chunk_t("m", None, Some(u.clone()), None), p.chunk("m", None, Some(u)));
+            assert!(!p.final_chunk("m", "stop", None).contains("timings"));
+        }
+    }
+
+    #[test]
+    fn timings_present_as_llama_server() {
+        let p = prepared(true);
+        let t = Timings { prompt_n: 2000, cache_n: 26, prompt_ms: 1600.0, predicted_n: 501, predicted_ms: 5000.0, draft: Some((700, 400)) };
+        let c: Json = serde_json::from_str(&p.final_chunk("m", "stop", Some(&t))).unwrap();
+        let tj = &c["timings"];
+        assert_eq!(tj["prompt_n"], 2000);
+        assert_eq!(tj["cache_n"], 26);
+        assert_eq!(tj["prompt_per_second"], 1250.0);
+        assert_eq!(tj["predicted_n"], 501);
+        assert_eq!(tj["predicted_per_second"], 100.0);
+        assert_eq!(tj["draft_n"], 700);
+        assert_eq!(tj["draft_n_accepted"], 400);
+        let none = Timings { draft: None, ..t };
+        assert!(none.to_json().get("draft_n").is_none());
+        // the rest of the chunk is the plain one plus the key
+        let mut plain: Json = serde_json::from_str(&p.final_chunk("m", "stop", None)).unwrap();
+        plain["timings"] = tj.clone();
+        assert_eq!(c, plain);
+    }
 
     #[test]
     fn thinking_detection() {

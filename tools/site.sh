@@ -16,6 +16,8 @@ unset _sf
 : "${FERRITE_EXL3_DIR:=$FERRITE_MODELS/Qwen3.8-27B-EXL3-3.0bpw-mix}"
 : "${FERRITE_NVFP4_DIR:=${FE_PROMPT_WEIGHTS:-$FERRITE_MODELS/nvidia-Qwen3.8-27B-NVFP4}}"
 : "${FERRITE_DRAFT_DIR:=${FE_DRAFT_DIR:-$FERRITE_MODELS/z-lab-Qwen3.8-27B-DFlash2}}"
+# the XQ quant of the Intel Arc Pro B70 engine (scripts/serve-xe.sh; docs/arc-b70.md)
+: "${FERRITE_XQ_DIR:=$FERRITE_MODELS/Qwen3.8-27B-XQ-5.0bpw-mix}"
 # state: logs and run files, and the locks (a GPU lock on each node, the TP2 lock on rank 0's node; every GPU job
 # on a node must take the same lock, so without FERRITE_STATE_DIR they stay at their /var/tmp paths)
 _fs=${FERRITE_STATE_DIR:-}
@@ -40,7 +42,7 @@ fi
 : "${FERRITE_MIN_FREE_GB:=45}"
 # the KL reference of tools/kl.sh / kl-tp2.sh: token ids, BF16 reference logits and the scorer
 : "${FERRITE_KL_DIR:=/var/tmp/kl27b}"
-export FERRITE_MODELS FERRITE_EXL3_DIR FERRITE_NVFP4_DIR FERRITE_DRAFT_DIR FERRITE_STATE_DIR FERRITE_GPU_LOCK \
+export FERRITE_MODELS FERRITE_EXL3_DIR FERRITE_NVFP4_DIR FERRITE_DRAFT_DIR FERRITE_XQ_DIR FERRITE_STATE_DIR FERRITE_GPU_LOCK \
   FERRITE_TP2_LOCK FERRITE_PEER FERRITE_TP_HOST FERRITE_NET_IF FERRITE_ROCE_HCA FERRITE_ROCE_GID FERRITE_MIN_FREE_GB \
   FERRITE_KL_DIR
 # the environment both TP ranks start with (the peer's arrives over ssh): NCCL's and the engine's fabric settings,
@@ -73,7 +75,7 @@ ferrite_two_node() {
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  for v in FERRITE_MODELS FERRITE_EXL3_DIR FERRITE_NVFP4_DIR FERRITE_DRAFT_DIR FERRITE_STATE_DIR FERRITE_GPU_LOCK \
+  for v in FERRITE_MODELS FERRITE_EXL3_DIR FERRITE_NVFP4_DIR FERRITE_DRAFT_DIR FERRITE_XQ_DIR FERRITE_STATE_DIR FERRITE_GPU_LOCK \
     FERRITE_TP2_LOCK FERRITE_PEER FERRITE_TP_HOST FERRITE_NET_IF FERRITE_ROCE_HCA FERRITE_ROCE_GID FERRITE_MIN_FREE_GB \
     FERRITE_KL_DIR; do
     printf '%-20s %s\n' "$v" "${!v}"

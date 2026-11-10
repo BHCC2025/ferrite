@@ -1,0 +1,23 @@
+[package]
+name = "kx-xq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "XQ decode GEMV + prepasses (Rust port of arc-engine xq.cl); one SPIR-V module per code width."
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# exactly one: the code width of the module
+b3 = []
+b4 = []
+b5 = []
+b6 = []
+b8 = []
+
+[dependencies]
+kxcommon = { path = "../kxcommon" }
+
+[lints]
+workspace = true

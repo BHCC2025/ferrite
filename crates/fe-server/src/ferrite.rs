@@ -131,7 +131,7 @@ pub mod sched {
                     Event::Tokens(t) => sink.as_ref().is_some_and(|s| s.send_tokens(t)),
                     Event::Finished { reason: f, cached_prompt_tokens } => {
                         if let Some(s) = sink.take() {
-                            s.finish(Finish { reason: reason(f), cached_prompt_tokens });
+                            s.finish(Finish { reason: reason(f), cached_prompt_tokens, timings: None });
                         }
                         false
                     }

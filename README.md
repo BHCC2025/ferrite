@@ -8,6 +8,9 @@ GPU kernels. The kernels are Rust too: compiled by rustc's `nvptx64-nvidia-cuda`
 across two connected over RoCE, behind an OpenAI-compatible API with streaming, thinking, tool calls, a prompt cache
 and 128K context.
 
+An experimental second target serves the same model on one **Intel Arc Pro B70**, with Rust kernels compiled to
+SPIR-V and loaded through Level Zero: see [Intel Arc Pro B70](#intel-arc-pro-b70).
+
 > **Status: experimental.** One model (Qwen3.8-27B), one GPU (GB10 / `sm_121a`). At most 4 requests run at once
 > with DFlash2 drafting; more wait in a queue. It works, but expect rough edges. Issues and measurements from other
 > Sparks are welcome.
@@ -126,6 +129,28 @@ Everything has a default; set only what differs on your machines. `tools/site.sh
 | `FERRITE_FABRIC` | unset | `auto` detects the RoCE devices, interface and GID shared with the peer; the two-node scripts do this whenever `FERRITE_TP_HOST` is unset |
 | `FERRITE_TP_HOST`, `FERRITE_NET_IF`, `FERRITE_ROCE_HCA`, `FERRITE_ROCE_GID` | see TP2.md | Manual two-node fabric settings |
 
+## Intel Arc Pro B70
+
+Ferrite also runs on a single Intel Arc Pro B70 (32 GB): the same model and server, a separate engine
+(`fe-server --engine xe`) whose kernels are Rust compiled to SPIR-V. It is experimental, serves one request at a time
+and is built from source. One card capped at 180 W, greedy decoding, tokens per second:
+
+| | Ferrite on one Arc Pro B70 |
+|---|---|
+| Code, 2K / 32K context | 124 / 111 |
+| Prose | 79 |
+| Code edits | 201-244 |
+| Prompt processing, 2K / 32K / ~120K context | ~2,090 / ~2,060 / ~1,490 |
+| KL divergence vs BF16 (code / prose / 16K context) | 0.006 / 0.011 / 0.006 |
+
+```bash
+cargo build --release --features xe -p fe-server
+scripts/fetch-models.sh xq draft && scripts/serve-xe.sh
+```
+
+Requirements, the model ([`BHCC2025/Qwen3.8-27B-XQ-5.0bpw-mix`](docs/model-card-xq.md)), settings and how it works:
+[docs/arc-b70.md](docs/arc-b70.md).
+
 ## How it gets its speed
 
 - **EXL3 decode** at about 90% of GB10's memory bandwidth. Matrix-vector kernels batch up to 48 rows into one weight
@@ -146,7 +171,8 @@ Everything has a default; set only what differs on your machines. `tools/site.sh
 
 Rust: every GPU kernel, the CUDA driver bindings, the model and scheduler, speculative decoding, the two-node fabric
 (RDMA over libibverbs), tokenizer and HTTP server. Not Rust: NVIDIA's `ptxas` assembler (build time), the CUDA driver
-itself, libibverbs, and NCCL for two-node prompt batches. The full ledger, with reasons and replacement plans, is in
+itself, libibverbs, and NCCL for two-node prompt batches; on Intel Arc, the SPIR-V translator (build time), Intel's
+device compiler and the Level Zero loader. The full ledger, with reasons and replacement plans, is in
 [NON-RUST.md](NON-RUST.md).
 
 ## Building from source
@@ -155,7 +181,8 @@ Needs stable Rust 1.99+, the kernels' pinned nightly (`nightly-2026-11-04`, in `
 `rust-src`, `llvm-tools` and `llvm-bitcode-linker` for the `nvptx64-nvidia-cuda` target, and CUDA 13's `ptxas`.
 `scripts/check-deps.sh --build --install` checks them and installs the Rust toolchains; then
 `cargo build --release -p fe-server --features ferrite -p fe-cli`. See
-[docs/quickstart.md](docs/quickstart.md#build-from-source).
+[docs/quickstart.md](docs/quickstart.md#build-from-source). The Intel Arc build needs neither CUDA nor `ptxas`; its
+tools are listed in [docs/arc-b70.md](docs/arc-b70.md#requirements).
 
 ## Credits
 

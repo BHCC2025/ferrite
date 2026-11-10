@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Stage the EXL3 quant (the decode weights) for Hugging Face, check it, and upload it only when asked.
+# Stage the EXL3 quant (the decode weights) for Hugging Face, check it, and upload it only when asked. With --xq it
+# stages the XQ quant of the Intel Arc Pro B70 engine instead ($FERRITE_XQ_DIR, docs/model-card-xq.md, the manifest's
+# xq lines, and the MTP draft head dhead_q8.bin beside the weights).
 #
 #   scripts/hf-upload.sh [options]
 #
@@ -17,6 +19,7 @@
 # script never takes, reads, writes or prints a token, and it clears HF_TOKEN / HUGGING_FACE_HUB_TOKEN for the CLI.
 #
 # Options:
+#   --xq               the XQ quant (Intel Arc Pro B70 engine) instead of the EXL3 quant
 #   --upload           really upload to $FERRITE_HF_REPO (one commit; rerunning skips files already on the Hub)
 #   --private          create the repository as private when it does not exist yet (default public)
 #   --quick            compare sizes only (default: sizes and sha256, about a minute for 13 GB)
@@ -42,6 +45,8 @@ card=$root/docs/model-card.md
 # shellcheck source=../tools/site.sh
 . "$root/tools/site.sh"
 dir=$FERRITE_EXL3_DIR
+role=quant
+msg="Qwen3.8-27B EXL3 3.0 bpw mix"
 upload=0
 private=0
 quick=0
@@ -53,6 +58,10 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
 
 while [ $# -gt 0 ]; do
   case $1 in
+    --xq) role=xq; dir=$FERRITE_XQ_DIR; card=$root/docs/model-card-xq.md; msg="Qwen3.8-27B XQ 5.0 bpw mix"
+          ALLOW=(config.json generation_config.json xq_config.json quant_log.json model.safetensors.index.json
+                 tokenizer.json tokenizer_config.json vocab.json merges.txt chat_template.jinja preprocessor_config.json
+                 video_preprocessor_config.json LICENSE dhead_q8.bin) ;;
     --upload) upload=1 ;;
     --private) private=1 ;;
     --quick) quick=1 ;;
@@ -67,10 +76,10 @@ done
 [ $update = 1 ] && [ $quick = 1 ] && die "--update-manifest needs the sha256 of every file; drop --quick"
 [ -f "$manifest" ] || die "missing $manifest"
 [ -f "$card" ] || die "missing $card"
-[ -d "$dir" ] || die "no quant folder $dir (set FERRITE_EXL3_DIR, or fetch it first)"
+[ -d "$dir" ] || die "no quant folder $dir (set FERRITE_EXL3_DIR / FERRITE_XQ_DIR, or fetch it first)"
 # the quant's manifest line: @ <folder> <repo> <revision> quant
-read -r folder mrepo _ <<< "$(awk '$1 == "@" && $5 == "quant" { print $2, $3, $4; exit }' "$manifest")"
-[ -n "$folder" ] || die "no quant line (@ ... quant) in $manifest"
+read -r folder mrepo _ <<< "$(awk -v r="$role" '$1 == "@" && $5 == r { print $2, $3, $4; exit }' "$manifest")"
+[ -n "$folder" ] || die "no $role line (@ ... $role) in $manifest"
 
 # 1. the allowlist: the shards the index names, the ALLOW files, README.md from the model card
 [ -f "$dir/model.safetensors.index.json" ] || die "no model.safetensors.index.json in $dir"
@@ -106,6 +115,8 @@ for f in sys.argv[2:]:
         if f.endswith(".safetensors"):
             n = struct.unpack("<Q", fh.read(8))[0]
             b = fh.read(n)
+        elif f.endswith(".bin"):
+            b = fh.read(4096)  # binary weights: the header only
         else:
             b = fh.read()
     m = pat.search(b)
@@ -140,7 +151,7 @@ for f in "${names[@]}"; do
   [ -e "$stage/$f" ] || { printf '%-40s %16s  %s\n' "$f" "-" "(written by a full run)"; continue; }
   n=$(stat -L -c %s "$stage/$f"); total=$((total + n))
   case $f in
-    README.md) src=docs/model-card.md ;;
+    README.md) src=docs/${card##*/} ;;
     sha256sums.txt) src="generated: sha256 of the other ${#files[@]} files + README.md" ;;
     *) src=$dir/$f ;;
   esac
@@ -183,13 +194,13 @@ else
   agree=0
   echo "manifest: the staged set DIFFERS from scripts/models.manifest (< manifest, > staged):"
   diff <(echo "$want") <(echo "$have") | grep '^[<>]' | sed 's/^/  /' || true
-  echo "  (after a deliberate change, e.g. to docs/model-card.md: rerun with --update-manifest and commit the manifest)"
+  echo "  (after a deliberate change, e.g. to docs/${card##*/}: rerun with --update-manifest and commit the manifest)"
 fi
 echo "credentials: none found in the text files or safetensors headers"
 
 # 6. placeholders that must be filled in before anything is published
 ph=$(grep -n -o -e '<repository URL>' -e '<HF_USER>' "$card" | tr '\n' ' ' || true)
-[ -n "$ph" ] && echo "model card: placeholders left in docs/model-card.md: $ph"
+[ -n "$ph" ] && echo "model card: placeholders left in docs/${card##*/}: $ph"
 
 # the Hugging Face CLI: on PATH, or where pip puts it (a non-interactive ssh shell often lacks ~/.local/bin)
 hf_bin=$(command -v hf || true)
@@ -204,7 +215,7 @@ inc=()
 for n in "${names[@]}"; do inc+=(--include "$n"); done
 exc=(--exclude '.cache/*' --exclude '.git*' --exclude '*.log')
 args=(upload "${repo:-$mrepo}" "$stage" . --repo-type model "${pflag[@]}" "${inc[@]}" "${exc[@]}"
-      --commit-message "Qwen3.8-27B EXL3 3.0 bpw mix")
+      --commit-message "$msg")
 if [ $upload = 0 ]; then
   echo
   echo "DRY RUN: nothing was uploaded. With --upload and FERRITE_HF_REPO=${repo:-$mrepo} it would run:"
@@ -218,7 +229,7 @@ fi
 [ -n "$repo" ] || die "--upload needs FERRITE_HF_REPO (e.g. FERRITE_HF_REPO=$mrepo)"
 case $repo in */*) ;; *) die "FERRITE_HF_REPO must be <user or org>/<name>, not '$repo'" ;; esac
 [ $agree = 1 ] || die "not uploading: the staged set does not agree with scripts/models.manifest"
-[ -z "$ph" ] || die "not uploading: fill in the placeholders in docs/model-card.md first"
+[ -z "$ph" ] || die "not uploading: fill in the placeholders in docs/${card##*/} first"
 [ -n "$hf_bin" ] || die "the Hugging Face CLI is not installed: python3 -m venv ~/.venvs/hf && ~/.venvs/hf/bin/pip install -U huggingface_hub"
 hfc() { env -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN "$hf_bin" "$@"; }
 hfc auth whoami > /dev/null 2>&1 || die "not logged in: run 'hf auth login' (the token stays in the Hugging Face CLI's own store)"
@@ -226,5 +237,5 @@ hfc auth whoami > /dev/null 2>&1 || die "not logged in: run 'hf auth login' (the
 echo "hf-upload: uploading ${#names[@]} files, $((total / 1000000)) MB, to $repo ($vis)"
 hfc "${args[@]}" || die "upload failed (write access for this login? network?)"
 echo "hf-upload: done. Pin the commit in scripts/models.manifest:"
-echo "  @ $folder $repo <commit sha from the output above> quant"
-echo "then check a fresh download: scripts/fetch-models.sh quant"
+echo "  @ $folder $repo <commit sha from the output above> $role"
+echo "then check a fresh download: scripts/fetch-models.sh $role"

@@ -123,11 +123,52 @@ pub struct Finish {
     pub reason: FinishReason,
     /// How many prompt tokens came from the engine's prompt / prefix cache (0 if none or unknown).
     pub cached_prompt_tokens: usize,
+    /// Engine-side timings for the responses' llama-server-style `timings` object; None (the default) = no such key.
+    pub timings: Option<Timings>,
 }
 
 impl Finish {
     pub fn new(reason: FinishReason) -> Self {
-        Self { reason, cached_prompt_tokens: 0 }
+        Self { reason, cached_prompt_tokens: 0, timings: None }
+    }
+}
+
+/// Engine-side timings of one request, as llama-server (and arc-engine) report them in `timings`: tools such as quickbench,
+/// gate.py and long.py prefer them to client-side estimates.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Timings {
+    /// prompt tokens run (the cached ones not counted)
+    pub prompt_n: usize,
+    /// prompt tokens taken from the prompt cache
+    pub cache_n: usize,
+    /// prompt processing up to the first token
+    pub prompt_ms: f64,
+    /// generated tokens, the first one included
+    pub predicted_n: usize,
+    /// generation after the first token
+    pub predicted_ms: f64,
+    /// speculative decoding: (draft tokens proposed, accepted); None without speculation
+    pub draft: Option<(u64, u64)>,
+}
+
+impl Timings {
+    /// The `timings` object (rates as llama-server / arc-engine: prompt_n / prompt time, (predicted_n - 1) / generation time).
+    pub fn to_json(&self) -> serde_json::Value {
+        let rate = |n: f64, ms: f64| if ms > 0.0 { n * 1000.0 / ms } else { 0.0 };
+        let mut t = serde_json::json!({
+            "prompt_n": self.prompt_n,
+            "cache_n": self.cache_n,
+            "prompt_ms": self.prompt_ms,
+            "prompt_per_second": rate(self.prompt_n as f64, self.prompt_ms),
+            "predicted_n": self.predicted_n,
+            "predicted_ms": self.predicted_ms,
+            "predicted_per_second": if self.predicted_n > 1 { rate((self.predicted_n - 1) as f64, self.predicted_ms) } else { 0.0 },
+        });
+        if let Some((n, a)) = self.draft {
+            t["draft_n"] = n.into();
+            t["draft_n_accepted"] = a.into();
+        }
+        t
     }
 }
 

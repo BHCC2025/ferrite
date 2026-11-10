@@ -1,0 +1,5 @@
+# Same pinned nightly as kernels/ (rustc 1.101.0-nightly 708c94ef0 2026-11-03, LLVM 23.1.5). The Xe kernels use the
+# amdgcn-amd-amdhsa target only as an LLVM IR carrier (build-std core); llvm-tools provides the `opt` that names values.
+[toolchain]
+channel = "nightly-2026-11-04"
+components = ["rust-src", "llvm-tools"]

@@ -5,9 +5,12 @@
 # sha256). The EXL3 entries describe the quant as it is uploaded: its folder as Ferrite was tested with it, README.md =
 # docs/model-card.md and a sha256sums.txt. scripts/hf-upload.sh stages that set and checks it against these lines
 # (--update-manifest rewrites them after the model card changes); pin the uploaded revision here.
+# The XQ entries (role xq) are the quant of the Intel Arc Pro B70 engine, staged the same way by
+# scripts/hf-upload.sh --xq with README.md = docs/model-card-xq.md; scripts/fetch-models.sh fetches it only by name.
 @ Qwen3.8-27B-EXL3-3.0bpw-mix BHCC2025/Qwen3.8-27B-EXL3-3.0bpw-mix 5ce0a825996da2ba9d2718cb4c089d071090c110 quant
 @ nvidia-Qwen3.8-27B-NVFP4 nvidia/Qwen3.8-27B-NVFP4 482ca0f3832238542f8f5295dde86b5f22711d80 prompt
 @ z-lab-Qwen3.8-27B-DFlash2 z-lab/Qwen3.8-27B-DFlash2 50307d4c4cde6860d4eee73e2547cd786fe8e8a4 draft
+@ Qwen3.8-27B-XQ-5.0bpw-mix BHCC2025/Qwen3.8-27B-XQ-5.0bpw-mix 1e9c51defa2c4abe9ff87cf96b99f47f82f299ed xq
 Qwen3.8-27B-EXL3-3.0bpw-mix chat_template.jinja 8952 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041
 Qwen3.8-27B-EXL3-3.0bpw-mix config.json 4645 653674c4c2cf8d9e66d742b9ed67f895d527e1bc3104d3697fb680d7c27579de
 Qwen3.8-27B-EXL3-3.0bpw-mix generation_config.json 202 e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e
@@ -46,3 +49,27 @@ z-lab-Qwen3.8-27B-DFlash2 config.json 1239 873e3556509b0da06e29654ba00d4944888d4
 z-lab-Qwen3.8-27B-DFlash2 .gitattributes 1581 8e63f02a5caa4dbc92838d44dddcfa2c1b76f355503fcbeaa3d6512f7fe132ef
 z-lab-Qwen3.8-27B-DFlash2 model.safetensors 3848817896 67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c
 z-lab-Qwen3.8-27B-DFlash2 README.md 5397 0c06405ffff835f4da26115114a6dd7bb4a8b8a6881c17edd3a1086a99281269
+Qwen3.8-27B-XQ-5.0bpw-mix README.md 5708 342b01c8537350478c54313b9eae971a1d017d2d292f97c61813282da9197522
+Qwen3.8-27B-XQ-5.0bpw-mix LICENSE 11544 bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a
+Qwen3.8-27B-XQ-5.0bpw-mix chat_template.jinja 8952 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041
+Qwen3.8-27B-XQ-5.0bpw-mix config.json 4312 191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab
+Qwen3.8-27B-XQ-5.0bpw-mix dhead_q8.bin 1273384980 71d9e5f16cf39b7996a751e30574b856141d4a2c9987d239e58109f944327f01
+Qwen3.8-27B-XQ-5.0bpw-mix generation_config.json 202 e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e
+Qwen3.8-27B-XQ-5.0bpw-mix merges.txt 3353259 a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d
+Qwen3.8-27B-XQ-5.0bpw-mix model.safetensors.index.json 155620 52901160088bffa2dc614ddf20a648076f35e9b24cfe8182760d27e97df05cdf
+Qwen3.8-27B-XQ-5.0bpw-mix preprocessor_config.json 390 27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516
+Qwen3.8-27B-XQ-5.0bpw-mix quant_log.json 80282 b7b41fff378b94604eedb7827e6a14f38edade83c9f9269c9b553db13769bd41
+Qwen3.8-27B-XQ-5.0bpw-mix sha256sums.txt 1946 1a4b49c24246a6522d038620e674268e6f84b0552da25bad46e4d9e59863d1ce
+Qwen3.8-27B-XQ-5.0bpw-mix tokenizer.json 12809320 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3
+Qwen3.8-27B-XQ-5.0bpw-mix tokenizer_config.json 17928 b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27
+Qwen3.8-27B-XQ-5.0bpw-mix video_preprocessor_config.json 385 7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13
+Qwen3.8-27B-XQ-5.0bpw-mix vocab.json 6722759 ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003
+Qwen3.8-27B-XQ-5.0bpw-mix xq-00001.safetensors 2548186072 42cd97c31ad0d42daef0f6de28dc3ba04f21c4d96bb2575a806db004f2ebc1cd
+Qwen3.8-27B-XQ-5.0bpw-mix xq-00002.safetensors 4323128488 187098010b754cf6d3af8093a3b558baf34b1ce61c45034dfbf89a084b0f0a26
+Qwen3.8-27B-XQ-5.0bpw-mix xq-00003.safetensors 4303335824 7597a8e230692867821d9da2e2fb47bd421d785dc6cb48957d1b8c1087f3e5e6
+Qwen3.8-27B-XQ-5.0bpw-mix xq-00004.safetensors 4338687744 75cf91611a30b5cb1cf60821e9bee85d1d3863d4ff94d3480203685469a3213a
+Qwen3.8-27B-XQ-5.0bpw-mix xq-00005.safetensors 4339586800 f527285f245708923f099372ec1d191d083d2ddd3af0701399e8418f0a3f8132
+Qwen3.8-27B-XQ-5.0bpw-mix xq-00006.safetensors 4339586784 674eeec8ed29e5cae639a5708240859497684acd5a32f71024e525bd820eb058
+Qwen3.8-27B-XQ-5.0bpw-mix xq-00007.safetensors 4796506776 89bb7d3fbf02de84232259d4359fd1130cf53695c6943902c67e82753a84a9db
+Qwen3.8-27B-XQ-5.0bpw-mix xq-00008.safetensors 19865720 50e9383492702b6ab61fd57b9073b1098940e4419dddd7e8fc44863e26b72bf5
+Qwen3.8-27B-XQ-5.0bpw-mix xq_config.json 139109 471ea0d0fae453ef949242869a10a0d7ac3d594529be40ae5d06a491d3169b15

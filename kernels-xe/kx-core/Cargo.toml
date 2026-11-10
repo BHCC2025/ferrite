@@ -1,0 +1,30 @@
+[package]
+name = "kx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3.8 non-GEMV kernels (norms, Gated DeltaNet, attention prep, KV q8, decode attention, merge, embedding, SwiGLU, argmax): Rust ports of arc-engine's qwen_rows / qwen_basic / qwen_kvq / qwen_attn_dec / qwen_attn_long OpenCL, bit-identical."
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# dec: only the matrix-engine decode attention (qwen_attn_dec.cl) -> kx_core_dec.spv, loaded with the 256-GRF build
+# flag like arc-engine's qwen_attn_dec_q8.spv; without it: every other kernel -> kx_core.spv
+dec = []
+
+# fe-kbuild-xe system-opt pipeline per build variant (cargo features joined by ","; "" = no features): light (default) |
+# o1 | o2 | o3. Both modules on o2:
+# - dec (the attention module): with light the decode pack kernels spill 5.2-5.4 KB (IGC splits the float8 accumulators
+#   after the key loop); with o2 no attention kernel spills;
+# - "" (kx_core): o2 equals light on every kernel within noise except gdn_step_r2x4 at 16 rows (14.9 vs 17.3 us, OpenCL
+#   16.2), which every verify window runs 48 times.
+[package.metadata.kbuild.pipeline]
+"" = "o2"
+dec = "o2"
+
+[dependencies]
+kxcommon = { path = "../kxcommon" }
+
+[lints]
+workspace = true

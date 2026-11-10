@@ -1,0 +1,15 @@
+[package]
+name = "kx-dflash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DFlash2 drafter kernels for the Arc Pro B70 (z-lab Qwen3.8-27B-DFlash2): two-tap dynamic convolution, per-head RMSNorm + RoPE with the draft KV ring write, block attention over the draft cache, top-16, candidate selector walk, target feature taps. Linears are XQ (kx-xq), norms / embedding / SwiGLU are kx-core's."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kxcommon = { path = "../kxcommon" }
+
+[lints]
+workspace = true

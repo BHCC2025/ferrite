@@ -1,0 +1,8 @@
+[package]
+name = "fe-ze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thin owned bindings to Level Zero (libze_loader.so.1, dlopen): context, immediate command lists, USM, SPIR-V modules, kernels, timestamp events."
+
+[dependencies]

@@ -135,3 +135,24 @@ Toolchain and system libraries (NON-RUST.md has the reasons):
 - [NCCL](https://github.com/NVIDIA/nccl) 2.30.4 (dlopen'd): the TP2 collectives above the RoCE path's size.
 - [rdma-core](https://github.com/linux-rdma/rdma-core) 50 `libibverbs`: the RoCE queue pairs.
 - PyTorch, exllamav3, vLLM and transformers (Python): test references only, never in the engine.
+
+## The Intel Arc Pro B70 engine
+
+The Arc engine (crates/fe-xe, fe-xdf, fe-xq, fe-ze, kernels-xe; docs/arc-b70.md) was ported from arc-engine, an
+unpublished Zig + OpenCL C engine for the same card by the same authors. Its kernels were re-implemented in Rust and
+checked bit for bit against the originals, and its serving policy (the prefix cache, the side pool, MTP drafting with
+context copy) was carried over (**ported**). What that engine drew on applies here too:
+
+- [GPTQ](https://arxiv.org/abs/2210.17323) (Frantar et al.): the quantization method of the XQ weights (**idea**);
+  Hadamard input rotations before quantization follow [QuIP](https://arxiv.org/abs/2307.13304) (**idea**).
+- DFlash2 (above): the drafter, here with its linears requantized to 4-bit XQ at load (**used**, **ported** from
+  crates/fe-dflash).
+- TensorFold (above): the verify-tree growth and its constants, through crates/fe-dflash (**design**).
+- [libm](https://github.com/rust-lang/libm) (MIT OR Apache-2.0): f32 `cos` / `sin` for the RoPE tables (**used**).
+- Intel: the [Level Zero](https://github.com/oneapi-src/level-zero) loader (bound directly in crates/fe-ze), the
+  [compute runtime](https://github.com/intel/compute-runtime) and its device compiler
+  [IGC](https://github.com/intel/intel-graphics-compiler), and the `intel_sub_group_*` matrix (DPAS) and 2D block IO
+  builtins the kernels call (**used**).
+- Khronos [SPIRV-LLVM-Translator](https://github.com/KhronosGroup/SPIRV-LLVM-Translator) (`llvm-spirv`) and
+  [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) (`spirv-val`), and LLVM 23 `opt`: the build route of the
+  Rust kernels to SPIR-V (**used**; NON-RUST.md).

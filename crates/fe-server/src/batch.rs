@@ -348,7 +348,7 @@ impl<M: StepModel> Scheduler<M> {
         let a = self.active.swap_remove(i);
         self.slots[a.slot].busy = false;
         tracing::debug!("{} finished in slot {}: {:?} after {} tokens", a.id, a.slot, reason, a.generated);
-        a.sink.finish(Finish { reason, cached_prompt_tokens: a.cached });
+        a.sink.finish(Finish { reason, cached_prompt_tokens: a.cached, timings: None });
     }
 }
 

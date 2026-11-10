@@ -1,0 +1,16 @@
+[package]
+name = "fe-kx-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Proofs for the Rust Xe2 kernels: feature tests, ceiling benches, XQ GEMV oracle + timing against arc-engine's OpenCL modules."
+publish = false
+
+[dependencies]
+fe-ze = { path = "../fe-ze" }
+fe-xq = { path = "../fe-xq" }
+fe-kxcore = { path = "../fe-kxcore" }
+anyhow.workspace = true
+
+[build-dependencies]
+fe-kbuild-xe = { path = "../fe-kbuild-xe" }
