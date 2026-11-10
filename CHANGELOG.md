@@ -1,10 +1,12 @@
 # Changelog
 
 Notable changes to Ferrite. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
-versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Changes on `main` that are not in a
-tagged release yet are listed under Unreleased.
+versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [On main since 0.1.0]
+
+Published and available now: clone `main` and build from source. These changes get a version number with the next
+tagged release.
 
 ### Added
 
@@ -43,5 +45,5 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
-[Unreleased]: https://github.com/BHCC2025/ferrite/compare/v0.1.0...HEAD
+[On main since 0.1.0]: https://github.com/BHCC2025/ferrite/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.1.0
