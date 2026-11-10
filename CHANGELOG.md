@@ -1,12 +1,10 @@
 # Changelog
 
-Notable changes to Ferrite. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
-versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Notable changes to Ferrite, newest release first. Every section below is a tagged release that is published and
+available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [On main since 0.1.0]
-
-Published and available now: clone `main` and build from source. These changes get a version number with the next
-tagged release.
+## [0.2.0] - 2026-11-10
 
 ### Added
 
@@ -22,6 +20,8 @@ tagged release.
   it and checks its sha256 sums.
 - `fe-server`: engines may report their own timings in a response.
 - This changelog.
+- Prebuilt DGX Spark package `ferrite-0.2.0-dgx-spark-aarch64.tar.gz`; the one-line installer now installs 0.2.0.
+  The Arc Pro B70 engine is built from source.
 
 ### Changed
 
@@ -45,5 +45,5 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
-[On main since 0.1.0]: https://github.com/BHCC2025/ferrite/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.2.0
 [0.1.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.1.0
