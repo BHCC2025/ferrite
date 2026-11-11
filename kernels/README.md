@@ -5,6 +5,10 @@ GPU kernels are Rust (`#![no_std]`, nightly, target `nvptx64-nvidia-cuda`, `targ
 embeds with `include_bytes!`. kernels/ is its own cargo workspace (members `kcommon` + glob `k-*`), selected
 toolchain nightly via `rust-toolchain.toml`, target and `build-std=core` via `.cargo/config.toml`.
 
+Another architecture: `FE_KARCH=sm_120a` (RTX 50 cards) at build time compiles the same crates with that
+`target-cpu`, assembles them with `ptxas -arch=sm_120a` and keeps them in `kernels/target-sm_120a`
+(crates/fe-kbuild). The default stays `sm_121a`.
+
 ## 1. A new kernel crate
 
 ```

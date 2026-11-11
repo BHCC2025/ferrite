@@ -31,11 +31,13 @@ pub struct MockConfig {
     pub prefill_tps: f64,
     pub max_batch: usize,
     pub max_context: usize,
+    /// Prompt tokens reported as served from a prompt cache (at most the prompt length - 1); 0 = none.
+    pub cached_prompt_tokens: usize,
 }
 
 impl Default for MockConfig {
     fn default() -> Self {
-        Self { delay: Duration::from_millis(5), burst: 1, prefill_tps: 0.0, max_batch: 4, max_context: 131_072 }
+        Self { delay: Duration::from_millis(5), burst: 1, prefill_tps: 0.0, max_batch: 4, max_context: 131_072, cached_prompt_tokens: 0 }
     }
 }
 
@@ -67,14 +69,16 @@ impl Engine for MockEngine {
 
 fn run(tok: &Tok, cfg: &MockConfig, req: GenRequest, sink: TokenSink) {
     let p = &req.params;
+    let cached = cfg.cached_prompt_tokens.min(req.prompt_ids.len().saturating_sub(1));
+    let done = |reason: FinishReason| Finish { reason, cached_prompt_tokens: cached, timings: None };
     let prompt = match tok.decode(&req.prompt_ids, false) {
         Ok(s) => s,
-        Err(e) => return sink.finish(Finish::new(FinishReason::Error(format!("mock: {e}")))),
+        Err(e) => return sink.finish(done(FinishReason::Error(format!("mock: {e}")))),
     };
     let plan = plan_response(&prompt);
     let canned = match tok.encode(&plan.text) {
         Ok(ids) => ids,
-        Err(e) => return sink.finish(Finish::new(FinishReason::Error(format!("mock: {e}")))),
+        Err(e) => return sink.finish(done(FinishReason::Error(format!("mock: {e}")))),
     };
     if cfg.prefill_tps > 0.0 {
         let total = Duration::from_secs_f64(req.prompt_ids.len() as f64 / cfg.prefill_tps);
@@ -83,7 +87,7 @@ fn run(tok: &Tok, cfg: &MockConfig, req: GenRequest, sink: TokenSink) {
         let mut left = total;
         while !left.is_zero() {
             if req.cancel.is_cancelled() || sink.is_closed() {
-                return sink.finish(Finish::new(FinishReason::Cancelled));
+                return sink.finish(done(FinishReason::Cancelled));
             }
             let d = left.min(slice);
             std::thread::sleep(d);
@@ -97,7 +101,7 @@ fn run(tok: &Tok, cfg: &MockConfig, req: GenRequest, sink: TokenSink) {
     let mut generated = 0usize;
     loop {
         if req.cancel.is_cancelled() || sink.is_closed() {
-            return sink.finish(Finish::new(FinishReason::Cancelled));
+            return sink.finish(done(FinishReason::Cancelled));
         }
         let mut step = Vec::with_capacity(cfg.burst);
         let mut stop = None;
@@ -131,13 +135,13 @@ fn run(tok: &Tok, cfg: &MockConfig, req: GenRequest, sink: TokenSink) {
         }
         generated += step.len();
         if !step.is_empty() && !sink.send_tokens(step) {
-            return sink.finish(Finish::new(FinishReason::Cancelled));
+            return sink.finish(done(FinishReason::Cancelled));
         }
         if let Some(t) = stop {
-            return sink.finish(Finish::new(FinishReason::Stop(t)));
+            return sink.finish(done(FinishReason::Stop(t)));
         }
         if generated >= p.max_tokens {
-            return sink.finish(Finish::new(FinishReason::Length));
+            return sink.finish(done(FinishReason::Length));
         }
     }
 }

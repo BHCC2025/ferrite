@@ -649,6 +649,7 @@ fn cmd_bench(model: &Path, lens: &[usize], dec: usize, slots: usize) -> Result<(
         let pf = t.elapsed().as_secs_f64();
         let mut next = e.argmax(1)?[0];
         // one warm-up step (graph capture), then timed decode
+        e.fwd_prof_report("prefill");
         e.forward(&[(0, &[next])], &[0])?;
         next = e.argmax(1)?[0];
         let t = Instant::now();
@@ -657,7 +658,8 @@ fn cmd_bench(model: &Path, lens: &[usize], dec: usize, slots: usize) -> Result<(
             next = e.argmax(1)?[0];
         }
         let dt = t.elapsed().as_secs_f64();
-        println!("bench len {len:6}: prefill {:7.0} tok/s ({pf:.2}s)   decode {:6.2} tok/s ({:.1} ms/tok)", len as f64 / pf,
+e.fwd_prof_report("decode");
+                println!("bench len {len:6}: prefill {:7.0} tok/s ({pf:.2}s)   decode {:6.2} tok/s ({:.1} ms/tok)", len as f64 / pf,
             dec as f64 / dt, dt * 1e3 / dec as f64);
     }
     if slots > 1 {

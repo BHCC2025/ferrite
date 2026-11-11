@@ -12,5 +12,9 @@ fe-exl3 = { path = "../fe-exl3" }
 anyhow.workspace = true
 libc = "0.2"
 
+[features]
+# link libibverbs for the two-node RoCE path on hosts other than aarch64 (the DGX Spark build always links it)
+roce = []
+
 [build-dependencies]
 fe-kbuild.workspace = true

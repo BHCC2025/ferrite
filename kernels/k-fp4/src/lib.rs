@@ -65,6 +65,21 @@ fn mma_fp8(d: &mut [f32; 4], a: [u32; 4], b: [u32; 2]) {
     }
 }
 
+/// D += A . B, e4m3 x e4m3, m16n8k32, through the block-scaled form with every scale 1 (ue8m0 code 127): the
+/// same products as `mma_fp8` on the block-scaled datapath.
+#[inline(always)]
+fn mma_fp8_bs(d: &mut [f32; 4], a: [u32; 4], b: [u32; 2]) {
+    unsafe {
+        asm!("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 \
+              {{{d0}, {d1}, {d2}, {d3}}}, {{{a0}, {a1}, {a2}, {a3}}}, {{{b0}, {b1}}}, {{{d0}, {d1}, {d2}, {d3}}}, \
+              {{{sc}}}, {{{z}, {z}}}, {{{sc}}}, {{{z}, {z}}};",
+            d0 = inout(reg32) d[0], d1 = inout(reg32) d[1], d2 = inout(reg32) d[2], d3 = inout(reg32) d[3],
+            a0 = in(reg32) a[0], a1 = in(reg32) a[1], a2 = in(reg32) a[2], a3 = in(reg32) a[3],
+            b0 = in(reg32) b[0], b1 = in(reg32) b[1], sc = in(reg32) 0x7f7f_7f7fu32, z = in(reg16) 0u16,
+            options(nomem, nostack));
+    }
+}
+
 /// Same as `mma_fp8` through the sm_89 form (no `kind::`), for the peak probe.
 #[inline(always)]
 fn mma_fp8_legacy(d: &mut [f32; 4], a: [u32; 4], b: [u32; 2]) {
@@ -271,7 +286,7 @@ fn wait_stages<const STAGES: u32>() {
 /// 2 along M x 4 along N, warp tile 64 x 32*NH), STAGES-deep cp.async ring, 1-D grid of
 /// ceil(M/128) * N/(128 NH) CTAs in a grouped raster.
 #[inline(always)]
-unsafe fn gemm<const FP4: bool, const NH: u32, const STAGES: u32, const NOLOAD: bool, const SWIGLU: bool>(c: *mut u16,
+unsafe fn gemm<const FP4: bool, const NH: u32, const STAGES: u32, const NOLOAD: bool, const SWIGLU: bool, const BS: bool>(c: *mut u16,
     a: *const u8, sa: *const u8, w: *const u8, sw: *const u8, alpha: *const f32, res: *const u16, m: u32, n: u32, k: u32,
     ldc: u32, group_m: u32, q_codes: *mut u8, q_sf: *mut u8, qg: f32) {
     let smem: Shared<u8> = dyn_base();
@@ -366,7 +381,7 @@ unsafe fn gemm<const FP4: bool, const NH: u32, const STAGES: u32, const NOLOAD: 
                 kcommon::unroll!(mt in 4 => {
                     kcommon::unroll!(j in 8 => {
                         if (j as u32) < 4 * NH {
-                            mma_fp8(&mut acc[mt][j], af[mt], bf[j]);
+                            if BS { mma_fp8_bs(&mut acc[mt][j], af[mt], bf[j]) } else { mma_fp8(&mut acc[mt][j], af[mt], bf[j]) }
                         }
                     });
                 });
@@ -445,13 +460,13 @@ unsafe fn epilogue_staged<const NH: u32>(acc: [[[f32; 4]; 8]; 4], smem: Shared<u
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn fe_gemm_nvfp4(c: *mut u16, a: *const u8, sa: *const u8, w: *const u8,
     sw: *const u8, alpha: *const f32, res: *const u16, m: u32, n: u32, k: u32, ldc: u32, group_m: u32) {
-    gemm::<true, 1, 4, false, false>(c, a, sa, w, sw, alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
+    gemm::<true, 1, 4, false, false, false>(c, a, sa, w, sw, alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
 }
 /// 128 x 256 tiles, 3 stages: N % 256 == 0, grid = ceil(M/128) * N/256, smem = FP4_SMEM_N256.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn fe_gemm_nvfp4_n256(c: *mut u16, a: *const u8, sa: *const u8, w: *const u8,
     sw: *const u8, alpha: *const f32, res: *const u16, m: u32, n: u32, k: u32, ldc: u32, group_m: u32) {
-    gemm::<true, 2, 3, false, false>(c, a, sa, w, sw, alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
+    gemm::<true, 2, 3, false, false, false>(c, a, sa, w, sw, alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
 }
 
 /// FP8 (e4m3) x FP8 -> bf16, per-column `alpha`. N % 128 == 0, K % 64 == 0.
@@ -459,13 +474,13 @@ pub unsafe extern "ptx-kernel" fn fe_gemm_nvfp4_n256(c: *mut u16, a: *const u8, 
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn fe_gemm_fp8(c: *mut u16, a: *const u8, w: *const u8, alpha: *const f32,
     res: *const u16, m: u32, n: u32, k: u32, ldc: u32, group_m: u32) {
-    gemm::<false, 1, 4, false, false>(c, a, core::ptr::null(), w, core::ptr::null(), alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
+    gemm::<false, 1, 4, false, false, false>(c, a, core::ptr::null(), w, core::ptr::null(), alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
 }
 /// 128 x 256 tiles, 3 stages: N % 256 == 0, smem = FP8_SMEM_N256.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn fe_gemm_fp8_n256(c: *mut u16, a: *const u8, w: *const u8, alpha: *const f32,
     res: *const u16, m: u32, n: u32, k: u32, ldc: u32, group_m: u32) {
-    gemm::<false, 2, 3, false, false>(c, a, core::ptr::null(), w, core::ptr::null(), alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
+    gemm::<false, 2, 3, false, false, false>(c, a, core::ptr::null(), w, core::ptr::null(), alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
 }
 
 // ---- mbarrier-pipelined variant -------------------------------------------------------------------
@@ -731,7 +746,7 @@ unsafe fn swiglu_epilogue(acc: [[[f32; 4]; 8]; 4], alpha: *const f32, m: u32, n:
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn fe_gemm_nvfp4_swiglu(a: *const u8, sa: *const u8, w: *const u8, sw: *const u8,
     alpha: *const f32, m: u32, n: u32, k: u32, group_m: u32, q_codes: *mut u8, q_sf: *mut u8, qg: f32) {
-    gemm::<true, 2, 3, false, true>(core::ptr::null_mut(), a, sa, w, sw, alpha, core::ptr::null(), m, n, k, 0, group_m,
+    gemm::<true, 2, 3, false, true, false>(core::ptr::null_mut(), a, sa, w, sw, alpha, core::ptr::null(), m, n, k, 0, group_m,
         q_codes, q_sf, qg);
 }
 /// The same on the mbarrier pipeline (`fe_gemm_nvfp4_mb`), smem = FP4_SMEM_MB.
@@ -790,14 +805,29 @@ pub unsafe extern "ptx-kernel" fn fe_fp4_swiglu_quant(q_codes: *mut u8, q_sf: *m
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn fe_gemm_fp8_s3(c: *mut u16, a: *const u8, w: *const u8, alpha: *const f32,
     res: *const u16, m: u32, n: u32, k: u32, ldc: u32, group_m: u32) {
-    gemm::<false, 1, 3, false, false>(c, a, core::ptr::null(), w, core::ptr::null(), alpha, res, m, n, k, ldc, group_m,
+    gemm::<false, 1, 3, false, false, false>(c, a, core::ptr::null(), w, core::ptr::null(), alpha, res, m, n, k, ldc, group_m,
+        core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
+}
+/// `fe_gemm_fp8_s3` on the block-scaled tensor-core form with unit scales (`mma_fp8_bs`): the same products, twice
+/// the tensor-core rate on RTX 50 cards (fp4-peak). Same arguments, grid and smem.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn fe_gemm_fp8_s3_bs(c: *mut u16, a: *const u8, w: *const u8, alpha: *const f32,
+    res: *const u16, m: u32, n: u32, k: u32, ldc: u32, group_m: u32) {
+    gemm::<false, 1, 3, false, false, true>(c, a, core::ptr::null(), w, core::ptr::null(), alpha, res, m, n, k, ldc, group_m,
+        core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
+}
+/// `fe_gemm_fp8_n256` on the block-scaled form (128 x 256 tiles, one CTA a SM). smem = FP8_SMEM_N256.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn fe_gemm_fp8_n256_bs(c: *mut u16, a: *const u8, w: *const u8, alpha: *const f32,
+    res: *const u16, m: u32, n: u32, k: u32, ldc: u32, group_m: u32) {
+    gemm::<false, 2, 3, false, false, true>(c, a, core::ptr::null(), w, core::ptr::null(), alpha, res, m, n, k, ldc, group_m,
         core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
 }
 /// NVFP4, 128 x 128 tiles, 2 stages (36 KB: two CTAs a SM). smem = FP4_SMEM_S2.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn fe_gemm_nvfp4_s2(c: *mut u16, a: *const u8, sa: *const u8, w: *const u8,
     sw: *const u8, alpha: *const f32, res: *const u16, m: u32, n: u32, k: u32, ldc: u32, group_m: u32) {
-    gemm::<true, 1, 2, false, false>(c, a, sa, w, sw, alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(),
+    gemm::<true, 1, 2, false, false, false>(c, a, sa, w, sw, alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(),
         core::ptr::null_mut(), 0.0);
 }
 
@@ -824,7 +854,7 @@ pub const FP8_SMEM_MB: u32 = 3 * stage_bytes(false, 2) + 64;
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn fe_gemm_nvfp4_n256_noload(c: *mut u16, a: *const u8, sa: *const u8, w: *const u8,
     sw: *const u8, alpha: *const f32, res: *const u16, m: u32, n: u32, k: u32, ldc: u32, group_m: u32) {
-    gemm::<true, 2, 3, true, false>(c, a, sa, w, sw, alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
+    gemm::<true, 2, 3, true, false, false>(c, a, sa, w, sw, alpha, res, m, n, k, ldc, group_m, core::ptr::null_mut(), core::ptr::null_mut(), 0.0);
 }
 
 // ---- peak probe -------------------------------------------------------------------------------
@@ -839,7 +869,16 @@ pub unsafe extern "ptx-kernel" fn fe_fp4_peak(out: *mut f32, iters: u32, fp4: u3
     let b = [0x22222222u32, 0x11111111 ^ l];
     let mut acc = [[[0.0f32; 4]; 4]; 4];
     let mut i = 0;
-    if fp4 == 2 {
+    if fp4 == 3 {
+        while i < iters {
+            kcommon::unroll!(mt in 4 => {
+                kcommon::unroll!(nt in 4 => {
+                    mma_fp8_bs(&mut acc[mt][nt], a, b);
+                });
+            });
+            i += 1;
+        }
+    } else if fp4 == 2 {
         while i < iters {
             kcommon::unroll!(mt in 4 => {
                 kcommon::unroll!(nt in 4 => {

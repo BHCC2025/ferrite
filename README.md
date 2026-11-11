@@ -10,10 +10,22 @@ and 128K context.
 
 An experimental second target serves the same model on one **Intel Arc Pro B70**, with Rust kernels compiled to
 SPIR-V and loaded through Level Zero: see [Intel Arc Pro B70](#intel-arc-pro-b70).
+The same CUDA engine also runs on one **RTX 5080** (16 GB) with a quantized K/V cache and the prompt weights
+streamed from host memory: see [docs/rtx-5080.md](docs/rtx-5080.md).
 
 > **Status: experimental.** One model (Qwen3.8-27B), one GPU (GB10 / `sm_121a`). At most 4 requests run at once
 > with DFlash2 drafting; more wait in a queue. It works, but expect rough edges. Issues and measurements from other
 > Sparks are welcome.
+
+## Supported systems
+
+**Linux only.** macOS and Windows are not supported.
+
+| Target | Operating system | CPU | GPU and driver | How you get it |
+|---|---|---|---|---|
+| NVIDIA DGX Spark, one or two | DGX OS (Ubuntu 24.04) | aarch64 | GB10, NVIDIA driver 580+, CUDA 13 | Prebuilt package, or from source |
+| NVIDIA RTX 5080 (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 595, CUDA 13 toolkit | From source: [docs/rtx-5080.md](docs/rtx-5080.md) |
+| Intel Arc Pro B70 (experimental) | Linux with the `xe` kernel driver; tested on Arch Linux | x86_64 | 32 GB, Level Zero loader 1.32+ | From source: [docs/arc-b70.md](docs/arc-b70.md) |
 
 ## Why Ferrite exists
 
@@ -150,6 +162,19 @@ scripts/fetch-models.sh xq draft && scripts/serve-xe.sh
 
 Requirements, the model ([`BHCC2025/Qwen3.8-27B-XQ-5.0bpw-mix`](docs/model-card-xq.md)), settings and how it works:
 [docs/arc-b70.md](docs/arc-b70.md).
+
+## NVIDIA RTX 5080
+
+One RTX 5080 (16 GB) serves the model with 128K context: the kernels are built for `sm_120a` (`FE_KARCH=sm_120a`),
+the K/V cache is stored at 6 bits, the NVFP4/FP8 prompt weights stream from pinned host memory, and drafting is the
+MTP head with copy rows. It is experimental and built from source:
+
+```bash
+FE_KARCH=sm_120a cargo build --release -p fe-server --features ferrite -p fe-cli
+scripts/fetch-models.sh quant prompt && tools/serve-5080.sh
+```
+
+Requirements, settings, results and how it fits: [docs/rtx-5080.md](docs/rtx-5080.md).
 
 ## How it gets its speed
 

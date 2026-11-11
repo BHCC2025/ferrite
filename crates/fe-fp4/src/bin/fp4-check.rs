@@ -52,6 +52,20 @@ fn check(kern: &Kernels, lt: &Lt, s: &Stream, ck: &Checkpoint, parts: &[&str], m
     s.sync()?;
     let yg = y.to_vec()?;
 
+    // (0) FP8: the block-scaled tensor-core form (FE_FP8_BS) must give the plain form's bits
+    if !fp4 {
+        let y2 = DeviceBuffer::<u16>::zeroed(m * n)?;
+        let f = if kern.fp8_bs { &kern.gemm8s3 } else { &kern.gemm8s3_bs };
+        unsafe {
+            s.launch(f, (m.div_ceil(128) * (n / 128)) as u32, 256, fe_fp4::FP8_SMEM_S3, (y2.ptr(), ws.codes.ptr(), lin.w.ptr(),
+                lin.alpha.ptr(), fe_cuda::DevPtr::NULL, m as u32, n as u32, k as u32, n as u32, 8u32))?;
+        }
+        s.sync()?;
+        let y2 = y2.to_vec()?;
+        let diff = yg.iter().zip(&y2).filter(|(a, b)| a != b).count();
+        println!("  FP8 plain vs block-scaled form: {diff} of {} outputs differ", yg.len());
+    }
+
     // (1) quantizer bit-exactness
     let row_bytes = if fp4 { k / 2 } else { k };
     let mut codes = vec![0u8; m * row_bytes];

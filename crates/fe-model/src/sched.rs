@@ -28,6 +28,17 @@ impl Default for SchedOptions {
     }
 }
 impl SchedOptions {
+    /// FE_POOL=1 (tools/serve-5080.sh with SLOTS > 1): the slots' contexts are one pool. A request that fits a slot
+    /// (`max_ctx` tokens with its reply) runs beside others; a larger one takes slot 0 with every slot's context, up
+    /// to `n_slots * max_ctx` tokens, and runs alone (the others wait in the queue; conversations in its way are
+    /// parked first).
+    pub fn pool(&self) -> bool {
+        self.n_slots > 1 && std::env::var("FE_POOL").is_ok_and(|v| v == "1")
+    }
+    /// tokens a request may hold
+    pub fn pool_ctx(&self) -> usize {
+        if self.pool() { self.n_slots * self.max_ctx } else { self.max_ctx }
+    }
     /// Rows a forward may carry (the engine's max_rows): FE_BATCH_ROWS, default the chunks of up to 4 prompts, so
     /// requests that arrive together prefill in one forward (M-wide prompt GEMMs) instead of a chunk a step.
     pub fn batch_rows(&self) -> usize {
@@ -187,7 +198,7 @@ enum Cmd {
 
 pub struct Scheduler {
     tx: mpsc::Sender<Cmd>,
-    n_slots: usize,
+    max_batch: usize,
     max_ctx: usize,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -196,14 +207,14 @@ impl Scheduler {
     /// Load the model on a new engine thread; returns once it is ready.
     pub fn start(model_dir: &Path, opts: SchedOptions) -> Result<Scheduler> {
         let (tx, rx) = mpsc::channel::<Cmd>();
-        let (rtx, rrx) = mpsc::channel::<Result<()>>();
+        let (rtx, rrx) = mpsc::channel::<Result<usize>>();
         let dir: PathBuf = model_dir.to_path_buf();
         let o = opts.clone();
         let thread = std::thread::Builder::new().name("ferrite-engine".into()).spawn(move || {
             let built = (|| -> Result<(Arc<fe_cuda::Context>, Engine)> {
                 // whole model, or TP rank 0 (FE_TP_*: rank 1 runs `ferrite <model> follow`)
                 // copy rows verify longer segments than the drafter's: the GDN replay keeps rows for them
-                let hist = if o.spec_depth > 0 && copy_rows() > 0 { o.spec_depth.max(copy_rows() + 1).max(TREE_ROWS) }
+                let hist = if o.spec_depth > 0 && copy_rows() > 0 { o.spec_depth.max(copy_rows() + 1).max(copy_hist_min(o.drafter.is_some(), o.spec_depth)) }
                     else { o.spec_depth };
                 crate::tp::load_engine(&dir, o.n_slots, o.max_ctx, o.batch_rows(), hist, false)
             })();
@@ -228,7 +239,10 @@ impl Scheduler {
                         let _ = rtx.send(Err(err));
                         return;
                     }
-                    let _ = rtx.send(Ok(()));
+                    // requests it decodes at once: every slot, but with the block drafter alone (no MTP head to fall
+                    // back on) one draft pass serves DF_PASS_STREAMS streams
+                    let batch = if w.df.is_some() && !w.e.has_mtp() { w.o.n_slots.min(DF_PASS_STREAMS) } else { w.o.n_slots };
+                    let _ = rtx.send(Ok(batch));
                     w.run(rx);
                 }
                 Err(err) => {
@@ -236,12 +250,13 @@ impl Scheduler {
                 }
             }
         })?;
-        rrx.recv()??;
-        Ok(Scheduler { tx, n_slots: opts.n_slots, max_ctx: opts.max_ctx, thread: Some(thread) })
+        let max_batch = rrx.recv()??;
+        Ok(Scheduler { tx, max_batch, max_ctx: opts.pool_ctx(), thread: Some(thread) })
     }
-    /// (max_batch, max_context)
+    /// (max_batch, max_context): the requests the loaded engine decodes at once (the slots; at most
+    /// DF_PASS_STREAMS when DFlash2 is the only drafter) and the tokens a request may hold
     pub fn info(&self) -> (usize, usize) {
-        (self.n_slots, self.max_ctx)
+        (self.max_batch, self.max_ctx)
     }
     /// Non-blocking. `sink` runs on the engine thread; returning false cancels the request.
     pub fn submit(&self, req: Request, sink: Sink) {
@@ -264,9 +279,16 @@ struct Active {
     req: Request,
     sink: Sink,
     slot: usize,
+    /// tokens its slot may hold: the slot's own context, or the whole pool for a wide request (SchedOptions::pool)
+    cap: usize,
     /// prompt tokens already in the cache
     fed: usize,
     cached: usize,
+    /// prompt cache: where this prompt is cut (ascending): the request's snapshot points (cut_points) and `share`
+    cuts: Vec<usize>,
+    /// share points (Worker::share_wait): positions on the 32-row grid where requests waiting in the queue resume;
+    /// a shared-prefix entry is stored when the prefill reaches one
+    share: Vec<usize>,
     out: Vec<u32>,
     /// next token to feed (sampled, not yet in the cache)
     pending: Option<u32>,
@@ -330,6 +352,8 @@ struct Worker {
     /// FE_VERIFY_ROWS (default 32): the block drafter's verify rows a step, all streams together, split by
     /// recent acceptance (the EXL3 GEMV costs little more at 32 rows than at 16)
     verify_rows: usize,
+    /// FE_VERIFY_ROWS is set: the block drafter's verify rows do not follow the decoding streams
+    verify_fixed: bool,
     /// FE_COPY_ROWS (copy_rows) and FE_COPY_AGREE (default 3): a copy is grafted onto a tree only past this many
     /// rows of it the tree already holds
     copy: usize,
@@ -351,12 +375,17 @@ struct Worker {
     /// per slot: its snapshots (ascending positions; rows [0, pos) of the slot's KV), and the free state blocks
     slot_snaps: Vec<Vec<crate::pcache::Snap>>,
     blocks: crate::pcache::Blocks,
-    /// (slot, position, the request's first snapshot point) snapshots to take after this step's drafter absorb
+    /// (slot, position, also a shared-prefix entry: the request's first snapshot point or a share point) snapshots to
+    /// take after this step's drafter absorb
     snap_due: Vec<(usize, usize, bool)>,
     /// parked conversations and shared-prefix entries (FE_PARK_GB on the engine side), at most FE_PREFIX_ENTRIES (4)
     /// prefix entries
     park: crate::pcache::Park,
     prefix_max: usize,
+    /// FE_CACHE_LEAD_MIN (lead_min): snapshot points from this position on are moved LEAD rows earlier (0 = off)
+    lead_min: usize,
+    /// FE_CACHE_TRACE: the queued requests whose wait for a shared prefix was already logged
+    wait_said: std::collections::HashSet<String>,
 }
 
 /// FE_COPY_ROWS (default 0 = off): the most copy rows a greedy DFlash2 stream verifies (crate::copy). A copy starts
@@ -367,6 +396,20 @@ struct Worker {
 fn copy_rows() -> usize {
     std::env::var("FE_COPY_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize).min(crate::model::DEC_MAX - 1)
 }
+
+/// streams one DFlash2 draft pass serves (the launch scripts refuse more slots than this with DRAFT=dflash)
+const DF_PASS_STREAMS: usize = 4;
+/// GDN replay rows a slot keeps so that copy rows can be verified: a whole tree segment with the block drafter's
+/// trees; with the MTP head a chain of `spec` drafts and a first copy (COPY_LO rows) behind the row they start from.
+/// Every verify with copy rows is also bounded by the engine's hist_rows, so fewer rows only shorten copies.
+fn copy_hist_min(block_drafter: bool, spec: usize) -> usize {
+    if block_drafter { TREE_ROWS } else { (COPY_LO + 1 + spec).min(TREE_ROWS) }
+}
+
+/// shared context pool: the reply length a request is assumed to need at most when it is given one slot (a longer
+/// reply ends at the slot's context; a request whose prompt leaves less room than this, or than its max_tokens, is
+/// given the whole pool)
+const WIDE_REPLY: usize = 4608;
 
 /// rows a verify tree segment holds at most (the engine's tree mask is 32 bits)
 const TREE_ROWS: usize = 32;
@@ -385,6 +428,12 @@ const DECODE_ROWS: usize = crate::model::X3_ROWS;
 /// ties its text) with whatever else shares the steps. Cuts also never leave a tail of <= X3_ROWS rows (those take
 /// the decode GEMV / split attention, not the prompt kernels).
 const PROMPT_ALIGN: usize = 32;
+/// Shared-prefix entries hold at least this many tokens (a shorter prefix is cheaper to compute than to store).
+const PREFIX_MIN: usize = 1024;
+/// A waiting request uses a leader's existing share point up to this many rows before its own (Worker::share_wait),
+/// and a leader takes at most SHARE_MAX share points (each stores a prefix entry).
+const SHARE_NEAR: usize = 256;
+const SHARE_MAX: usize = 4;
 
 /// Rows of the next chunk of a prompt of `len` ids with `fed` already in, given `avail` rows (0: wait a step).
 /// `base`: where this request's prefill started (0, or the length of a reused cached prefix): cuts sit on the
@@ -401,6 +450,26 @@ pub fn prompt_cut(len: usize, base: usize, fed: usize, avail: usize) -> usize {
     end.saturating_sub(fed)
 }
 
+/// Where a queued prompt `p` (cut points `mine`) can share the prefill of an active prompt `q` (cut points `theirs`,
+/// `fed` rows in, share points `share`): the end of their common tokens, at least DECODE_ROWS + 1 rows before either
+/// prompt's end, moved back onto the 32-row grid from the last cut point of both before it; or an existing share
+/// point up to SHARE_NEAR rows before that. None: nothing to share (the common part is shorter than PREFIX_MIN, the
+/// active prompt is already past it, their cut points differ, or it has SHARE_MAX share points).
+pub fn share_point(p: &[u32], mine: &[usize], q: &[u32], theirs: &[usize], fed: usize, share: &[usize]) -> Option<usize> {
+    let l = p.iter().zip(q).take_while(|(x, y)| x == y).count();
+    let lim = l.min(p.len().saturating_sub(DECODE_ROWS + 1)).min(q.len().saturating_sub(DECODE_ROWS + 1));
+    // the last cut point of each inside the common text: the same position, or their grids differ
+    let last = |pts: &[usize]| pts.iter().rev().find(|&&x| x <= lim).copied().unwrap_or(0);
+    let base = last(theirs);
+    if last(mine) != base {
+        return None;
+    }
+    let pos = base + (lim - base) / PROMPT_ALIGN * PROMPT_ALIGN;
+    let pos = share.iter().copied().filter(|&c| c > fed && c <= pos && pos - c <= SHARE_NEAR).max().unwrap_or(pos);
+    // too short to store, or the active prompt is past it (its state there was not kept)
+    (pos >= PREFIX_MIN && pos > fed && (share.contains(&pos) || share.len() < SHARE_MAX)).then_some(pos)
+}
+
 /// MemAvailable from /proc/meminfo, in bytes.
 fn mem_available() -> Option<usize> {
     let m = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -413,6 +482,36 @@ fn mem_available() -> Option<usize> {
 fn cut_points(r: &Request, tailcut: bool) -> Vec<usize> {
     let len = r.prompt_ids.len();
     r.snapshots.iter().copied().filter(|&p| tailcut || p >= len || len - p > DECODE_ROWS).collect()
+}
+
+/// FE_CACHE_LEAD_MIN (default 4096 on small-memory devices, else 0 = off): snapshot points at or past this many
+/// tokens move back onto the prompt's chunk grid. The point of a turn's generation prompt lies within DECODE_ROWS of
+/// the prompt end, where nothing is cut or saved, so the next turn could only resume a turn further back and computed
+/// a long first prompt twice. Moved back to the last whole chunk before it (counted from the point before), it is
+/// where a forward ends anyway: the state is saved there at no cost, and the next turn resumes from it, computing at
+/// most one chunk of the old prompt again. The points stay a function of the prompt and the chunk size alone, so a
+/// resumed reply is still the full computation's.
+fn lead_min() -> usize {
+    std::env::var("FE_CACHE_LEAD_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if crate::lowmem::on() { 4096 } else { 0 })
+}
+
+/// `points` (ascending) with every point p >= `min` replaced by the end of the last whole `chunk` before it, counted
+/// from the point before it (0 for the first) and leaving more than DECODE_ROWS rows up to p; dropped when no whole
+/// chunk fits.
+pub fn lead_points(points: &[usize], min: usize, chunk: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::with_capacity(points.len());
+    for &p in points {
+        let base = out.last().copied().unwrap_or(0);
+        let q = if p >= min && chunk > 0 {
+            base + p.saturating_sub(DECODE_ROWS + 1).saturating_sub(base) / chunk * chunk
+        } else {
+            p
+        };
+        if q > base {
+            out.push(q);
+        }
+    }
+    out
 }
 
 /// FE_VERIFY_ROWS (default 48: one g6 GEMV pass; 4-stream code TP2 286 vs 264 at 32, TP1 208 vs 183; 64 gains
@@ -428,10 +527,12 @@ impl Worker {
         let v = e.cfg.vocab;
         // the engine may keep more history rows than the drafter's depth (copy rows)
         let spec = o.spec_depth.min(e.hist_rows);
-        let copy = if spec > 0 && e.hist_rows >= TREE_ROWS { copy_rows().min(e.hist_rows - 1) } else { 0 };
-        // prompt cache: DFlash2 / plain only (the MTP head's cache is not saved: exact-slot reuse as before)
+        let copy = if spec > 0 && e.hist_rows >= copy_hist_min(o.drafter.is_some(), o.spec_depth) { copy_rows().min(e.hist_rows - 1) } else { 0 };
+        // prompt cache: DFlash2 / plain; with the MTP head loaded only when FE_CACHE_MTP=1 (default on small-memory
+        // devices, crate::lowmem, where the MTP head is the drafter): the head's KV rows are parked and restored with
+        // the target's, and the one row a resume leaves it without only costs a draft
         let want_cache = std::env::var("FE_CACHE").is_ok_and(|v| v == "1");
-        let cache = want_cache && !e.has_mtp();
+        let cache = want_cache && (!e.has_mtp() || crate::lowmem::flag("FE_CACHE_MTP"));
         if want_cache && !cache {
             eprintln!("ferrite: FE_CACHE off with the MTP head loaded (DRAFT=mtp / auto): exact-slot prompt reuse only");
         }
@@ -445,7 +546,7 @@ impl Worker {
                 (std::env::var("FE_ARRIVAL_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(5.0) * 1e3) as u64),
             tree: std::env::var("FE_TREE").is_ok_and(|v| v == "1"),
             prof: std::env::var("FE_SCHED_PROF").is_ok_and(|v| v == "1" || v == "2").then_some(([0.0; 5], 0)),
-            prof_steps: std::env::var("FE_SCHED_PROF").is_ok_and(|v| v == "2"), verify_rows: verify_rows(n),
+            prof_steps: std::env::var("FE_SCHED_PROF").is_ok_and(|v| v == "2"), verify_rows: verify_rows(n), verify_fixed: std::env::var("FE_VERIFY_ROWS").is_ok(),
             copy,
             copy_agree: std::env::var("FE_COPY_AGREE").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
             cache,
@@ -457,6 +558,8 @@ impl Worker {
             slot_snaps: vec![Vec::new(); n], blocks: crate::pcache::Blocks::new(0), snap_due: Vec::new(),
             park: crate::pcache::Park::new(0),
             prefix_max: std::env::var("FE_PREFIX_ENTRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+            lead_min: lead_min(),
+            wait_said: std::collections::HashSet::new(),
             o }
     }
 
@@ -484,7 +587,12 @@ impl Worker {
             }
             for c in cmds {
                 match c {
-                    Cmd::Submit(r, s) => self.waiting.push_back((r, s)),
+                    Cmd::Submit(mut r, s) => {
+                        if self.cache && self.lead_min > 0 {
+                            r.snapshots = lead_points(&r.snapshots, self.lead_min, self.o.prefill_chunk);
+                        }
+                        self.waiting.push_back((r, s))
+                    }
                     Cmd::Shutdown => return,
                 }
             }
@@ -517,40 +625,106 @@ impl Worker {
         }
     }
 
-    /// Prompt cache: a request whose first snapshot point (the shared system prompt, >= 1024 rows) nothing cached
-    /// covers, while an active request with the same tokens there is still prefilling toward it, waits: the
-    /// leader's prefix entry then serves it (several agents starting together prefill the prefix once).
-    fn prefix_lead(&self, p: &[u32], points: &[usize]) -> bool {
-        let Some(&s0) = points.first().filter(|&&s0| s0 >= 1024 && s0 < p.len()) else { return false };
-        if self.park.has_prefix(&p[..s0]) {
-            return false;
+    /// The longest resume point the caches hold for prompt `p` right now (a free slot's snapshot, a parked
+    /// conversation or a shared-prefix entry); 0: none.
+    fn cached_pos(&self, p: &[u32]) -> usize {
+        let slot = (0..self.o.n_slots).filter(|&s| !self.slot_busy[s])
+            .filter_map(|s| crate::pcache::best_snap(&self.slot_tokens[s], &self.slot_snaps[s], p, self.min_tail()))
+            .map(|x| x.pos).max();
+        slot.max(self.park.best(p, self.min_tail()).map(|(_, x)| x.pos)).unwrap_or(0)
+    }
+
+    /// Shared prefix, computed once (docs/prompt-cache.md). A request waits in the queue while an active request is
+    /// still prefilling text both start with, further than anything cached covers: the active request (the leader)
+    /// stores a shared-prefix entry when its prefill gets there, and the waiting one resumes from it. Requests that
+    /// arrive together and start with the same text (parallel lanes of one job, agents with one system prompt)
+    /// therefore compute that text once, even though no cache held it when they were queued.
+    ///
+    /// Where they share: the end of their common tokens, moved back onto the 32-row grid from the last snapshot
+    /// point before it (and at least DECODE_ROWS + 1 rows before either prompt's end). A cut on that grid does not
+    /// change a prompt's rows (PROMPT_ALIGN), and the grid after it stays where it was, so the leader and the
+    /// waiting request both produce exactly what they produce alone. The position becomes one of the leader's cut
+    /// points (`Active::share`); a leader's share point within SHARE_NEAR rows before it is used instead, so lanes
+    /// whose tails start alike share one entry.
+    /// Returns the position the request waits for, or None when it should be admitted now.
+    fn share_wait(&mut self, req: &Request) -> Option<usize> {
+        let p = &req.prompt_ids;
+        if p.len() <= PREFIX_MIN + DECODE_ROWS {
+            return None;
         }
-        self.active.iter().any(|a| a.fed < s0 && a.req.snapshots.first() == Some(&s0) && a.req.prompt_ids.len() > s0
-            && a.req.prompt_ids[..s0] == p[..s0])
+        let mine = cut_points(req, self.tailcut);
+        let mut best: Option<(usize, usize)> = None; // (active index, position)
+        for (ai, a) in self.active.iter().enumerate() {
+            let q = &a.req.prompt_ids;
+            if a.pending.is_some() || a.fed >= q.len() {
+                continue; // its prompt is in
+            }
+            let Some(pos) = share_point(p, &mine, q, &cut_points(&a.req, self.tailcut), a.fed, &a.share) else { continue };
+            if best.is_none_or(|b| pos > b.1) {
+                best = Some((ai, pos));
+            }
+        }
+        let (ai, pos) = best.filter(|b| b.1 > self.cached_pos(p))?;
+        let a = &mut self.active[ai];
+        if !a.share.contains(&pos) {
+            a.share.push(pos);
+        }
+        if let Err(i) = a.cuts.binary_search(&pos) {
+            a.cuts.insert(i, pos);
+        }
+        if self.cache_trace && self.wait_said.insert(req.id.clone()) {
+            eprintln!("cache: {} waits for {}'s prefill to reach {pos} (shared prefix)", req.id, self.active[ai].req.id);
+        }
+        Some(pos)
+    }
+
+    /// a wide request (the whole context pool in slot 0) is running
+    fn wide_active(&self) -> bool {
+        self.active.iter().any(|a| a.cap > self.o.max_ctx)
     }
 
     fn admit_inner(&mut self, held: &mut Vec<(Request, Sink)>) {
         while let Some((req, mut sink)) = self.waiting.pop_front() {
-            if self.cache && self.cache_restore && self.prefix_lead(&req.prompt_ids, &req.snapshots) {
-                let free_snap = (0..self.o.n_slots).filter(|&s| !self.slot_busy[s]).any(|s| {
-                    crate::pcache::best_snap(&self.slot_tokens[s], &self.slot_snaps[s], &req.prompt_ids, self.min_tail())
-                        .is_some_and(|x| Some(&x.pos) >= req.snapshots.first())
-                });
-                if !free_snap && self.park.best(&req.prompt_ids, self.min_tail()).is_none_or(|(_, x)| Some(&x.pos) < req.snapshots.first()) {
-                    if self.cache_trace {
-                        eprintln!("cache: {} waits for a prefix being prefilled", req.id);
-                    }
-                    held.push((req, sink));
-                    continue;
-                }
-            }
-            let p = &req.prompt_ids;
-            if p.is_empty() || p.len() + 1 + self.spec > self.o.max_ctx {
-                sink(Event::Finished { reason: Finish::Error(format!("prompt of {} tokens (max {})", p.len(),
-                    self.o.max_ctx - 1 - self.spec)), cached_prompt_tokens: 0 });
+            if self.cache && self.cache_restore && self.cache_save_on && self.prefix_max > 0 && self.share_wait(&req).is_some() {
+                held.push((req, sink));
                 continue;
             }
-            let free: Vec<usize> = (0..self.o.n_slots).filter(|&s| !self.slot_busy[s]).collect();
+            self.wait_said.remove(&req.id);
+            let p = &req.prompt_ids;
+            if p.is_empty() || p.len() + 1 + self.spec > self.o.pool_ctx() {
+                sink(Event::Finished { reason: Finish::Error(format!("prompt of {} tokens (max {})", p.len(),
+                    self.o.pool_ctx() - 1 - self.spec)), cached_prompt_tokens: 0 });
+                continue;
+            }
+            // shared context pool: a request that does not fit one slot with its reply takes them all, alone
+            let wide = self.o.pool() && p.len() + 1 + self.spec + req.sampling.max_tokens.min(WIDE_REPLY) > self.o.max_ctx;
+            if self.o.pool() && (self.wide_active() || (wide && !self.active.is_empty())) {
+                self.waiting.push_front((req, sink));
+                return;
+            }
+            if wide {
+                // every other slot's conversation goes to the park pool: this one's rows will run through them
+                let mut failed = None;
+                for s in 1..self.o.n_slots {
+                    if let Err(err) = self.park_slot(s).and_then(|_| self.e.reset_slot(s)) {
+                        failed = Some(err);
+                        break;
+                    }
+                    self.slot_tokens[s].clear();
+                }
+                if let Some(err) = failed {
+                    sink(Event::Finished { reason: Finish::Error(format!("{err:#}")), cached_prompt_tokens: 0 });
+                    continue;
+                }
+            } else if self.o.pool() && self.e.slot_len[0] > self.o.max_ctx {
+                // slot 0 still holds a wide conversation: park it before the other slots are written again
+                if let Err(err) = self.park_slot(0).and_then(|_| self.e.reset_slot(0)) {
+                    sink(Event::Finished { reason: Finish::Error(format!("{err:#}")), cached_prompt_tokens: 0 });
+                    continue;
+                }
+                self.slot_tokens[0].clear();
+            }
+            let free: Vec<usize> = (0..self.o.n_slots).filter(|&s| !self.slot_busy[s] && (!wide || s == 0)).collect();
             if free.is_empty() {
                 self.waiting.push_front((req, sink));
                 return;
@@ -627,9 +801,13 @@ impl Worker {
             self.slot_used[slot] = self.tick;
             let seed = req.sampling.seed.unwrap_or(0x9e37_79b9_7f4a_7c15 ^ self.tick);
             let depth = if self.df.is_some() { self.spec } else { self.spec.min(4) };
-            let copier = (self.copy > 0 && self.tree && self.df.is_some() && req.sampling.greedy())
+            // copy rows: greedy streams of the block drafter's trees, or of the MTP head (its chain and the copy
+            // share a verify tree)
+            let copier = (self.copy > 0 && req.sampling.greedy() && ((self.tree && self.df.is_some()) || (self.df.is_none() && self.e.has_mtp())))
                 .then(|| crate::copy::Copier::new(COPY_LO, self.copy.max(COPY_LO)));
-            self.active.push(Active { req, sink, slot, fed: cached, cached, out: Vec::new(), pending: None,
+            let cuts = if self.cache { cut_points(&req, self.tailcut) } else { Vec::new() };
+            let cap = if wide { self.o.pool_ctx() } else { self.o.max_ctx };
+            self.active.push(Active { req, sink, slot, cap, fed: cached, cached, cuts, share: Vec::new(), out: Vec::new(), pending: None,
                 drafts: Vec::new(), tree: None, copier, copied: (0, 0), out_idx: 0, depth, acc_ema: depth as f32, rounds: 0,
                 accepted: 0, rng: seed | 1, t0: Instant::now(), ttft: None });
         }
@@ -669,7 +847,15 @@ impl Worker {
         if spec && use_df {
             // verify rows a stream: what its recent acceptance can use (FE_VERIFY_GAIN (1.0) x acc_ema + 2, so a
             // prose stream accepting ~1.3 asks for ~3 rows and a code stream ~9)
-            let gain: f32 = std::env::var("FE_VERIFY_GAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            // By decoding streams, when neither is set: three or more share 32 verify rows at gain 8 (each asks for
+            // its whole block, and one 32-row GEMV pass carries them), fewer keep 48 rows at gain 1. Total tokens/s
+            // of 3 / 4 parallel code streams on one GB10: 145 / 168 against 133 / 149; one and two streams are
+            // unchanged. The rows a stream verifies never change its tokens.
+            let many = ndec_now >= 3;
+            let gain: f32 = std::env::var("FE_VERIFY_GAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if many { 8.0 } else { 1.0 });
+            if !self.verify_fixed {
+                self.verify_rows = if many { 2 * DECODE_ROWS } else { 3 * DECODE_ROWS }.clamp(self.o.n_slots.max(2), crate::model::DEC_MAX);
+            }
             let want_rows = |a: &Active| (2.0 + gain * a.acc_ema.max(0.0)).round().clamp(2.0, (self.spec + 1) as f32);
             let wsum: f32 = self.active.iter().filter(|a| a.pending.is_some()).map(want_rows).sum();
             // up to DECODE_ROWS (16) rows a step cost the verify GEMV next to nothing, so a small demand is
@@ -688,7 +874,7 @@ impl Worker {
                     let n = if c.extra >= self.copy { self.copy } else { c.extra.min(TREE_ROWS - 1) }
                         .min(self.verify_rows - 1).min(self.e.hist_rows - 1)
                         .min(a.req.sampling.max_tokens.saturating_sub(a.out.len()))
-                        .min(self.o.max_ctx.saturating_sub(self.e.slot_len[a.slot] + 3));
+                        .min(a.cap.saturating_sub(self.e.slot_len[a.slot] + 3));
                     c.sync(&a.req.prompt_ids, &a.out);
                     let (copy, _) = c.propose(n);
                     if !copy.is_empty() {
@@ -706,7 +892,7 @@ impl Worker {
                     let rows = ((want_rows(a) * scale) as usize).max(2);
                     let cap = (rows - 1).min(self.spec);
                     let pos = self.e.slot_len[a.slot];
-                    if self.o.max_ctx.saturating_sub(pos + 2) >= df.max_drafts() + 1 {
+                    if a.cap.saturating_sub(pos + 2) >= df.max_drafts() + 1 {
                         // trees: greedy streams only; the tree's rows must fit the GDN replay (hist_rows)
                         let budget = if self.tree && a.req.sampling.greedy() { cap.min(self.spec.saturating_sub(1)) } else { 0 };
                         want.push((ai, a.slot, t, pos, cap, budget));
@@ -745,7 +931,7 @@ impl Worker {
                             let rows = par.len();
                             let room = c.extra.min(TREE_ROWS.saturating_sub(rows)).min(left)
                                 .min(a.req.sampling.max_tokens.saturating_sub(a.out.len()))
-                                .min(self.o.max_ctx.saturating_sub(self.e.slot_len[a.slot] + rows + 3));
+                                .min(a.cap.saturating_sub(self.e.slot_len[a.slot] + rows + 3));
                             if room == 0 {
                                 continue;
                             }
@@ -791,12 +977,33 @@ impl Worker {
         if spec && !use_df && self.e.has_mtp() {
             let ndec = self.active.iter().filter(|a| a.pending.is_some()).count().max(1);
             let cap = (DECODE_ROWS / ndec).saturating_sub(1).min(self.spec);
+            // copy rows: a lone stream whose copies keep landing whole verifies its copy alone as one chain, without
+            // chaining MTP drafts (as with the block drafter)
+            if self.copy > 0 && ndec_now == 1 {
+                for a in self.active.iter_mut().filter(|a| a.pending.is_some()) {
+                    let Some(c) = a.copier.as_mut() else { continue };
+                    if c.extra <= COPY_LO {
+                        continue;
+                    }
+                    let n = if c.extra >= self.copy { self.copy } else { c.extra.min(TREE_ROWS - 1) }
+                        .min(self.verify_rows - 1).min(self.e.hist_rows - 1)
+                        .min(a.req.sampling.max_tokens.saturating_sub(a.out.len()))
+                        .min(a.cap.saturating_sub(self.e.slot_len[a.slot] + 3));
+                    c.sync(&a.req.prompt_ids, &a.out);
+                    let (copy, _) = c.propose(n);
+                    if !copy.is_empty() {
+                        a.copied = (1, copy.len());
+                        a.drafts = copy;
+                        a.tree = None;
+                    }
+                }
+            }
             loop {
                 let mut rows = Vec::new();
                 let mut who = Vec::new();
                 for (ai, a) in self.active.iter().enumerate() {
-                    let want = a.depth.min(cap).min(self.o.max_ctx.saturating_sub(self.e.slot_len[a.slot] + 2));
-                    if a.pending.is_some() && !a.drafts.is_empty() && a.drafts.len() < want {
+                    let want = a.depth.min(cap).min(a.cap.saturating_sub(self.e.slot_len[a.slot] + 2));
+                    if a.pending.is_some() && a.copied.1 == 0 && !a.drafts.is_empty() && a.drafts.len() < want {
                         let k = a.drafts.len();
                         rows.push(MtpRow { slot: a.slot, pos: self.e.slot_len[a.slot] + k - 1, token: a.drafts[k - 1],
                             src: MtpSrc::Out(a.out_idx) });
@@ -813,8 +1020,48 @@ impl Worker {
                     self.active[ai].out_idx = j;
                 }
             }
-            for a in self.active.iter_mut() {
+            for a in self.active.iter_mut().filter(|a| a.copied.1 == 0) {
                 a.drafts.truncate(cap);
+            }
+            // copy rows grafted onto each stream's MTP chain: one verify tree holds both (the copy follows the chain
+            // while they agree, then branches), within the step's verify rows. A copy joins when it agrees with the
+            // chain's first draft or its match is long (COPY_SURE), and crosses a COPY_TIER row boundary only when
+            // its stream's copies keep landing whole or the match is long.
+            if self.copy > 0 {
+                let mut total: usize = self.active.iter().filter(|a| a.pending.is_some()).map(|a| 1 + a.drafts.len()).sum();
+                let mut left = self.verify_rows.saturating_sub(total);
+                for a in self.active.iter_mut() {
+                    let (Some(c), Some(t)) = (a.copier.as_mut(), a.pending) else { continue };
+                    if a.copied.1 > 0 {
+                        continue;
+                    }
+                    let rows = 1 + a.drafts.len();
+                    let room = c.extra.min(TREE_ROWS.saturating_sub(rows)).min(left).min(self.e.hist_rows.saturating_sub(rows))
+                        .min(a.req.sampling.max_tokens.saturating_sub(a.out.len()))
+                        .min(a.cap.saturating_sub(self.e.slot_len[a.slot] + rows + 3));
+                    if room == 0 {
+                        continue;
+                    }
+                    c.sync(&a.req.prompt_ids, &a.out);
+                    let (copy, matched) = c.propose(rows - 1 + room);
+                    let room = if c.extra > COPY_LO || matched >= COPY_SURE { room }
+                        else { room.min(total.next_multiple_of(COPY_TIER) - total) };
+                    if copy.is_empty() || room == 0 {
+                        continue;
+                    }
+                    let mut toks = Vec::with_capacity(rows + room);
+                    toks.push(t);
+                    toks.extend_from_slice(&a.drafts);
+                    let mut par: Vec<i32> = (0..rows as i32).map(|r| r - 1).collect();
+                    let (agree, added) = crate::copy::graft(&mut toks, &mut par, &copy, room);
+                    if added > 0 && (agree >= 1 || rows == 1 || matched >= COPY_SURE) {
+                        a.tree = Some(par);
+                        a.drafts = toks.split_off(1);
+                        a.copied = (rows, added);
+                        left -= added;
+                        total += added;
+                    }
+                }
             }
         }
         lap(&mut self.prof, 0);
@@ -849,7 +1096,7 @@ impl Worker {
             if a.pending.is_none() && a.fed < a.req.prompt_ids.len() && rows < budget {
                 let lim = self.o.prefill_chunk.min(budget - rows);
                 let mut n = if self.cache {
-                    prompt_cut_at(a.req.prompt_ids.len(), &cut_points(&a.req, self.tailcut), a.fed, lim)
+                    prompt_cut_at(a.req.prompt_ids.len(), &a.cuts, a.fed, lim)
                 } else {
                     prompt_cut(a.req.prompt_ids.len(), a.cached, a.fed, lim)
                 };
@@ -915,8 +1162,8 @@ impl Worker {
                 // prefill chunk: into the slot's bookkeeping; the last chunk samples the first token
                 self.slot_tokens[a.slot].extend_from_slice(&sg.1);
                 a.fed += n;
-                if self.cache && self.cache_save_on && cut_points(&a.req, self.tailcut).binary_search(&a.fed).is_ok() {
-                    self.snap_due.push((a.slot, a.fed, a.req.snapshots.first() == Some(&a.fed)));
+                if self.cache && self.cache_save_on && a.cuts.binary_search(&a.fed).is_ok() {
+                    self.snap_due.push((a.slot, a.fed, a.req.snapshots.first() == Some(&a.fed) || a.share.contains(&a.fed)));
                 }
                 let complete = a.fed == a.req.prompt_ids.len();
                 let mut first = None;
@@ -937,7 +1184,7 @@ impl Worker {
                     absorb.push((ai, rows, complete));
                 }
                 if let Some(t) = first {
-                    match Self::emit(a, &[t], self.e.slot_len[a.slot], self.o.max_ctx) {
+                    match Self::emit(a, &[t], self.e.slot_len[a.slot], a.cap) {
                         Some(f) => done.push((ai, f)),
                         None => a.pending = Some(t),
                     }
@@ -1026,12 +1273,13 @@ impl Worker {
             a.drafts.clear();
             a.pending = None;
             if spec {
+                // the kept rows' taps: consecutive rows of a chain, the path's rows of a tree
                 let rows: Vec<MtpRow> = (0..=acc).map(|i| MtpRow { slot: a.slot, pos: start + i, token: emitted[i],
-                    src: MtpSrc::Tap(r0 + i) }).collect();
+                    src: MtpSrc::Tap(r0 + path.as_ref().map_or(i, |p| p[i])) }).collect();
                 absorb.push((ai, rows, true));
             }
             let slot_len = self.e.slot_len[a.slot];
-            match Self::emit(a, &emitted, slot_len, self.o.max_ctx) {
+            match Self::emit(a, &emitted, slot_len, a.cap) {
                 Some(f) => done.push((ai, f)),
                 None => a.pending = emitted.last().copied(),
             }
@@ -1176,6 +1424,8 @@ impl Worker {
             return Ok(());
         }
         let extra = self.df.as_ref().map_or(0, |d| d.state_bytes());
+        anyhow::ensure!(extra == 0 || !crate::lowmem::flag("FE_PARK_HOST"),
+            "prompt cache: a drafter with saved state needs the park pool on the device (FE_PARK_HOST=0)");
         // the pool: FE_PARK_GB (default 24) but never closer than FE_PARK_RESERVE_GB (default 20) to running out of
         // available memory (MemAvailable, what memguard and the OOM killer see; TP1 128K slots leave ~31 GB)
         let gb: f64 = std::env::var("FE_PARK_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(24.0);
@@ -1266,10 +1516,11 @@ impl Worker {
         Ok(())
     }
 
-    /// The first snapshot point of a request (the end of the shared system prompt): keep it as a shared-prefix entry
-    /// (KV rows [0, pos) + its state) unless one with these tokens exists; at most `prefix_max` (LRU).
+    /// The first snapshot point of a request (the end of the shared system prompt) or one of its share points: keep
+    /// it as a shared-prefix entry (KV rows [0, pos) + its state) unless one with these tokens exists; at most
+    /// `prefix_max` (LRU).
     fn prefix_entry(&mut self, slot: usize, pos: usize) -> Result<()> {
-        if pos < 1024 || self.prefix_max == 0 || self.park.has_prefix(&self.slot_tokens[slot][..pos]) {
+        if pos < PREFIX_MIN || self.prefix_max == 0 || self.park.has_prefix(&self.slot_tokens[slot][..pos]) {
             return Ok(());
         }
         if self.park.prefixes() >= self.prefix_max {
@@ -1453,8 +1704,126 @@ pub fn prompt_cut_at(len: usize, points: &[usize], fed: usize, avail: usize) -> 
 }
 
 #[cfg(test)]
+mod share_tests {
+    use super::{prompt_cut_at, share_point, DECODE_ROWS, PROMPT_ALIGN};
+
+    /// two prompts with `common` equal tokens, then different tails
+    fn pair(common: usize, tail_a: usize, tail_b: usize) -> (Vec<u32>, Vec<u32>) {
+        let a: Vec<u32> = (0..common as u32).chain((0..tail_a as u32).map(|i| 1_000_000 + i)).collect();
+        let b: Vec<u32> = (0..common as u32).chain((0..tail_b as u32).map(|i| 2_000_000 + i)).collect();
+        (a, b)
+    }
+
+    #[test]
+    fn the_common_prefix_on_the_grid() {
+        let (a, b) = pair(5000, 300, 420);
+        // no snapshot points: the grid starts at 0
+        assert_eq!(share_point(&b, &[], &a, &[], 0, &[]), Some(4992));
+        // a snapshot point at 301 (the system prompt's end) in both: the grid starts there
+        assert_eq!(share_point(&b, &[301], &a, &[301], 0, &[]), Some(301 + (5000 - 301) / 32 * 32));
+        // the leader is part way in: still ahead of it
+        assert_eq!(share_point(&b, &[301], &a, &[301], 2349, &[]), Some(4973));
+        // the leader is at or past the point: its state there is gone
+        assert_eq!(share_point(&b, &[301], &a, &[301], 4973, &[]), None);
+        assert_eq!(share_point(&b, &[301], &a, &[301], 5300, &[]), None);
+        // a snapshot point exactly at the end of the common text is the point itself
+        assert_eq!(share_point(&b, &[5000], &a, &[5000], 0, &[]), Some(5000));
+    }
+
+    #[test]
+    fn no_point_when_sharing_would_change_a_prompt() {
+        // under 1024 common tokens: computed by each
+        let (a, b) = pair(1000, 300, 300);
+        assert_eq!(share_point(&b, &[], &a, &[], 0, &[]), None);
+        // the prompts' cut points before the common end differ (one prompt's point is too close to its end to cut at)
+        let (a, b) = pair(5000, 300, 300);
+        assert_eq!(share_point(&b, &[], &a, &[301], 0, &[]), None);
+        // a waiting prompt that ends within DECODE_ROWS rows of the common text keeps a tail for the prompt kernels
+        let (a, b) = pair(4992, 300, 5);
+        let pos = share_point(&b, &[], &a, &[], 0, &[]).unwrap();
+        assert!(b.len() - pos > DECODE_ROWS && pos % PROMPT_ALIGN == 0, "{pos}");
+        // identical prompts: the same rule against the prompt's own end
+        let pos = share_point(&a, &[], &a, &[], 0, &[]).unwrap();
+        assert!(a.len() - pos > DECODE_ROWS && pos % PROMPT_ALIGN == 0, "{pos}");
+    }
+
+    #[test]
+    fn lanes_share_one_point() {
+        // lane 3's tail starts like lane 1's for 40 more tokens than lane 2's: it takes the point lane 2 asked for
+        let (a, b) = pair(5000, 300, 300);
+        let first = share_point(&b, &[], &a, &[], 0, &[]).unwrap();
+        let c: Vec<u32> = a[..5040].iter().copied().chain(3_000_000..3_000_200).collect();
+        assert_eq!(share_point(&c, &[], &a, &[], 0, &[first]), Some(first));
+        // far beyond it: a point of its own, until the leader holds four
+        let d: Vec<u32> = a[..5290].iter().copied().chain(3_000_000..3_000_200).collect();
+        assert_eq!(share_point(&d, &[], &a, &[], 0, &[first]), Some(5280));
+        assert_eq!(share_point(&d, &[], &a, &[], 0, &[1024, 2048, 3072, first]), None);
+        assert_eq!(share_point(&c, &[], &a, &[], 0, &[1024, 2048, 3072, first]), Some(first));
+    }
+
+    /// The chunk ends of a prompt of `len` tokens cut at `points`, with `avail` rows a step, from `from` on.
+    fn chunks(len: usize, points: &[usize], from: usize, avail: usize) -> Vec<usize> {
+        let (mut fed, mut ends) = (from, Vec::new());
+        while fed < len {
+            let n = prompt_cut_at(len, points, fed, avail);
+            assert!(n > 0);
+            fed += n;
+            ends.push(fed);
+        }
+        ends
+    }
+
+    #[test]
+    fn a_share_point_keeps_every_cut_on_the_prompts_grid() {
+        // a prompt alone (cut points: the system prompt's end), as the leader (cut at the share point too) and as the
+        // waiting request (resumed at the share point): at any row budget, every chunk ends on the 32-row grid the
+        // prompt has alone, and no chunk before the last is short enough to leave the prompt kernels
+        let (a, b) = pair(5000, 333, 181);
+        for sys in [0usize, 301, 1500] {
+            let pts: Vec<usize> = if sys > 0 { vec![sys] } else { vec![] };
+            let pos = share_point(&b, &pts, &a, &pts, 0, &[]).unwrap();
+            let mut with = pts.clone();
+            with.push(pos);
+            for avail in [64usize, 300, 1000, 2048, 8192] {
+                let on_grid = |ends: &[usize], len: usize, from: usize| {
+                    let mut prev = from;
+                    for &e in ends {
+                        let origin = if e > sys { sys } else { 0 };
+                        assert!(e == len || e == sys || (e - origin) % PROMPT_ALIGN == 0, "end {e} sys {sys} avail {avail}");
+                        assert!(e == len || e - prev > DECODE_ROWS, "short chunk {prev}..{e}");
+                        prev = e;
+                    }
+                };
+                on_grid(&chunks(a.len(), &pts, 0, avail), a.len(), 0); // alone
+                let lead = chunks(a.len(), &with, 0, avail);
+                assert!(lead.contains(&pos));
+                on_grid(&lead, a.len(), 0);
+                on_grid(&chunks(b.len(), &pts, pos, avail), b.len(), pos); // resumed at the share point
+                assert!(b.len() - pos > DECODE_ROWS && a.len() - pos > DECODE_ROWS);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod prompt_cut_tests {
     use super::{prompt_cut, prompt_cut_at};
+    #[test]
+    fn lead_points_sit_on_the_chunk_grid() {
+        // short prompts: untouched
+        assert_eq!(super::lead_points(&[100, 3000], 4096, 2240), [100, 3000]);
+        // a 20000-token first turn: saved at 8 whole chunks; the next turn's point adds whole chunks from there
+        assert_eq!(super::lead_points(&[20000], 4096, 2240), [17920]);
+        assert_eq!(super::lead_points(&[20000, 20100], 4096, 2240), [17920]);
+        assert_eq!(super::lead_points(&[20000, 20300, 23000], 4096, 2240), [17920, 20160, 22400]);
+        // a short system prompt stays; the turn point counts chunks from it; a point exactly at a chunk end keeps a tail
+        assert_eq!(super::lead_points(&[1500, 9000], 4096, 2240), [1500, 8220]);
+        assert_eq!(super::lead_points(&[4480], 4096, 2240), [2240]);
+        assert_eq!(super::lead_points(&[4497], 4096, 2240), [4480]);
+        // no whole chunk before the point: dropped
+        assert_eq!(super::lead_points(&[5000, 5100], 4096, 4096), [4096]);
+    }
+
     #[test]
     fn cuts_stop_at_resume_points() {
         // uncached: points 0 and 700 (a turn boundary); budget 2048: [0, 700) then [700, 1800)

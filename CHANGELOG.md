@@ -4,6 +4,38 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-11
+
+### Added
+
+- **NVIDIA RTX 5080 target (experimental).** The CUDA engine serves Qwen3.8-27B on one RTX 5080 (16 GB) with 128K
+  context, built from source for `sm_120a` (`FE_KARCH`). See [docs/rtx-5080.md](docs/rtx-5080.md).
+  - A 6-bit K/V cache (`FE_KVQ`, new Rust kernels), NVFP4/FP8 prompt weights streamed from pinned host memory, and
+    the embedding table and prompt cache pool in host memory.
+  - MTP drafting with copy rows, and `tools/serve-5080.sh` to start it.
+- **Up to four requests at once on the RTX 5080** from one shared pool of context (`SLOTS=4`, `FE_POOL`): a request
+  that fits a unit runs beside others, a longer one takes the whole pool and runs alone.
+- **Shared prefix computed once.** Requests that arrive together and start with the same text (parallel lanes of one
+  job, agents with one system prompt) prefill that text once, wherever it ends
+  ([docs/prompt-cache.md](docs/prompt-cache.md)).
+- `tools/bench/lanes.py`: a benchmark and gate for N requests sharing a prefix.
+- A "Supported systems" table in the README: Ferrite runs on Linux only.
+
+### Changed
+
+- Three or more streams decoding at once share 32 verify rows with DFlash2 drafting (48 for one or two), which raises
+  their total speed. Set `FE_VERIFY_ROWS` / `FE_VERIFY_GAIN` to fix them.
+- `/health`: `max_batch_size` is the number of requests the loaded engine decodes at once (a larger
+  `--max-concurrent` is clamped to it), and a test pins the field names (`max_batch_size`, `max_model_len`,
+  `running`, `queued`).
+- The DGX Spark package is `ferrite-0.3.0-dgx-spark-aarch64.tar.gz`; the one-line installer installs 0.3.0.
+
+### Fixed
+
+- Captured CUDA graphs were never released, so many different batch shapes could fill device memory. They are now
+  dropped when memory runs low.
+- Prompt attention with the quantized K/V cache: a kernel written during this release read staged data too early.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added
@@ -45,5 +77,6 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.3.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.3.0
 [0.2.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.2.0
 [0.1.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.1.0

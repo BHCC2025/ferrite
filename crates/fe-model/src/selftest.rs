@@ -12,6 +12,13 @@ fn bf16_f32(h: u16) -> f32 {
 }
 
 pub fn run(m: &Module, s: &Stream) -> Result<()> {
+    if std::env::var("FE_SELFTEST_ONLY").is_ok_and(|v| v == "kvq") {
+        return kvq_selftest(m, s);
+    }
+    // FE_KVQ_BENCH_ONLY=<keys>: only the attention kernel bench (kvq_bench)
+    if let Some(keys) = std::env::var("FE_KVQ_BENCH_ONLY").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return kvq_bench(m, s, keys.max(4096));
+    }
     // shared memory (static + dynamic) + block reduction
     {
         let f = m.function("fe_t_smem")?;
@@ -188,6 +195,12 @@ pub fn run(m: &Module, s: &Stream) -> Result<()> {
         println!("selftest flash vs split: worst rel {worst:.4} at row {} head {} dim {} ({} vs {})", wi / 6144,
             (wi % 6144) / 256, wi % 256, bf16_f32(a[wi]), bf16_f32(b[wi]));
         ensure!(worst < 0.05, "flash attention mismatch");
+    }
+    kvq_selftest(m, s)?;
+    // FE_KVQ_BENCH=<keys>: time the attention kernels over a cache of that many keys, bf16 against the quantized forms:
+    // a 2048-row prompt chunk at the end of it (flash), a 1-row decode and a 16-row verify (vk + combine)
+    if let Some(keys) = std::env::var("FE_KVQ_BENCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+        kvq_bench(m, s, keys.max(4096))?;
     }
     // split-column GDN recurrence + separate gated norm vs the fused kernel
     {
@@ -574,6 +587,298 @@ pub fn run(m: &Module, s: &Stream) -> Result<()> {
         println!("selftest tree GDN (16 rows, {leaves} leaves, {saves} saved states: conv, history, recurrence vs the chain \
             over each path): {bad} differing");
         ensure!(bad == 0, "tree GDN differs from the chain kernels");
+    }
+    Ok(())
+}
+fn kvq_bench(m: &Module, s: &Stream, keys: usize) -> Result<()> {
+    let n = 2048usize;
+    let mut seed = 77u32;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        seed
+    };
+    let q: Vec<u16> = (0..n * 6144).map(|_| bf16_bits(((rnd() >> 9) as f32 / (1u32 << 23) as f32 - 0.5) * 2.0)).collect();
+    let (dq, dqg) = (DeviceBuffer::from_slice(&q)?, DeviceBuffer::<u16>::zeroed(n * 12288)?);
+    let out = DeviceBuffer::<u16>::zeroed(n * 6144)?;
+    let scale = (1.0f32 / 16.0) * std::f32::consts::LOG2_E;
+    let rslot = DeviceBuffer::from_slice(&vec![0u32; 16])?;
+    let (nobase, nomask) = (DeviceBuffer::from_slice(&vec![u32::MAX; 16])?, DeviceBuffer::from_slice(&vec![0u32; 16])?);
+    // the quantized forms take their split count from the grid (FE_KVQ_BENCH_SPLITS); fe_attn_vk has 48 built in
+    let qsplits: u32 = std::env::var("FE_KVQ_BENCH_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+    let po = DeviceBuffer::<f32>::zeroed(16 * 4 * qsplits.max(48) as usize * 1536)?;
+    let pm = DeviceBuffer::<f32>::zeroed(16 * 4 * qsplits.max(48) as usize * 12)?;
+    println!("kvq bench: {keys} keys; ms for a 2048-row prompt chunk (flash) | 1-row decode | 16-row verify (vk + combine), one layer");
+    for bits in [0usize, 4, 6] {
+        let rec = match bits { 0 => 512, 6 => 208, _ => 144 };
+        // random cache contents (records: random codes, scales of 1.0)
+        let mut c: Vec<u32> = (0..keys * 4 * rec / 4).map(|_| rnd()).collect();
+        if bits == 0 {
+            for w in c.iter_mut() {
+                *w = (*w & 0x00ff_00ff) | 0x3f00_3f00;
+            }
+        } else {
+            for t in 0..keys * 4 {
+                for g in 0..4 {
+                    c[(t * rec + rec - 16) / 4 + g] = 0x3f80_3f80;
+                }
+            }
+        }
+        let (dk, dv) = (DeviceBuffer::from_slice(&c)?, DeviceBuffer::from_slice(&c)?);
+        let stride = if bits == 0 { (keys * 1024) as u64 } else { (keys * 4 * rec) as u64 };
+        let sfx = if bits == 0 { String::new() } else { format!("_q{bits}") };
+        let fl = m.function(&format!("fe_flash_prefill{sfx}"))?;
+        let vk = m.function(&format!("fe_attn_vk{sfx}"))?;
+        let cb = m.function(if bits == 0 { "fe_attn_combine" } else { "fe_attn_combine_q" })?;
+        let (fl_smem, vk_smem) = if bits == 0 { (98304u32, 98304u32) } else {
+            ((64 * 512 + 2 * 2 * 32 * rec + 2 * 32 * 512) as u32, (6 * 16 * 512 + 3 * 2 * 16 * rec + 2 * 16 * 512) as u32)
+        };
+        fl.set_max_dynamic_smem(fl_smem)?;
+        vk.set_max_dynamic_smem(vk_smem)?;
+        let pos0 = (keys - n) as u32;
+        let splits = if bits == 0 { 48 } else { qsplits };
+        let mut t = [0f32; 3];
+        for it in 0..4 {
+            let ms = s.time(|s| unsafe {
+                s.launch(&fl, ((n as u32).div_ceil(64), 24), 128, fl_smem, (out.ptr(), dq.ptr(), dqg.ptr(), 12288u32, dk.ptr(),
+                    dv.ptr(), stride, 0u32, 0u32, n as u32, pos0, scale))?;
+                Ok(())
+            })?;
+            if it > 0 {
+                t[0] += ms / 3.0;
+            }
+        }
+        for (ti, rows) in [(1usize, 1u32), (2, 16)] {
+            let rpos = DeviceBuffer::from_slice(&(0..16u32).map(|i| keys as u32 - rows + i.min(rows - 1)).collect::<Vec<_>>())?;
+            let (srow0, slen) = (DeviceBuffer::from_slice(&[0u32])?, DeviceBuffer::from_slice(&[rows])?);
+            for it in 0..6 {
+                let ms = s.time(|s| unsafe {
+                    s.launch(&vk, (1u32, 4, splits), 192, vk_smem, (po.ptr(), pm.ptr(), dq.ptr(), dk.ptr(), dv.ptr(), rslot.ptr(),
+                        rpos.ptr(), nobase.ptr(), nomask.ptr(), srow0.ptr(), slen.ptr(), 0u32, 0u32, stride, scale))?;
+                    s.launch(&cb, (rows, 24), 256, 0, (out.ptr(), po.ptr(), pm.ptr(), dqg.ptr(), 12288u32, splits, 0u32))?;
+                    Ok(())
+                })?;
+                if it > 0 {
+                    t[ti] += ms / 5.0;
+                }
+            }
+        }
+        let mut tp = 0f32;
+        let pthreads: u32 = 128 + 32 * std::env::var("FE_KVQ_BENCH_PROD").ok().and_then(|v| v.parse().ok()).unwrap_or(4u32);
+        if bits != 0 {
+            let flp = m.function(&format!("fe_flash_prefill_q{bits}p"))?;
+            let flp_smem = (64 * 512 + 2 * 32 * 512 + 2 * 32 * rec) as u32;
+        flp.set_max_dynamic_smem(flp_smem)?;
+            for it in 0..4 {
+                let ms = s.time(|s| unsafe {
+                    s.launch(&flp, ((n as u32).div_ceil(64), 24), pthreads, flp_smem, (out.ptr(), dq.ptr(), dqg.ptr(), 12288u32, dk.ptr(),
+                        dv.ptr(), stride, 0u32, 0u32, n as u32, pos0, scale))?;
+                    Ok(())
+                })?;
+                if it > 0 {
+                    tp += ms / 3.0;
+                }
+            }
+        }
+        if bits != 0 {
+            let flp = m.function(&format!("fe_flash_prefill_q{bits}p"))?;
+            let flp_smem = (64 * 512 + 2 * 32 * 512 + 2 * 32 * rec) as u32;
+            let o2 = DeviceBuffer::<u16>::zeroed(n * 6144)?;
+            unsafe {
+                s.launch(&fl, ((n as u32).div_ceil(64), 24), 128, fl_smem, (out.ptr(), dq.ptr(), dqg.ptr(), 12288u32, dk.ptr(),
+                    dv.ptr(), stride, 0u32, 0u32, n as u32, pos0, scale))?;
+            }
+            s.sync()?;
+            let want = out.to_vec()?;
+            let mut nd = 0usize;
+            for _ in 0..10 {
+                unsafe {
+                    s.launch(&flp, ((n as u32).div_ceil(64), 24), pthreads, flp_smem, (o2.ptr(), dq.ptr(), dqg.ptr(), 12288u32,
+                        dk.ptr(), dv.ptr(), stride, 0u32, 0u32, n as u32, pos0, scale))?;
+                }
+                s.sync()?;
+                nd += want.iter().zip(&o2.to_vec()?).filter(|(x, y)| x != y).count();
+            }
+            println!("kvq bench {bits}-bit: producer-warp flash vs plain over 10 runs: {nd} outputs differ");
+            ensure!(nd == 0, "kvq bench: the producer-warp flash kernel differs");
+        }
+        println!("kvq bench {}: flash {:8.2} (producer warps {:8.2}) | decode {:6.3} | verify16 {:6.3}",
+            if bits == 0 { "bf16 ".into() } else { format!("{bits}-bit") }, t[0], tp, t[1], t[2]);
+    }
+    Ok(())
+}
+
+/// The quantized K/V cache kernels (k-core kvq.rs); `FE_SELFTEST_ONLY=kvq` runs only this (e.g. under
+/// compute-sanitizer's racecheck).
+fn kvq_selftest(m: &Module, s: &Stream) -> Result<()> {
+    // the quantized K/V cache (k-core kvq.rs) at both widths: fe_attn_prep_q's V records against the host quantizer
+    // (exact), then fe_flash_prefill_q against fe_attn_vk_q + fe_attn_combine_q over the same records (the two differ in
+    // how they round a dequantized V: bf16 against f16)
+    for bits in [4usize, 6] {
+        let rec = if bits == 6 { 208usize } else { 144 };
+        let (ctx, n) = (128usize, 100usize);
+        let prep = m.function(&format!("fe_attn_prep_q{bits}"))?;
+        let fl = m.function(&format!("fe_flash_prefill_q{bits}"))?;
+        let vk = m.function(&format!("fe_attn_vk_q{bits}"))?;
+        let cb = m.function("fe_attn_combine_q")?;
+        let (fl_smem, vk_smem) = ((64 * 512 + 2 * 2 * 32 * rec + 2 * 32 * 512) as u32, (6 * 16 * 512 + 3 * 2 * 16 * rec + 2 * 16 * 512) as u32);
+        fl.set_max_dynamic_smem(fl_smem)?;
+        vk.set_max_dynamic_smem(vk_smem)?;
+        let mut seed = 4711u32 + bits as u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 9) as f32 / (1u32 << 23) as f32) - 0.5
+        };
+        let qg: Vec<u16> = (0..n * 12288).map(|_| bf16_bits(rnd() * 4.0)).collect();
+        let kx: Vec<u16> = (0..n * 1024).map(|_| bf16_bits(rnd() * 4.0)).collect();
+        // V with a few large values, so group scales differ
+        let vx: Vec<u16> = (0..n * 1024).map(|i| bf16_bits(rnd() * if i % 37 == 0 { 3.0 } else { 1.0 })).collect();
+        let nw: Vec<u16> = (0..256).map(|_| bf16_bits(rnd() * 0.2)).collect();
+        let rope: Vec<u16> = (0..ctx * 64).map(|i| {
+            let ang = (i / 64) as f32 * 0.37 / (1.0 + (i % 32) as f32);
+            bf16_bits(if i % 64 < 32 { ang.cos() } else { ang.sin() })
+        }).collect();
+        let (dqg, dkx, dvx, dnw, drope) = (DeviceBuffer::from_slice(&qg)?, DeviceBuffer::from_slice(&kx)?,
+            DeviceBuffer::from_slice(&vx)?, DeviceBuffer::from_slice(&nw)?, DeviceBuffer::from_slice(&rope)?);
+        let dq = DeviceBuffer::<u16>::zeroed(n * 6144)?;
+        let (dk, dv) = (DeviceBuffer::<u8>::zeroed(ctx * 4 * rec)?, DeviceBuffer::<u8>::zeroed(ctx * 4 * rec)?);
+        let rslot = DeviceBuffer::from_slice(&vec![0u32; n])?;
+        let rpos = DeviceBuffer::from_slice(&(0..n as u32).collect::<Vec<_>>())?;
+        let stride = (ctx * 4 * rec) as u64;
+        unsafe {
+            s.launch(&prep, n as u32, 1024, 0, (dq.ptr(), dk.ptr(), dv.ptr(), dqg.ptr(), 12288u32, dkx.ptr(), 1024u32,
+                dvx.ptr(), 1024u32, dnw.ptr(), dnw.ptr(), drope.ptr(), rslot.ptr(), rpos.ptr(), rpos.ptr(), stride, 1e-6f32))?;
+        }
+        s.sync().map_err(|e| anyhow::anyhow!("prep_q: {e}"))?;
+        // host quantizer of V (kvq.rs had32 + prep_q, the same operation order)
+        let got = dv.to_vec()?;
+        let mut bad = 0usize;
+        let (half, top) = ((1u32 << (bits - 1)) as f32, (1i32 << bits) - 1);
+        for r in 0..n {
+            for hg in 0..32 {
+                let (h, g) = (hg / 8, hg % 8);
+                let mut y = [[0f32; 8]; 4];
+                for (l, yl) in y.iter_mut().enumerate() {
+                    for (j, v) in yl.iter_mut().enumerate() {
+                        *v = bf16_f32(vx[r * 1024 + h * 256 + g * 32 + l * 8 + j]);
+                    }
+                    for st in [1usize, 2, 4] {
+                        let t = *yl;
+                        for j in 0..8 {
+                            yl[j] = if j & st == 0 { t[j] + t[j + st] } else { t[j - st] - t[j] };
+                        }
+                    }
+                }
+                for m2 in [1usize, 2] {
+                    let t = y;
+                    for l in 0..4 {
+                        for j in 0..8 {
+                            y[l][j] = if l & m2 == 0 { t[l][j] + t[l ^ m2][j] } else { t[l ^ m2][j] - t[l][j] };
+                        }
+                    }
+                }
+                let mut am = 0f32;
+                for yl in y.iter_mut() {
+                    for v in yl.iter_mut() {
+                        *v *= 0.176_776_7;
+                        am = am.max(v.abs());
+                    }
+                }
+                let mut sb = bf16_bits(am);
+                if bf16_f32(sb) < am {
+                    sb += 1;
+                }
+                let sc = bf16_f32(sb);
+                let inv = if sc > 0.0 { half / sc } else { 0.0 };
+                let base = (r * 4 + h) * rec;
+                let rd16 = |o: usize| u16::from_le_bytes([got[o], got[o + 1]]);
+                bad += (rd16(base + rec - 16 + g * 2) != sb) as usize;
+                for l in 0..4 {
+                    let (mut word, mut low) = (0u32, 0u32);
+                    for j in 0..8 {
+                        let qi = (y[l][j].mul_add(inv, half) as i32).clamp(0, top) as u32;
+                        word |= (qi >> (bits - 4)) << (4 * j);
+                        low |= (qi & 3) << (2 * j);
+                    }
+                    let wo = base + (g * 4 + l) * 4;
+                    bad += (u32::from_le_bytes([got[wo], got[wo + 1], got[wo + 2], got[wo + 3]]) != word) as usize;
+                    if bits == 6 {
+                        bad += (rd16(base + 128 + (g * 4 + l) * 2) as u32 != low) as usize;
+                    }
+                }
+            }
+        }
+        ensure!(bad == 0, "kvq {bits}-bit: {bad} V record fields differ from the host quantizer");
+        let o1 = DeviceBuffer::<u16>::zeroed(n * 6144)?;
+        let o2 = DeviceBuffer::<u16>::zeroed(n * 6144)?;
+        let scale = (1.0f32 / 16.0) * std::f32::consts::LOG2_E;
+        let nseg = n.div_ceil(16);
+        let srow0 = DeviceBuffer::from_slice(&(0..nseg).map(|i| (i * 16) as u32).collect::<Vec<_>>())?;
+        let slen = DeviceBuffer::from_slice(&(0..nseg).map(|i| (n - i * 16).min(16) as u32).collect::<Vec<_>>())?;
+        let (nobase, nomask) = (DeviceBuffer::from_slice(&vec![u32::MAX; n])?, DeviceBuffer::from_slice(&vec![0u32; n])?);
+        let po = DeviceBuffer::<f32>::zeroed(n * 4 * 48 * 1536)?;
+        let pm = DeviceBuffer::<f32>::zeroed(n * 4 * 48 * 12)?;
+        unsafe {
+            s.launch(&fl, ((n as u32).div_ceil(64), 24), 128, fl_smem, (o1.ptr(), dq.ptr(), dqg.ptr(), 12288u32, dk.ptr(),
+                dv.ptr(), stride, 0u32, 0u32, n as u32, 0u32, scale))?;
+            s.sync().map_err(|e| anyhow::anyhow!("flash_q: {e}"))?;
+            s.launch(&vk, (nseg as u32, 4, 48), 192, vk_smem, (po.ptr(), pm.ptr(), dq.ptr(), dk.ptr(), dv.ptr(), rslot.ptr(),
+                rpos.ptr(), nobase.ptr(), nomask.ptr(), srow0.ptr(), slen.ptr(), 0u32, 0u32, stride, scale))?;
+            s.sync().map_err(|e| anyhow::anyhow!("vk_q: {e}"))?;
+            s.launch(&cb, (n as u32, 24), 256, 0, (o2.ptr(), po.ptr(), pm.ptr(), dqg.ptr(), 12288u32, 48u32, 0u32))?;
+        }
+        // the producer-warp form of the flash kernel: the same bits
+        let flp = m.function(&format!("fe_flash_prefill_q{bits}p"))?;
+        let flp_smem = (64 * 512 + 2 * 32 * 512 + 2 * 32 * rec) as u32;
+        flp.set_max_dynamic_smem(flp_smem)?;
+        let o3 = DeviceBuffer::<u16>::zeroed(n * 6144)?;
+        let (a, b) = (o1.to_vec()?, o2.to_vec()?);
+        // 25 runs: its producer and tensor-core warps hand tiles over under barriers, and a missing one would show
+        // as an occasional difference
+        for rep in 0..25 {
+            unsafe {
+                s.launch(&flp, ((n as u32).div_ceil(64), 24), 256, flp_smem, (o3.ptr(), dq.ptr(), dqg.ptr(), 12288u32, dk.ptr(),
+                    dv.ptr(), stride, 0u32, 0u32, n as u32, 0u32, scale))?;
+            }
+            s.sync()?;
+            let nd = a.iter().zip(&o3.to_vec()?).filter(|(x, y)| x != y).count();
+            ensure!(nd == 0, "kvq {bits}-bit: fe_flash_prefill_q{bits}p differs from fe_flash_prefill_q{bits} in {nd} outputs (run {rep})");
+        }
+        let mut worst = 0f32;
+        let mut wi = 0;
+        let mut rows_bad = std::collections::BTreeMap::new();
+        for i in 0..a.len() {
+            let (x, y) = (bf16_f32(a[i]), bf16_f32(b[i]));
+            // flash_q rounds a dequantized V to bf16, vk_q to f16: up to ~0.004 apart at these magnitudes
+            let e = (x - y).abs() / (y.abs() + 0.1);
+            if e > worst {
+                worst = e;
+                wi = i;
+            }
+            if e > 0.03 {
+                *rows_bad.entry(i / 6144).or_insert(0usize) += 1;
+            }
+        }
+        if std::env::var("FE_SELFTEST_V").is_ok() {
+            println!("kvq {bits}: worst at row {} head {} dim {}: flash {} vk {}; rows over 0.03: {:?}", wi / 6144, (wi % 6144) / 256,
+                wi % 256, bf16_f32(a[wi]), bf16_f32(b[wi]), rows_bad);
+        }
+        // row 0 has one key (itself): its output is its own V through the cache, times the gate
+        let mut se = 0f64;
+        let mut sv = 0f64;
+        for h in 0..24 {
+            for d in 0..256 {
+                let v = bf16_f32(vx[(h / 6) * 256 + d]);
+                let g = bf16_f32(qg[h * 512 + 256 + d]);
+                let want = v * bf16_f32(bf16_bits(1.0 / (1.0 + (-g).exp())));
+                let got_ = bf16_f32(b[h * 256 + d]);
+                se += ((got_ - want) as f64).powi(2);
+                sv += (want as f64).powi(2);
+            }
+        }
+        let rel = (se / sv).sqrt();
+        println!("selftest kvq {bits}-bit: V records = host quantizer; flash_q vs vk_q + combine_q worst rel {worst:.4}; a V row through the cache: rms error {rel:.4} of its rms");
+        ensure!(rel < if bits == 6 { 0.03 } else { 0.12 }, "kvq {bits}-bit: a row's own V comes back {rel:.4} off");
+        ensure!(worst < 0.05 && b.iter().any(|&x| x & 0x7fff != 0), "kvq {bits}-bit: flash_q and vk_q disagree");
     }
     Ok(())
 }

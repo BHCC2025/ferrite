@@ -44,6 +44,33 @@ pub const TUNED: &[((u32, u32, u32), Plan)] = &[
     ((8704, 5120, 4), Plan { sk: 4, wk: 8, ver: 8, occ: 2 }), // 93.4 / 103.8 us
 ];
 
-pub fn tuned(k: u32, n: u32, bits: u32) -> Option<Plan> {
-    TUNED.iter().find(|(key, _)| *key == (k, n, bits)).map(|(_, p)| *p)
+/// Tuned plans for the RTX 5080 (84 SMs, sm_120), from `exl3-tune` on the same quant (rows 1 + 0.25 x rows 16, median
+/// of 5 runs for the 8 best; 2026-11-10). Count-weighted sum over the model's linears: 13.7 ms at 1 row, 16.0 ms at
+/// 16 rows (the default rule: 19.1 / 20.6). The v1 winners (5120 x 6144) are listed as v9 with the same splits, as
+/// above.
+pub const TUNED_RTX5080: &[((u32, u32, u32), Plan)] = &[
+    ((5120, 1024, 3), Plan { sk: 10, wk: 8, ver: 8, occ: 2 }), // 5.5 / 7.6 us
+    ((5120, 1024, 4), Plan { sk: 10, wk: 8, ver: 8, occ: 2 }), // 5.8 / 8.5 us
+    ((5120, 6144, 2), Plan { sk: 5, wk: 4, ver: 9, occ: 0 }), // 17.2 / 20.1 us (v1)
+    ((5120, 6144, 3), Plan { sk: 5, wk: 4, ver: 9, occ: 0 }), // 19.8 / 22.6 us (v1)
+    ((5120, 10240, 2), Plan { sk: 2, wk: 8, ver: 8, occ: 2 }), // 20.9 / 27.4 us
+    ((5120, 10240, 3), Plan { sk: 2, wk: 8, ver: 8, occ: 2 }), // 26.3 / 29.8 us
+    ((5120, 12288, 3), Plan { sk: 20, wk: 4, ver: 8, occ: 4 }), // 33.2 / 47.4 us
+    ((5120, 12288, 4), Plan { sk: 10, wk: 4, ver: 8, occ: 4 }), // 41.1 / 48.9 us
+    ((5120, 17408, 2), Plan { sk: 4, wk: 4, ver: 8, occ: 4 }), // 36.8 / 48.0 us
+    ((5120, 17408, 3), Plan { sk: 1, wk: 8, ver: 8, occ: 2 }), // 44.3 / 51.4 us
+    ((5120, 17408, 4), Plan { sk: 1, wk: 8, ver: 8, occ: 2 }), // 54.4 / 59.5 us
+    ((5120, 248320, 5), Plan { sk: 1, wk: 4, ver: 9, occ: 0 }), // 883.4 / 946.4 us
+    ((6144, 5120, 3), Plan { sk: 4, wk: 8, ver: 8, occ: 2 }), // 17.2 / 20.7 us
+    ((6144, 5120, 4), Plan { sk: 4, wk: 8, ver: 8, occ: 2 }), // 20.0 / 23.4 us
+    ((10240, 5120, 4), Plan { sk: 4, wk: 8, ver: 8, occ: 2 }), // 32.4 / 35.7 us
+    ((17408, 5120, 2), Plan { sk: 4, wk: 8, ver: 9, occ: 2 }), // 32.7 / 46.7 us
+    ((17408, 5120, 3), Plan { sk: 4, wk: 8, ver: 9, occ: 2 }), // 43.1 / 49.5 us
+    ((17408, 5120, 4), Plan { sk: 4, wk: 8, ver: 8, occ: 2 }), // 53.8 / 58.2 us
+];
+
+/// The tuned plan of a shape on a device with `sm_count` SMs: the RTX 5080's table on 84 SMs, else GB10's.
+pub fn tuned(k: u32, n: u32, bits: u32, sm_count: u32) -> Option<Plan> {
+    let t = if sm_count == 84 { TUNED_RTX5080 } else { TUNED };
+    t.iter().find(|(key, _)| *key == (k, n, bits)).map(|(_, p)| *p)
 }

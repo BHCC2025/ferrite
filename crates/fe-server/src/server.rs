@@ -77,9 +77,11 @@ impl GenDefaults {
 pub struct ServerConfig {
     /// The model id reported everywhere (requests may name any model).
     pub model_id: String,
-    /// Requests generating at once; the rest wait in a FIFO queue.
+    /// Requests generating at once; the rest wait in a FIFO queue. `/health` reports it as `max_batch_size`;
+    /// [`AppState::new`] keeps it within the engine's `max_batch`.
     pub max_concurrent: usize,
-    /// Prompt + output token limit per request.
+    /// Prompt + output token limit per request (`/health`: `max_model_len`); [`AppState::new`] keeps it within the
+    /// engine's `max_context`.
     pub max_context: usize,
     pub defaults: GenDefaults,
 }
@@ -98,7 +100,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(engine: Arc<dyn Engine>, tok: Arc<Tok>, template: Arc<ChatTemplate>, cfg: ServerConfig) -> Arc<Self> {
+    /// `cfg.max_concurrent` and `cfg.max_context` are capped at what the engine reports ([`Engine::info`]): the
+    /// server never runs, and `/health` never claims, more requests at once or a longer request than the loaded
+    /// engine handles.
+    pub fn new(engine: Arc<dyn Engine>, tok: Arc<Tok>, template: Arc<ChatTemplate>, mut cfg: ServerConfig) -> Arc<Self> {
+        let info = engine.info();
+        cfg.max_concurrent = cfg.max_concurrent.clamp(1, info.max_batch.max(1));
+        cfg.max_context = cfg.max_context.min(info.max_context);
         Arc::new(Self {
             slots: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
             marks: crate::snapshots::Marks::new(&tok)
@@ -134,6 +142,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// `GET /health` (and `/v1/health`). Clients size themselves from it, so the field names are a contract
+/// (tests/health_contract.rs): `max_batch_size` = requests the loaded engine decodes at once (never more than the
+/// engine reports), `max_model_len` = prompt + output tokens a request may use, `running` = requests holding a
+/// slot now, `queued` = requests waiting for one.
 async fn health(State(s): State<Arc<AppState>>) -> AxJson<Json> {
     AxJson(json!({
         "status": "ok",

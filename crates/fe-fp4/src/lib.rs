@@ -47,6 +47,15 @@ pub struct Kernels {
     pub gemm4mb: Function,
     pub gemm8mb: Function,
     pub gemm8s3: Function,
+    /// the FP8 GEMMs on the block-scaled tensor-core form (`fp8_bs`): s3 tiles and 128 x 256 tiles
+    pub gemm8s3_bs: Function,
+    pub gemm8w_bs: Function,
+    /// FE_FP8_BS=1|0: FP8 GEMMs through the block-scaled form with unit scales (twice the tensor-core rate on RTX 50
+    /// cards; the same bits as the plain form, checked by fp4-check). Default off; fe-model turns it on for
+    /// compute capability 12.0.
+    pub fp8_bs: bool,
+    /// FE_FP8_BS_TILE=n256: the block-scaled FP8 GEMM on 128 x 256 tiles instead of 128 x 128
+    pub fp8_bs_wide: bool,
     pub gemm4s2: Function,
     pub swiglu4: Function,
     pub swiglu4mb: Function,
@@ -66,6 +75,10 @@ impl Kernels {
             gemm4mb: module.function("fe_gemm_nvfp4_mb")?,
             gemm8mb: module.function("fe_gemm_fp8_mb")?,
             gemm8s3: module.function("fe_gemm_fp8_s3")?,
+            gemm8s3_bs: module.function("fe_gemm_fp8_s3_bs")?,
+            gemm8w_bs: module.function("fe_gemm_fp8_n256_bs")?,
+            fp8_bs: std::env::var("FE_FP8_BS").is_ok_and(|v| v == "1"),
+            fp8_bs_wide: std::env::var("FE_FP8_BS_TILE").is_ok_and(|v| v == "n256"),
             gemm4s2: module.function("fe_gemm_nvfp4_s2")?,
             swiglu4: module.function("fe_gemm_nvfp4_swiglu")?,
             swiglu4mb: module.function("fe_gemm_nvfp4_swiglu_mb")?,
@@ -96,6 +109,8 @@ impl Kernels {
         k.gemm8mb.set_max_dynamic_smem(FP8_SMEM_MB)?;
         k.swiglu4.set_max_dynamic_smem(FP4_SMEM_N256)?;
         k.gemm8s3.set_max_dynamic_smem(FP8_SMEM_S3)?;
+        k.gemm8s3_bs.set_max_dynamic_smem(FP8_SMEM_S3)?;
+        k.gemm8w_bs.set_max_dynamic_smem(FP8_SMEM_N256)?;
         k.gemm4s2.set_max_dynamic_smem(FP4_SMEM_S2)?;
         k.swiglu4mb.set_max_dynamic_smem(FP4_SMEM_MB)?;
         Ok(k)
@@ -179,6 +194,8 @@ impl Kernels {
         ensure!(ldc % 8 == 0 && y.0 % 16 == 0 && res.is_none_or(|r| r.0 % 16 == 0), "gemm: y/res must be 16-byte aligned rows");
         let v = Self::pick(self.variant8, m, n);
         let (f, bn, smem, threads) = match v {
+            _ if self.fp8_bs && self.fp8_bs_wide && n % 256 == 0 => (&self.gemm8w_bs, 256, FP8_SMEM_N256, 256),
+            _ if self.fp8_bs => (&self.gemm8s3_bs, TILE, FP8_SMEM_S3, 256),
             0 => (&self.gemm8, TILE, FP8_SMEM, 256),
             4 => (&self.gemm8s3, TILE, FP8_SMEM_S3, 256),
             1 => (&self.gemm8w, 256, FP8_SMEM_N256, 256),
@@ -265,19 +282,27 @@ pub struct PromptLinear {
     pub swiglu: bool,
 }
 
-impl PromptLinear {
-    /// Load and fuse `parts` (layer names without `.weight`, e.g. `model.language_model.layers.0.mlp.gate_proj`).
-    pub fn load(ck: &Checkpoint, parts: &[&str]) -> Result<PromptLinear> {
-        Self::load_opts(ck, parts, false)
-    }
+/// A prompt linear in host memory, before it goes to the device: resident ([`HostLinear::upload`]) or as part of
+/// a stream of weights that visit the device a layer at a time ([`HostLinear::place`]).
+pub struct HostLinear {
+    pub kind: Kind,
+    pub n: usize,
+    pub k: usize,
+    pub name: String,
+    pub parts: Vec<Part>,
+    /// e2m1 codes [n][k/2] or e4m3 [n][k]
+    pub codes: Vec<u8>,
+    /// NVFP4 block scales, row-major [n][k/16]
+    pub sf: Vec<u8>,
+    pub with_lt: bool,
+    pub alpha: Vec<f32>,
+    pub g: f32,
+    pub swiglu: bool,
+}
 
-    /// `with_lt`: also keep cuBLASLt-layout scales so [`PromptLinear::forward_lt`] works.
-    pub fn load_opts(ck: &Checkpoint, parts: &[&str], with_lt: bool) -> Result<PromptLinear> {
-        Self::load_sliced(ck, parts, with_lt, None)
-    }
-
-    /// [`PromptLinear::load_opts`] of one [`Slice`] of every part (tensor parallelism; `None`: whole tensors).
-    pub fn load_sliced(ck: &Checkpoint, parts: &[&str], with_lt: bool, slices: Option<&[Slice]>) -> Result<PromptLinear> {
+impl HostLinear {
+    /// Read and fuse `parts` (layer names without `.weight`), one [`Slice`] of each under tensor parallelism.
+    pub fn load_sliced(ck: &Checkpoint, parts: &[&str], with_lt: bool, slices: Option<&[Slice]>) -> Result<HostLinear> {
         ensure!(!parts.is_empty(), "no parts");
         ensure!(slices.is_none_or(|v| v.len() == parts.len()), "{}: {} parts, slices for {}", parts[0], parts.len(),
             slices.map_or(0, |v| v.len()));
@@ -322,7 +347,7 @@ impl PromptLinear {
             p.alpha *= in_scale;
         }
         let row_bytes = if kind == Kind::Nvfp4 { k / 2 } else { k };
-        let w = DeviceBuffer::<u8>::alloc(n * row_bytes)?;
+        let mut codes_all = Vec::with_capacity(n * row_bytes);
         let mut sf_all = Vec::new();
         // codes bytes / scale bytes a k column (NVFP4: 2 codes a byte, a scale a 16-group)
         let (cb, sb) = if kind == Kind::Nvfp4 { (2, 16) } else { (1, 16) };
@@ -340,38 +365,109 @@ impl PromptLinear {
                 }
             }
             ensure!(codes.len() == p.n * row_bytes, "{}: weight bytes", p.name);
-            fe_cuda::memcpy_htod(w.at(p.n0 * row_bytes), &codes)?;
+            if ps.len() == 1 {
+                codes_all = codes;
+            } else {
+                codes_all.extend_from_slice(&codes);
+            }
             if kind == Kind::Nvfp4 {
                 ensure!(sf.len() == p.n * k / 16, "{}: weight_scale bytes", p.name);
                 sf_all.extend_from_slice(&sf);
             }
         }
-        let (sw, sw_lt) = if kind == Kind::Nvfp4 {
-            let t = format::tile_scales(&sf_all, n, k / 16);
-            let lt = if with_lt { Some(DeviceBuffer::from_slice(&format::cublaslt_scales(&sf_all, n, k / 16))?) } else {
-                None
-            };
-            (Some(DeviceBuffer::from_slice(&t)?), lt)
-        } else {
-            (None, None)
-        };
         let mut alpha = vec![0.0f32; n];
         for p in &ps {
             alpha[p.n0..p.n0 + p.n].fill(p.alpha);
         }
-        Ok(PromptLinear {
-            kind,
-            n,
-            k,
-            name: parts.join("+"),
-            parts: ps,
-            w,
-            sw,
-            sw_lt,
-            alpha: DeviceBuffer::from_slice(&alpha)?,
-            g: 1.0 / in_scale,
-            swiglu: false,
-        })
+        Ok(HostLinear { kind, n, k, name: parts.join("+"), parts: ps, codes: codes_all, sf: sf_all, with_lt, alpha,
+            g: 1.0 / in_scale, swiglu: false })
+    }
+
+    /// gate|up (NVFP4, same K, loaded as two parts) with their rows interleaved in blocks of 8 for the fused
+    /// SwiGLU GEMM (PromptLinear::load_swiglu).
+    pub fn into_swiglu(mut self) -> Result<HostLinear> {
+        ensure!(self.kind == Kind::Nvfp4 && self.parts.len() == 2 && self.parts[0].n == self.parts[1].n,
+            "{}: not an NVFP4 gate|up pair", self.name);
+        ensure!(self.n % 256 == 0, "{}: n {}", self.name, self.n);
+        let (n, k, inter) = (self.n, self.k, self.n / 2);
+        let perm = |r: usize| -> usize {
+            // interleaved row r -> source row of the gate|up concatenation
+            let (blk, w) = (r / 16, r % 16);
+            if w < 8 { blk * 8 + w } else { inter + blk * 8 + w - 8 }
+        };
+        let rb = k / 2;
+        let mut ic = vec![0u8; self.codes.len()];
+        for r in 0..n {
+            let src = perm(r);
+            ic[r * rb..(r + 1) * rb].copy_from_slice(&self.codes[src * rb..(src + 1) * rb]);
+        }
+        self.codes = ic;
+        let kb = k / 16;
+        let mut is = vec![0u8; self.sf.len()];
+        for r in 0..n {
+            let src = perm(r);
+            is[r * kb..(r + 1) * kb].copy_from_slice(&self.sf[src * kb..(src + 1) * kb]);
+        }
+        self.sf = is;
+        self.alpha = (0..n).map(|r| self.alpha[perm(r)]).collect();
+        self.with_lt = false;
+        self.swiglu = true;
+        self.name = format!("{}(swiglu)", self.name);
+        Ok(self)
+    }
+
+    /// The NVFP4 block scales in ferrite's tiled layout (None for FP8).
+    pub fn tiled_scales(&self) -> Option<Vec<u8>> {
+        (self.kind == Kind::Nvfp4).then(|| format::tile_scales(&self.sf, self.n, self.k / 16))
+    }
+
+    /// Onto the device, resident.
+    pub fn upload(self) -> Result<PromptLinear> {
+        let (sw, sw_lt) = match self.tiled_scales() {
+            Some(t) => {
+                let lt = if self.with_lt {
+                    Some(DeviceBuffer::from_slice(&format::cublaslt_scales(&self.sf, self.n, self.k / 16))?)
+                } else {
+                    None
+                };
+                (Some(DeviceBuffer::from_slice(&t)?), lt)
+            }
+            None => (None, None),
+        };
+        Ok(PromptLinear { kind: self.kind, n: self.n, k: self.k, name: self.name, parts: self.parts,
+            w: DeviceBuffer::from_slice(&self.codes)?, sw, sw_lt, alpha: DeviceBuffer::from_slice(&self.alpha)?, g: self.g,
+            swiglu: self.swiglu })
+    }
+
+    /// A streamed linear: only `alpha` goes to the device now. Returns the linear (its `w` / `sw` are empty views
+    /// until [`PromptLinear::set_views`]) and its codes and tiled scales, which the caller keeps in host memory and
+    /// copies to where the views point before each use.
+    pub fn place(self) -> Result<(PromptLinear, Vec<u8>, Vec<u8>)> {
+        let sf = self.tiled_scales();
+        // SAFETY: null views of the right length; set_views points them at real memory before any launch
+        let (w, sw) = unsafe {
+            (DeviceBuffer::view(DevPtr::NULL, self.codes.len()), sf.as_ref().map(|t| DeviceBuffer::view(DevPtr::NULL, t.len())))
+        };
+        let lin = PromptLinear { kind: self.kind, n: self.n, k: self.k, name: self.name, parts: self.parts, w, sw,
+            sw_lt: None, alpha: DeviceBuffer::from_slice(&self.alpha)?, g: self.g, swiglu: self.swiglu };
+        Ok((lin, self.codes, sf.unwrap_or_default()))
+    }
+}
+
+impl PromptLinear {
+    /// Load and fuse `parts` (layer names without `.weight`, e.g. `model.language_model.layers.0.mlp.gate_proj`).
+    pub fn load(ck: &Checkpoint, parts: &[&str]) -> Result<PromptLinear> {
+        Self::load_opts(ck, parts, false)
+    }
+
+    /// `with_lt`: also keep cuBLASLt-layout scales so [`PromptLinear::forward_lt`] works.
+    pub fn load_opts(ck: &Checkpoint, parts: &[&str], with_lt: bool) -> Result<PromptLinear> {
+        Self::load_sliced(ck, parts, with_lt, None)
+    }
+
+    /// [`PromptLinear::load_opts`] of one [`Slice`] of every part (tensor parallelism; `None`: whole tensors).
+    pub fn load_sliced(ck: &Checkpoint, parts: &[&str], with_lt: bool, slices: Option<&[Slice]>) -> Result<PromptLinear> {
+        HostLinear::load_sliced(ck, parts, with_lt, slices)?.upload()
     }
 
     /// gate and up (NVFP4, same K) fused with their rows interleaved in blocks of 8 (gate f..f+7, up f..f+7,
@@ -383,38 +479,18 @@ impl PromptLinear {
 
     /// [`PromptLinear::load_swiglu`] of one [`Slice`] each of gate and up (the same columns of both).
     pub fn load_swiglu_sliced(ck: &Checkpoint, gate: &str, up: &str, slices: Option<&[Slice]>) -> Result<PromptLinear> {
-        let mut l = Self::load_sliced(ck, &[gate, up], false, slices)?;
-        ensure!(l.kind == Kind::Nvfp4 && l.parts.len() == 2 && l.parts[0].n == l.parts[1].n, "{}: not an NVFP4 gate|up pair", l.name);
-        ensure!(l.n % 256 == 0, "{}: n {}", l.name, l.n);
-        let (n, k, inter) = (l.n, l.k, l.n / 2);
-        let perm = |r: usize| -> usize {
-            // interleaved row r -> source row of the gate|up concatenation
-            let (blk, w) = (r / 16, r % 16);
-            if w < 8 { blk * 8 + w } else { inter + blk * 8 + w - 8 }
-        };
-        let rb = k / 2;
-        let codes = l.w.to_vec()?;
-        let mut ic = vec![0u8; codes.len()];
-        for r in 0..n {
-            let src = perm(r);
-            ic[r * rb..(r + 1) * rb].copy_from_slice(&codes[src * rb..(src + 1) * rb]);
+        HostLinear::load_sliced(ck, &[gate, up], false, slices)?.into_swiglu()?.upload()
+    }
+
+    /// Point a streamed linear (HostLinear::place) at where its codes and scales will be on the device.
+    pub fn set_views(&mut self, w: DevPtr, sw: DevPtr) {
+        // SAFETY: the caller keeps the memory (a ring of the prompt weight stream) alive and filled before use
+        unsafe {
+            self.w = DeviceBuffer::view(w, self.w.len());
+            if let Some(b) = self.sw.as_mut() {
+                *b = DeviceBuffer::view(sw, b.len());
+            }
         }
-        l.w.copy_from(&ic)?;
-        let kb = k / 16;
-        let st = format::untile_scales(&l.sw.as_ref().unwrap().to_vec()?, n, kb);
-        let mut is = vec![0u8; st.len()];
-        for r in 0..n {
-            let src = perm(r);
-            is[r * kb..(r + 1) * kb].copy_from_slice(&st[src * kb..(src + 1) * kb]);
-        }
-        l.sw.as_mut().unwrap().copy_from(&format::tile_scales(&is, n, kb))?;
-        let al = l.alpha.to_vec()?;
-        let ia: Vec<f32> = (0..n).map(|r| al[perm(r)]).collect();
-        l.alpha.copy_from(&ia)?;
-        l.sw_lt = None;
-        l.swiglu = true;
-        l.name = format!("{}(swiglu)", l.name);
-        Ok(l)
     }
 
     /// Fused MLP front for prompt rows: act = SwiGLU(x . [gate|up]^T), written NVFP4-quantized with `down_g`

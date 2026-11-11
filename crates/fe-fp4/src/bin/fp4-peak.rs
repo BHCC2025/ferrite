@@ -9,7 +9,7 @@ fn main() -> Result<()> {
     let f = kern.module.function("fe_fp4_peak")?;
     let s = Stream::new()?;
     let iters = 4096u32;
-    for fp4 in [1u32, 0, 2] {
+    for fp4 in [1u32, 0, 2, 3] {
         for (ctas, threads) in [(sms, 256u32), (2 * sms, 256), (sms, 512), (4 * sms, 256)] {
             let out = DeviceBuffer::<f32>::alloc((ctas * threads) as usize)?;
             let run = || unsafe { s.launch(&f, ctas, threads, 0, (out.ptr(), iters, fp4)) };
@@ -24,7 +24,7 @@ fn main() -> Result<()> {
             b.sync()?;
             let ms = b.elapsed_since(&a)? / 5.0;
             let k = if fp4 == 1 { 64.0 } else { 32.0 };
-            let label = ["FP8 ", "NVFP4", "FP8 (sm_89 form)"][fp4 as usize];
+            let label = ["FP8 ", "NVFP4", "FP8 (sm_89 form)", "FP8 (block-scaled form, scales 1)"][fp4 as usize];
             let flops = (ctas * threads / 32) as f64 * iters as f64 * 16.0 * 2.0 * 16.0 * 8.0 * k;
             println!("{label} ctas {ctas} x {threads} thr: {:.0} TFLOPS",
                 flops / (ms as f64 * 1e9));

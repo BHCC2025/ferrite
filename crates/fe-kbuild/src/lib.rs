@@ -12,7 +12,18 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The default kernel architecture (GB10, DGX Spark). `FE_KARCH` overrides it at build time (e.g. `sm_120a` for
+/// RTX 50-series cards): the kernels are then compiled with that `target-cpu` and assembled with `ptxas -arch` of
+/// the same name, in their own target directory.
 pub const ARCH: &str = "sm_121a";
+
+/// The kernel architecture of this build: `FE_KARCH`, else [`ARCH`].
+pub fn arch() -> String {
+    match std::env::var("FE_KARCH") {
+        Ok(a) if !a.trim().is_empty() => a.trim().to_string(),
+        _ => ARCH.to_string(),
+    }
+}
 
 /// Workspace root (the directory holding `kernels/`), found from the calling crate's manifest dir.
 pub fn workspace_root() -> PathBuf {
@@ -55,6 +66,9 @@ pub fn build(crate_name: &str) -> PathBuf {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     println!("cargo:rerun-if-env-changed=FE_PTXAS_FLAGS");
+    println!("cargo:rerun-if-env-changed=FE_KARCH");
+    let arch = arch();
+    println!("cargo:rustc-env=FE_KARCH_BUILT={arch}");
     let ident = crate_name.replace('-', "_");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let cubin = out_dir.join(format!("{ident}.cubin"));
@@ -62,21 +76,32 @@ pub fn build(crate_name: &str) -> PathBuf {
     // Nested cargo with a clean environment: the outer (stable, host) build's RUSTFLAGS, RUSTUP_TOOLCHAIN,
     // CARGO_* and target variables must not leak into the nightly nvptx build.
     let h = home();
-    let cargo = which("cargo", &[&format!("{h}/.cargo/bin/cargo")]);
+    // the rustup proxies live in $CARGO_HOME/bin (default ~/.cargo/bin)
+    let cbin = match std::env::var("CARGO_HOME") {
+        Ok(c) if !c.is_empty() => format!("{c}/bin"),
+        _ => format!("{h}/.cargo/bin"),
+    };
+    let cargo = which("cargo", &[&format!("{cbin}/cargo")]);
     let cargo = if cargo.to_string_lossy().contains("/toolchains/") {
         // PATH points into the stable toolchain dir; use the rustup proxy so rust-toolchain.toml applies.
-        PathBuf::from(format!("{h}/.cargo/bin/cargo"))
+        PathBuf::from(format!("{cbin}/cargo"))
     } else {
         cargo
     };
     let path = std::env::var("PATH").unwrap_or_default();
+    // the default architecture keeps kernels/target; another one gets its own directory so the two never thrash
+    let tdir = if arch == ARCH { kdir.join("target") } else { kdir.join(format!("target-{arch}")) };
     let mut cmd = Command::new(&cargo);
     cmd.env_clear()
-        .env("PATH", format!("{h}/.cargo/bin:{path}"))
+        .env("PATH", format!("{cbin}:{path}"))
         .env("HOME", &h)
         .current_dir(&kdir)
         .args(["build", "--release", "-p", crate_name, "--target-dir"])
-        .arg(kdir.join("target"));
+        .arg(&tdir);
+    if arch != ARCH {
+        // overrides the target-cpu of kernels/.cargo/config.toml
+        cmd.env("CARGO_TARGET_NVPTX64_NVIDIA_CUDA_RUSTFLAGS", format!("-C target-cpu={arch}"));
+    }
     for k in ["CARGO_HOME", "RUSTUP_HOME", "TERM"] {
         if let Ok(v) = std::env::var(k) {
             cmd.env(k, v);
@@ -86,7 +111,7 @@ pub fn build(crate_name: &str) -> PathBuf {
     if !out.status.success() {
         panic!("fe-kbuild: kernel crate `{crate_name}` failed to build:\n{}", String::from_utf8_lossy(&out.stderr));
     }
-    let ptx = kdir.join("target/nvptx64-nvidia-cuda/release").join(format!("{ident}.ptx"));
+    let ptx = tdir.join("nvptx64-nvidia-cuda/release").join(format!("{ident}.ptx"));
     assert!(ptx.exists(), "fe-kbuild: expected {}", ptx.display());
     let ptx_out = out_dir.join(format!("{ident}.ptx"));
     std::fs::copy(&ptx, &ptx_out).expect("copy ptx");
@@ -99,7 +124,7 @@ pub fn build(crate_name: &str) -> PathBuf {
 pub fn assemble(ptx: &Path, cubin: &Path) {
     let ptxas = which("ptxas", &["/usr/local/cuda/bin/ptxas"]);
     let mut cmd = Command::new(ptxas);
-    cmd.arg(format!("-arch={ARCH}")).arg("-O3");
+    cmd.arg(format!("-arch={}", arch())).arg("-O3");
     if let Ok(f) = std::env::var("FE_PTXAS_FLAGS") {
         cmd.args(f.split_whitespace());
     }

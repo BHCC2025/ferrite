@@ -131,6 +131,8 @@ impl DevPtr {
 pub struct DeviceBuffer<T> {
     ptr: DevPtr,
     len: usize,
+    /// false: a view of memory another buffer owns ([`DeviceBuffer::view`]); never freed here
+    owned: bool,
     _t: PhantomData<T>,
 }
 unsafe impl<T> Send for DeviceBuffer<T> {}
@@ -152,7 +154,14 @@ impl<T: Copy> DeviceBuffer<T> {
                 cu!(cuCtxSynchronize())?;
             }
         }
-        Ok(DeviceBuffer { ptr: DevPtr(p), len, _t: PhantomData })
+        Ok(DeviceBuffer { ptr: DevPtr(p), len, owned: true, _t: PhantomData })
+    }
+    /// A buffer over `len` elements at `ptr` inside another allocation; dropping it frees nothing.
+    ///
+    /// # Safety
+    /// The memory must stay allocated (and hold what the view's users expect) for as long as the view is used.
+    pub unsafe fn view(ptr: DevPtr, len: usize) -> Self {
+        DeviceBuffer { ptr, len, owned: false, _t: PhantomData }
     }
     /// Allocate and zero (synchronous).
     pub fn zeroed(len: usize) -> Result<Self> {
@@ -209,7 +218,7 @@ impl<T: Copy> DeviceBuffer<T> {
 }
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
-        if self.ptr.0 != 0 {
+        if self.ptr.0 != 0 && self.owned {
             canary::disarm(self.ptr.0);
             unsafe { cuMemFree_v2(self.ptr.0) };
         }
@@ -288,6 +297,13 @@ pub fn memcpy_dtoh<T: Copy>(dst: &mut [T], src: DevPtr) -> Result<()> {
 pub fn memcpy_dtod(dst: DevPtr, src: DevPtr, bytes: usize) -> Result<()> {
     cu!(cuMemcpyDtoDAsync_v2(dst.0, src.0, bytes, std::ptr::null_mut()))?;
     cu!(cuCtxSynchronize())
+}
+
+/// (free, total) device memory of the current context's device.
+pub fn mem_info() -> Result<(usize, usize)> {
+    let (mut f, mut t) = (0usize, 0usize);
+    cu!(cuMemGetInfo_v2(&mut f, &mut t))?;
+    Ok((f, t))
 }
 
 /// Page-locked host memory (cuMemAllocHost), for staging uploads and async readback.

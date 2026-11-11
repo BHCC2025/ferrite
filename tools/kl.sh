@@ -3,7 +3,7 @@
 # usage: tools/kl.sh <model-dir> <set: code|text|long16k> [nseq] [skip] [rows] [name]
 #   defaults per set: code 40 seqs row0 0 skip 1024; text 20 seqs row0 40 skip 1024; long16k 3 seqs skip 15360; rows 512
 # env: FE_BIN (default target/release/ferrite), FE_BATCH, KL_OUT (dir for the logits bin, default
-#      $FERRITE_STATE_DIR/kl); the reference folder and the GPU lock: tools/site.sh (FERRITE_KL_DIR, FERRITE_GPU_LOCK)
+#      $FERRITE_STATE_DIR/kl), FERRITE_KL_PY (score with this python instead of the container); the reference folder and the GPU lock: tools/site.sh (FERRITE_KL_DIR, FERRITE_GPU_LOCK)
 set -e
 . "$(dirname "$0")/site.sh"
 K=$FERRITE_KL_DIR
@@ -22,6 +22,11 @@ head -n $n $K/kl-ids-$SET.txt > $ids
 bin=$OUT/$name.bin
 echo "$(date +%T) $name: engine ($n seqs, skip $skip, rows $rows)" >&2
 flock $FERRITE_GPU_LOCK $BIN $M logits $ids $bin $skip $rows
-docker run --rm --gpus all -v $K:$K -v $OUT:$OUT nvcr.io/nvidia/pytorch:26.07-py3 \
-  python $K/score.py $bin $K/ref/$ref.pt $row0 $n $skip $rows $name 2>/dev/null | tail -1 | tee -a $OUT/results.jsonl
+# the scorer: FERRITE_KL_PY (a python with torch and numpy) when set, else the NGC PyTorch container
+if [ -n "${FERRITE_KL_PY:-}" ]; then
+  $FERRITE_KL_PY $K/score.py $bin $K/ref/$ref.pt $row0 $n $skip $rows $name 2>/dev/null | tail -1 | tee -a $OUT/results.jsonl
+else
+  docker run --rm --gpus all -v $K:$K -v $OUT:$OUT nvcr.io/nvidia/pytorch:26.07-py3 \
+    python $K/score.py $bin $K/ref/$ref.pt $row0 $n $skip $rows $name 2>/dev/null | tail -1 | tee -a $OUT/results.jsonl
+fi
 rm -f $bin

@@ -72,6 +72,10 @@ are tagged "studied" below: read as reference while writing Ferrite's own kernel
   `exl3_gemm*`, `exl3_dq.cuh`, `codebook.cuh`, `hadamard*`); Ferrite's decode GEMV came to it through
   TensorFold's port (above). Its DFlash2 drafter (`architecture/`, `modules/arch_specific/`), to cross-check
   crates/fe-dflash's forward.
+- idea: the quantized K/V cache of small-memory devices (kernels/k-core/src/kvq.rs) follows exllamav3's cache
+  quantization (`exllamav3_ext/cache/q_cache_kernels.cuh`): groups of 32 values rotated by a Hadamard matrix,
+  scaled by the group's absolute maximum and stored on the midpoint grid, with a 4-bit plane and a 2-bit plane for
+  6-bit codes. Ferrite's record layout, the attention in the rotated basis and the kernels are its own.
 - used: the quant was made with exllamav3's `sc_optimize.py` and `convert.py` from the per-tensor sensitivity
   measurement published in [turboderp/Qwen3.8-27B-exl3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3)
   (docs/model-card.md). The exllamav3 Python package also generates the test references above (test only).

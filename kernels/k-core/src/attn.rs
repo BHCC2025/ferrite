@@ -263,14 +263,14 @@ pub unsafe extern "ptx-kernel" fn fe_attn_combine(out: *mut u16, part_o: *const 
 // stay normal) into P V on f16 tensor cores; partials in fe_attn_split's layout, merged by fe_attn_combine with
 // nsplit = VK_SPLITS.
 
-const SB: u32 = 16; // keys a tile
-const SROWB: u32 = HD * 2; // 512 bytes a row
+pub(crate) const SB: u32 = 16; // keys a tile
+pub(crate) const SROWB: u32 = HD * 2; // 512 bytes a row
 /// log2 of the probability scale (f16 P, max 2^14 < 65504).
-const P_SHIFT: f32 = 14.0;
+pub(crate) const P_SHIFT: f32 = 14.0;
 /// Splits of every row (grid z, the combine's nsplit).
 pub const VK_SPLITS: u32 = 48;
 /// K/V tiles in flight (cp.async stages).
-const VK_STAGES: u32 = 3;
+pub(crate) const VK_STAGES: u32 = 3;
 /// Q [GRP][16][256] + VK_STAGES x (K + V) [16][256], bf16 (98304 bytes; opt-in).
 pub const SEG_SMEM: u32 = GRP * 16 * SROWB + VK_STAGES * 2 * SB * SROWB;
 
@@ -283,13 +283,13 @@ pub fn vk_chunk(n: u32) -> u32 {
 
 /// Byte offset of 16-byte chunk `c` (0..32) of row `r` in a [rows][256] tile, XOR-swizzled (as flash.rs).
 #[inline(always)]
-fn ssw(r: u32, c: u32) -> u32 {
+pub(crate) fn ssw(r: u32, c: u32) -> u32 {
     r * SROWB + ((c ^ (r & 7)) << 4)
 }
 
 /// Two floats to an f16x2 word (`lo` = element 0).
 #[inline(always)]
-fn f16x2(lo: f32, hi: f32) -> u32 {
+pub(crate) fn f16x2(lo: f32, hi: f32) -> u32 {
     let r: u32;
     unsafe {
         core::arch::asm!("cvt.rn.f16x2.f32 {r}, {hi}, {lo};", r = out(reg32) r, hi = in(reg32) hi, lo = in(reg32) lo,
@@ -300,7 +300,7 @@ fn f16x2(lo: f32, hi: f32) -> u32 {
 
 /// x rounded to f16 and back.
 #[inline(always)]
-fn f16r(x: f32) -> f32 {
+pub(crate) fn f16r(x: f32) -> f32 {
     let y: f32;
     unsafe {
         core::arch::asm!("{{ .reg .f16 h; cvt.rn.f16.f32 h, {x}; cvt.f32.f16 {y}, h; }}", y = out(reg32) y, x = in(reg32) x,
@@ -311,7 +311,7 @@ fn f16r(x: f32) -> f32 {
 
 /// Cache row of virtual key v for a row with tree base `tb` and ancestor mask `tm`.
 #[inline(always)]
-fn vk_phys(v: u32, tb: u32, tm: u32) -> u32 {
+pub(crate) fn vk_phys(v: u32, tb: u32, tm: u32) -> u32 {
     if v < tb {
         return v;
     }

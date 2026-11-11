@@ -900,7 +900,8 @@ impl DFlash {
         unsafe { s.memcpy_htod(self.ids.ptr(), &self.ids_host.as_slice()[..rows + 2 * ns])? };
         let (res, hn, hc, coef) = (self.res.ptr(), self.hn.ptr(), self.hc.ptr(), self.coef.ptr());
         unsafe {
-            s.launch(&e.k.embed, rows as u32, 256, 0, (res, e.w.embed.ptr(), self.ids.ptr(), H as u32))?;
+            let tab = e.embed_dev().context("DFlash2 drafting needs the embedding table on the device (FE_EMBED_HOST=0)")?;
+            s.launch(&e.k.embed, rows as u32, 256, 0, (res, tab, self.ids.ptr(), H as u32))?;
         }
         self.pmark(e, "embed");
         let conv = |x: DevPtr, out: DevPtr, base: DevPtr, side: usize, r: DevPtr| -> Result<()> {

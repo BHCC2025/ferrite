@@ -52,8 +52,16 @@ backstop the engine shrinks it to keep `FE_PARK_RESERVE_GB` (20 GB) of memory av
 entries make room for new ones.
 
 **Shared prefix.** The first request that computes a system prompt of 1024 tokens or more also stores it as a prefix
-entry (at most `FE_PREFIX_ENTRIES`, default 4). New conversations with the same system prompt start from it. Requests
-that arrive while that prefix is still being computed wait for it, so agents that start together compute it once.
+entry (at most `FE_PREFIX_ENTRIES`, default 4). New conversations with the same system prompt start from it.
+
+**Requests that start with the same text.** Requests that are queued together and begin with the same tokens compute
+that part once, wherever it ends: at the end of the system prompt, or part way through the user message (parallel
+lanes of one job that share a brief and files, then each add a task of their own). No cache holds the common part
+when such requests arrive, so the first one is computed and the others wait in the queue. When the first one's
+prefill reaches the end of the common tokens it stores a prefix entry there, and the others resume from it. The
+common part must be at least 1024 tokens. A later request that starts with the same text (a fix round) resumes from
+the same entry. `usage.prompt_tokens_details.cached_tokens` reports the reused tokens, on streamed replies too
+(with `stream_options.include_usage`).
 
 **Two nodes.** Node A's scheduler makes every decision. Each save, restore and park is mirrored to node B, which
 applies it to its half of the model.
@@ -69,6 +77,10 @@ Three rules make that hold:
 - **Resume only at snapshot points.** A request never resumes from the live state after a reply's generated tokens:
   generated rows and prompt rows round differently. The previous reply is computed again as part of the next
   prompt, about 0.1-0.2 s for 400 tokens.
+- **Shared text is cut on the grid.** The point where requests with the same beginning share their prefill is moved
+  back onto the 32-row grid from the snapshot point before it, at most 31 tokens. A cut on that grid leaves every
+  row as it is without the cut, so the first request and the ones that resume from it all return what they return
+  alone.
 - **No cut near the prompt end.** A point within 16 rows of the end is neither cut at nor resumed from, because such
   a short last chunk would run on the decode kernels instead of the prompt kernels. A turn therefore resumes from the
   turn before it.

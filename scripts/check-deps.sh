@@ -13,6 +13,8 @@
 # crates, the exact nightly the GPU kernels are built with (kernels/rust-toolchain.toml: its channel, components and
 # the nvptx64-nvidia-cuda target), a C linker (cc) and ptxas from the CUDA 13 toolkit. With --install it installs
 # the missing Rust toolchains through rustup.
+# FE_KARCH (the kernel architecture the binaries were built for; default sm_121a = GB10 on aarch64): sm_120a checks
+# for an RTX 50 card (compute capability 12.0) on any host architecture instead (docs/rtx-5080.md).
 # Environment: the site settings of tools/site.sh: FERRITE_MIN_FREE_GB (warn below this much available memory;
 # scripts/serve.sh passes its own estimate), FERRITE_NCCL_LIB, FERRITE_ROCE_HCA / FERRITE_NET_IF (two nodes).
 set -uo pipefail
@@ -48,7 +50,13 @@ err() { echo "check-deps: ERROR: $*" >&2; fail=1; }
 warn() { echo "check-deps: warning: $*" >&2; }
 ok() { echo "check-deps: ok: $*"; }
 
-[ "$(uname -m)" = aarch64 ] || err "this build is for aarch64 (DGX Spark); this machine is $(uname -m)"
+karch=${FE_KARCH:-sm_121a}
+case $karch in
+  sm_121a) want_cap=12.1; want_gpu="GB10, DGX Spark"
+    [ "$(uname -m)" = aarch64 ] || err "this build is for aarch64 (DGX Spark); this machine is $(uname -m)" ;;
+  sm_120a) want_cap=12.0; want_gpu="RTX 50 series" ;;
+  *) err "FE_KARCH=$karch: sm_121a or sm_120a"; want_cap=; want_gpu= ;;
+esac
 
 if [ $build = 1 ]; then
   # probe without rustup installing anything on its own (rustup auto-installs a missing toolchain when one is named)
@@ -102,7 +110,7 @@ if [ $build = 1 ]; then
   if [ -n "$px" ]; then
     pv=$("$px" --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p')
     if [ "${pv%%.*}" -ge 13 ] 2>/dev/null; then ok "ptxas $pv ($px)"
-    else err "ptxas $pv at $px; the kernels need the CUDA 13 toolkit (sm_121a)"
+    else err "ptxas $pv at $px; the kernels need the CUDA 13 toolkit ($karch)"
     fi
   else
     err "ptxas not found (on PATH or /usr/local/cuda/bin): install the CUDA 13 toolkit"
@@ -134,10 +142,10 @@ if command -v nvidia-smi > /dev/null; then
     | head -1 | awk -F', ' '{ gsub(/ /, "_", $1); print $1, $2, $3 }')
   if [ -z "${cap:-}" ]; then
     err "nvidia-smi found no GPU"
-  elif [ "$cap" != 12.1 ]; then
-    err "GPU $gpu has compute capability $cap; the kernels are built for sm_121a (GB10, DGX Spark)"
+  elif [ "$cap" != "$want_cap" ]; then
+    err "GPU $gpu has compute capability $cap; the kernels are built for $karch ($want_gpu)"
   else
-    ok "GPU ${gpu//_/ } (sm_121), driver $drv"
+    ok "GPU ${gpu//_/ } (${karch%a}), driver $drv"
     major=${drv%%.*}
     [ "${major:-0}" -ge 580 ] || warn "driver $drv; Ferrite was tested with 580.x (CUDA 13.0)"
   fi

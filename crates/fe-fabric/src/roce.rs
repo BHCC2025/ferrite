@@ -20,6 +20,9 @@ use fe_cuda::{DevPtr, DeviceBuffer, HostBuffer};
 
 use crate::boot::Link;
 
+// libibverbs is linked on the DGX Spark build (aarch64) or with the `roce` feature. Other builds (one GPU, no
+// fabric) get stubs that report no RDMA device, so they need neither the library nor its headers.
+#[cfg(any(target_arch = "aarch64", feature = "roce"))]
 #[link(name = "ibverbs")]
 unsafe extern "C" {
     fn ibv_get_device_list(num: *mut c_int) -> *mut *mut c_void;
@@ -38,6 +41,28 @@ unsafe extern "C" {
     fn ibv_modify_qp(qp: *mut c_void, attr: *mut u8, mask: c_int) -> c_int;
     fn ibv_query_gid(ctx: *mut c_void, port: u8, index: c_int, gid: *mut [u8; 16]) -> c_int;
 }
+
+#[cfg(not(any(target_arch = "aarch64", feature = "roce")))]
+mod no_verbs {
+    use super::*;
+    pub unsafe fn ibv_get_device_list(_num: *mut c_int) -> *mut *mut c_void { std::ptr::null_mut() }
+    pub unsafe fn ibv_free_device_list(_list: *mut *mut c_void) {  }
+    pub unsafe fn ibv_get_device_name(_dev: *mut c_void) -> *const c_char { std::ptr::null() }
+    pub unsafe fn ibv_open_device(_dev: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
+    pub unsafe fn ibv_close_device(_ctx: *mut c_void) -> c_int { -1 }
+    pub unsafe fn ibv_alloc_pd(_ctx: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
+    pub unsafe fn ibv_dealloc_pd(_pd: *mut c_void) -> c_int { -1 }
+    pub unsafe fn ibv_reg_mr(_pd: *mut c_void, _addr: *mut c_void, _len: usize, _access: c_int) -> *mut c_void { std::ptr::null_mut() }
+    pub unsafe fn ibv_dereg_mr(_mr: *mut c_void) -> c_int { -1 }
+    pub unsafe fn ibv_create_cq(_ctx: *mut c_void, _cqe: c_int, _cq_ctx: *mut c_void, _ch: *mut c_void, _vec: c_int) -> *mut c_void { std::ptr::null_mut() }
+    pub unsafe fn ibv_destroy_cq(_cq: *mut c_void) -> c_int { -1 }
+    pub unsafe fn ibv_create_qp(_pd: *mut c_void, _attr: *mut QpInitAttr) -> *mut c_void { std::ptr::null_mut() }
+    pub unsafe fn ibv_destroy_qp(_qp: *mut c_void) -> c_int { -1 }
+    pub unsafe fn ibv_modify_qp(_qp: *mut c_void, _attr: *mut u8, _mask: c_int) -> c_int { -1 }
+    pub unsafe fn ibv_query_gid(_ctx: *mut c_void, _port: u8, _index: c_int, _gid: *mut [u8; 16]) -> c_int { -1 }
+}
+#[cfg(not(any(target_arch = "aarch64", feature = "roce")))]
+use no_verbs::*;
 
 #[repr(C)]
 struct QpInitAttr {

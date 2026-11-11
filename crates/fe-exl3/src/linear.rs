@@ -215,7 +215,11 @@ impl Linear {
     }
 
     pub fn plan_for(k: u32, n: u32, bits: u32, blocks: u32) -> Plan {
-        let tuned = if std::env::var("FE_EXL3_UNTUNED").is_ok() { None } else { crate::plans::tuned(k, n, bits) };
+        let tuned = if std::env::var("FE_EXL3_UNTUNED").is_ok() { None } else { {
+            // the device's table by its SM count (blocks = 4 an SM); FE_EXL3_TABLE=gb10 forces GB10's (A/B runs)
+            let sms = if std::env::var("FE_EXL3_TABLE").is_ok_and(|v| v == "gb10") { 48 } else { blocks / 4 };
+            crate::plans::tuned(k, n, bits, sms)
+        } };
         let mut p = tuned.unwrap_or_else(|| plan(k, n, blocks, 8));
         // FE_EXL3_NOSPLIT=1 (or FE_EXL3_SPLIT=0) forces one K split (no counters / partial reduction; debugging).
         // The tuned splits are the default again: the suspected split-K race did not reproduce (exl3-stress 1.28M

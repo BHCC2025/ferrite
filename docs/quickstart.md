@@ -4,6 +4,9 @@ Ferrite serves Qwen3.8-27B from a Rust engine (host code and GPU kernels) on NVI
 OpenAI-compatible API: streaming, tool calls, thinking on/off, 128K context, a prompt cache, 4 concurrent streams
 and speculative decoding (DFlash2 or the model's MTP head). It runs on one Spark or on two over the RoCE link.
 
+Ferrite runs on Linux only; macOS and Windows are not supported. This page is for DGX Spark. The other targets have
+their own pages: [rtx-5080.md](rtx-5080.md) and [arc-b70.md](arc-b70.md).
+
 ## Requirements
 
 | | |
@@ -27,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
    available memory (`FERRITE_MIN_FREE_GB`);
-2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the release tarball of `FERRITE_VERSION` (0.2.0), its sha256
+2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the release tarball of `FERRITE_VERSION` (0.3.0), its sha256
    checked, or when there is no release a clone of the repository and a source build (`--source` forces it). Run
    inside a checkout or an unpacked release, it uses that folder instead;
 3. installs the Hugging Face CLI into `~/.venvs/hf`;
@@ -215,6 +218,9 @@ The build compiles every `kernels/k-*` crate to PTX with that nightly (`target-c
 `ptxas -arch=sm_121a`, and embeds the cubins in `target/release/fe-server` and `target/release/ferrite`. Tested with
 rustc 1.99.1 (host), nightly-2026-11-04 (kernels) and ptxas 13.0.88.
 `scripts/package-release.sh` builds and packs the release tarball into `dist/`.
+
+To build for an RTX 50 card instead (x86_64, `sm_120a`), set `FE_KARCH=sm_120a` for the build and for
+`scripts/check-deps.sh`; see [rtx-5080.md](rtx-5080.md).
 
 ## Troubleshooting
 

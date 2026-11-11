@@ -11,5 +11,6 @@ pub mod dims;
 pub mod flash;
 pub mod gdn;
 pub mod gemm;
+pub mod kvq;
 pub mod misc;
 pub mod selftest;

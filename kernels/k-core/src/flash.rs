@@ -20,13 +20,13 @@ pub const FLASH_SMEM: u32 = BQ * ROWB + 2 * 2 * BKV * ROWB; // 98304
 
 /// Byte offset of 16-byte chunk `c` (0..32) of row `r` in a [rows][256] bf16 tile, XOR-swizzled.
 #[inline(always)]
-fn sw(r: u32, c: u32) -> u32 {
+pub(crate) fn sw(r: u32, c: u32) -> u32 {
     r * ROWB + ((c ^ (r & 7)) << 4)
 }
 
 /// Load `rows` rows of 256 bf16 (row stride `ld` elements) into a swizzled tile; rows >= `valid` zero-fill.
 #[inline(always)]
-unsafe fn load_rows(dst: Shared<u8>, src: *const u16, ld: usize, rows: u32, valid: u32) {
+pub(crate) unsafe fn load_rows(dst: Shared<u8>, src: *const u16, ld: usize, rows: u32, valid: u32) {
     let mut i = tid_x();
     let total = rows * 32;
     while i < total {

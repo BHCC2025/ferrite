@@ -39,6 +39,8 @@ pub struct Kernels {
     pub gdn_replay: Function,
     /// verify segments (2..16 rows of a slot): the shared cache part on tensor cores + the masked segment part
     pub attn_vk: Function,
+    /// the quantized K/V cache forms (k-core kvq.rs): prep, flash, vk and combine, at 4 and at 6 bits
+    pub kvq: [[Function; 4]; 2],
 }
 impl Kernels {
     /// One rank of a two-way head split: the head-dependent kernels from kernels/k-core-tp2's module.
@@ -97,6 +99,19 @@ impl Kernels {
                 f.set_max_dynamic_smem(SEG_SMEM)?;
                 f
             },
+            kvq: {
+                // the flash kernel with producer warps (the same bits, the dequantization behind the tensor cores) unless
+                // FE_FLASH_PROD=0
+                let prod = flash_prod();
+                let set = |bits: usize| -> Result<[Function; 4]> {
+                    let (fl, vk) = (m.function(&format!("fe_flash_prefill_q{bits}{}", if prod { "p" } else { "" }))?,
+                        m.function(&format!("fe_attn_vk_q{bits}"))?);
+                    fl.set_max_dynamic_smem(flash_q_smem(bits))?;
+                    vk.set_max_dynamic_smem(seg_q_smem(bits))?;
+                    Ok([m.function(&format!("fe_attn_prep_q{bits}"))?, fl, vk, m.function("fe_attn_combine_q")?])
+                };
+                [set(4)?, set(6)?]
+            },
         })
     }
 }
@@ -105,6 +120,39 @@ const GEMM_SMEM: u32 = 3 * 2 * 128 * 32 * 2;
 const FLASH_SMEM: u32 = 64 * 512 + 2 * 2 * 32 * 512;
 /// k-core attn.rs SEG_SMEM: Q [6 heads][16][256] + 3 x (K + V) [16][256], bf16.
 const SEG_SMEM: u32 = 6 * 16 * 512 + 3 * 2 * 16 * 512;
+/// k-core kvq.rs (the quantized K/V cache): bytes of one head's record at 4 or 6 bits a value, and the kernels'
+/// dynamic shared memory.
+const fn kvq_rec(bits: usize) -> usize {
+    if bits == 6 { 208 } else { 144 }
+}
+fn flash_q_smem(bits: usize) -> u32 {
+    if flash_prod() {
+        (64 * 512 + 2 * 32 * 512 + 2 * 32 * kvq_rec(bits)) as u32
+    } else {
+        (64 * 512 + 2 * 2 * 32 * kvq_rec(bits) + 2 * 32 * 512) as u32
+    }
+}
+/// FE_FLASH_PROD (default 1): fe_flash_prefill_q*p, the quantized flash kernel with four producer warps (block 256).
+fn flash_prod() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FE_FLASH_PROD").map(|v| v != "0").unwrap_or(true))
+}
+const fn seg_q_smem(bits: usize) -> u32 {
+    (6 * 16 * 512 + 3 * 2 * 16 * kvq_rec(bits) + 2 * 16 * 512) as u32
+}
+
+/// FE_KVQ = 6 | 4 | 0 (default: 6 on small-memory devices, crate::lowmem; else 0 = a bf16 cache): the K/V cache as
+/// 6-bit or 4-bit records (rotated, group scaled; k-core kvq.rs): 832 or 576 bytes a token and layer for K and V
+/// each instead of 2048. KL against BF16 at 6 bits is the bf16 cache's; 4 bits cost 4-8%. One GPU only.
+fn kvq_bits() -> Result<usize> {
+    match std::env::var("FE_KVQ").ok().as_deref() {
+        Some("0") => Ok(0),
+        Some("4") => Ok(4),
+        Some("6") | Some("1") => Ok(6),
+        Some(v) => anyhow::bail!("FE_KVQ={v}: 0, 4 or 6"),
+        None => Ok(if crate::lowmem::on() { 6 } else { 0 }),
+    }
+}
 
 /// k-core attn.rs VK_SPLITS: fe_attn_vk's splits a row (grid z, the combine's nsplit).
 const VK_SPLITS: u32 = 48;
@@ -388,14 +436,66 @@ pub struct MtpW {
     pub head: Option<Linear>,
 }
 
+/// The token embedding table: on the device, or (small-memory devices, `FE_EMBED_HOST`) in host memory, from
+/// where each forward's rows are gathered and uploaded (the same bf16 bits either way).
+pub enum Embed {
+    Dev(DeviceBuffer<u16>),
+    Host(Vec<u8>),
+}
+
 pub struct Weights {
-    pub embed: DeviceBuffer<u16>,
+    pub embed: Embed,
     pub layers: Vec<Layer>,
     pub norm: DeviceBuffer<u16>,
     pub lm_head: Linear,
     pub mtp: Option<MtpW>,
     pub x3: Option<X3>,
     pub fp4: Option<fe_fp4::Kernels>,
+    /// the NVFP4/FP8 prompt weights live in host memory and visit the device a layer at a time
+    pub pstream: Option<PromptStream>,
+    /// the device's SM count (launch geometry)
+    pub sm_count: u32,
+}
+
+/// Prompt weights streamed from pinned host memory (small-memory devices; `FE_PROMPT_STREAM`, ring size
+/// `FE_PROMPT_RING`, default 2 layers): every layer's NVFP4/FP8 codes and scales are one pinned blob, copied on
+/// its own stream into slot `layer % ring` of a device ring just before the layer's prompt GEMMs run, while the
+/// layers before it compute. A slot is rewritten only after the layer that used it has finished.
+pub struct PromptStream {
+    blobs: Vec<fe_cuda::HostBuffer<u8>>,
+    ring: DeviceBuffer<u8>,
+    slot: usize,
+    n_ring: usize,
+    copy: Stream,
+    up: Vec<fe_cuda::Event>,
+    done: Vec<fe_cuda::Event>,
+    dry: bool,
+}
+impl PromptStream {
+    /// Bytes in host memory, and the device ring's.
+    pub fn bytes(&self) -> (usize, usize) {
+        (self.blobs.iter().map(|b| b.len()).sum(), self.ring.len())
+    }
+    /// Enqueue layer `li`'s upload; stream `s` then waits for it before whatever is launched next.
+    fn fetch(&self, li: usize, s: &Stream) -> Result<()> {
+        if li >= self.n_ring {
+            self.copy.wait(&self.done[li - self.n_ring])?;
+        }
+        // FE_PROMPT_STREAM_DRY=1 (timing only: wrong results) skips the copies, to see the compute alone
+        if !self.dry {
+            unsafe {
+                self.copy.memcpy_htod(self.ring.ptr().byte_add((li % self.n_ring) * self.slot), self.blobs[li].as_slice())?;
+            }
+        }
+        self.copy.record(&self.up[li])?;
+        s.wait(&self.up[li])?;
+        Ok(())
+    }
+    /// Layer `li`'s launches are all enqueued on `s`: its slot may be reused once they finish.
+    fn release(&self, li: usize, s: &Stream) -> Result<()> {
+        s.record(&self.done[li])?;
+        Ok(())
+    }
 }
 
 /// Load options.
@@ -411,10 +511,17 @@ pub struct LoadOpts {
     pub prompt_fp4: Option<std::path::PathBuf>,
     /// tensor parallel (rank, world): load this rank's slices (crate::tp)
     pub tp: Option<(usize, usize)>,
+    /// keep the embedding table in host memory (Embed::Host)
+    pub embed_host: bool,
+    /// stream the NVFP4/FP8 prompt weights from host memory (PromptStream) instead of keeping them on the device
+    pub prompt_stream: bool,
+    /// bf16 copies of the MTP head's weights for its prompt rows (false: they take the trellis GEMV)
+    pub mtp_bf16: bool,
 }
 impl Default for LoadOpts {
     fn default() -> Self {
-        LoadOpts { bf16: true, exl3_decode: true, mtp: true, prompt_fp4: None, tp: None }
+        LoadOpts { bf16: true, exl3_decode: true, mtp: true, prompt_fp4: None, tp: None, embed_host: false, prompt_stream: false,
+            mtp_bf16: true }
     }
 }
 impl LoadOpts {
@@ -426,7 +533,9 @@ impl LoadOpts {
         let path = fe_site::nvfp4_dir();
         let keep_bf16 = std::env::var("FE_BF16").map(|v| v == "1").unwrap_or(false);
         LoadOpts { bf16: (on("FE_BF16") && !fp4) || keep_bf16, exl3_decode: on("FE_EXL3_DECODE"), mtp: on("FE_MTP"),
-            prompt_fp4: fp4.then_some(path), tp: crate::tp::from_env() }
+            prompt_fp4: fp4.then_some(path), tp: crate::tp::from_env(),
+            embed_host: crate::lowmem::flag("FE_EMBED_HOST"), prompt_stream: fp4 && crate::lowmem::flag("FE_PROMPT_STREAM"),
+            mtp_bf16: std::env::var("FE_MTP_BF16").map(|v| v != "0").unwrap_or(!crate::lowmem::on()) }
     }
 }
 
@@ -620,7 +729,14 @@ impl Weights {
         let pfx = if src.st.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" };
         let h = cfg.hidden;
         let t0 = std::time::Instant::now();
-        let embed = src.st.upload_bf16(&format!("{pfx}.embed_tokens.weight"))?;
+        let embed = if o.embed_host {
+            let name = format!("{pfx}.embed_tokens.weight");
+            ensure!(src.st.get(&name)?.dtype == "BF16", "{name}: host embedding needs a BF16 table");
+            eprintln!("ferrite: embedding table in host memory");
+            Embed::Host(src.st.read_host(&name)?)
+        } else {
+            Embed::Dev(src.st.upload_bf16(&format!("{pfx}.embed_tokens.weight"))?)
+        };
         let mut layers: Vec<Layer> = Vec::new();
         let (mut gi, mut ai) = (0, 0);
         for l in 0..cfg.n_layers {
@@ -663,10 +779,13 @@ impl Weights {
                 eprintln!("  loaded {} layers ({:.1}s)", l + 1, t0.elapsed().as_secs_f32());
             }
         }
+        crate::lowmem::trace("the layers");
         let norm = src.st.upload_bf16(&format!("{pfx}.norm.weight"))?;
         let mut lm_head = src.single("lm_head", h)?;
+        crate::lowmem::trace("lm_head");
         // the ModelOpt checkpoint keeps MTP in bf16 (excluded from quantization): its prompt rows use bf16 copies
-        src.o.bf16 = true;
+        // (small-memory devices: none, the head's prompt rows take the trellis GEMV)
+        src.o.bf16 = o.mtp_bf16;
         let mtp = if o.mtp && src.st.has("mtp.norm.weight") {
             let p = "mtp.layers.0";
             let names = |v: &[&str]| -> Vec<String> { v.iter().map(|n| format!("{p}.{n}")).collect() };
@@ -709,6 +828,7 @@ impl Weights {
             }
             _ => None,
         };
+        crate::lowmem::trace("the MTP head");
         let x3 = match src.exl3.take() {
             Some((_, kern, _, _)) if o.exl3_decode => {
                 let mut all = x3_linears(&layers, &lm_head);
@@ -737,34 +857,63 @@ impl Weights {
                 eprintln!("ferrite: MTP draft head over the first {dv} vocabulary ids");
             }
         }
+        crate::lowmem::trace("the GEMV workspace (load scratch freed)");
+        let mut pstream = None;
         let fp4 = match &o.prompt_fp4 {
             Some(dir) => {
                 let ck = fe_fp4::Checkpoint::open(dir)?;
-                let fk = fe_fp4::Kernels::load()?;
+                let mut fk = fe_fp4::Kernels::load()?;
+                // FP8 GEMMs on the block-scaled tensor-core form (the same bits, fp4-check): on by default on compute
+                // capability 12.0 (RTX 50), where it runs at twice the plain form's rate; FE_FP8_BS overrides
+                if std::env::var("FE_FP8_BS").is_err() {
+                    fk.fp8_bs = crate::lowmem::compute_capability() == 120;
+                }
                 let t = std::time::Instant::now();
-                attach_fp4(&ck, pfx, cfg, &mut layers, &mut lm_head, o.tp)?;
+                ensure!(!(o.prompt_stream && o.tp.is_some()), "FE_PROMPT_STREAM: one GPU only");
+                pstream = attach_fp4(&ck, pfx, cfg, &mut layers, &mut lm_head, o.tp, o.prompt_stream)?;
                 eprintln!("ferrite: NVFP4/FP8 prompt weights from {dir:?} ({:.1}s)", t.elapsed().as_secs_f32());
+                if let Some(ps) = &pstream {
+                    let (hb, rb) = ps.bytes();
+                    eprintln!("ferrite: prompt weights streamed from host memory ({:.1} GB pinned, a {}-layer ring of {:.2} GB on the device)",
+                        hb as f64 / 1e9, ps.n_ring, rb as f64 / 1e9);
+                }
                 Some(fk)
             }
             None => None,
         };
-        Ok(Weights { embed, layers, norm, lm_head, mtp, x3, fp4 })
+        crate::lowmem::trace("the prompt weights");
+        Ok(Weights { embed, layers, norm, lm_head, mtp, x3, fp4, pstream, sm_count })
     }
 }
 
 /// Hybrid prompt path: NVFP4/FP8 linears from the ModelOpt checkpoint for every layer (fused per projection).
-/// `tp`: (rank, world): each rank loads its slice of every weight (crate::tp::fp4_slice).
+/// `tp`: (rank, world): each rank loads its slice of every weight (crate::tp::fp4_slice). `stream`: the weights stay
+/// in host memory (the returned PromptStream) instead of on the device.
 fn attach_fp4(ck: &fe_fp4::Checkpoint, pfx: &str, cfg: &Config, layers: &mut [Layer], lm_head: &mut Linear,
-    tp: Option<(usize, usize)>) -> Result<()> {
-    use fe_fp4::PromptLinear;
+    tp: Option<(usize, usize)>, stream: bool) -> Result<Option<PromptStream>> {
+    use fe_fp4::{HostLinear, PromptLinear};
     // FE_FP4_ONLY=qkv,o,gdn,out,mlp,down,lm limits which projections use it (debugging; needs FE_BF16=1); under TP
-    // lm_head stays on the trellis head (logits rows always take it)
+    // lm_head stays on the trellis head (logits rows always take it), and a streamed set has no head either
     let only = std::env::var("FE_FP4_ONLY").unwrap_or_else(|_| "qkv,o,gdn,out,mlp,down,lm".into());
-    let on = |k: &str| only.split(',').any(|x| x == k) && !(tp.is_some() && k == "lm");
+    let on = |k: &str| only.split(',').any(|x| x == k) && !((tp.is_some() || stream) && k == "lm");
     let slices = |names: &[&str]| -> Result<Option<Vec<fe_fp4::Slice>>> {
         tp.map(|(r, w)| names.iter().map(|n| crate::tp::fp4_slice(ck, n, r, w)).collect()).transpose()
     };
-    let load = |names: &[&str]| -> Result<PromptLinear> { PromptLinear::load_sliced(ck, names, false, slices(names)?.as_deref()) };
+    // a layer's streamed linears in creation order (mixer projection, mixer output, gate|up, down): codes, scales
+    let pending: std::cell::RefCell<Vec<(Vec<u8>, Vec<u8>)>> = Default::default();
+    let fin = |h: HostLinear| -> Result<PromptLinear> {
+        if stream {
+            let (lin, codes, sf) = h.place()?;
+            pending.borrow_mut().push((codes, sf));
+            Ok(lin)
+        } else {
+            h.upload()
+        }
+    };
+    let load = |names: &[&str]| -> Result<PromptLinear> { fin(HostLinear::load_sliced(ck, names, false, slices(names)?.as_deref())?) };
+    let align = |x: usize| x.div_ceil(256) * 256;
+    let mut blobs = Vec::new();
+    let mut offs: Vec<Vec<(usize, usize)>> = Vec::new();
     for (l, layer) in layers.iter_mut().enumerate() {
         let p = format!("{pfx}.layers.{l}");
         let nm = |n: &str| format!("{p}.{n}");
@@ -796,7 +945,7 @@ fn attach_fp4(ck: &fe_fp4::Checkpoint, pfx: &str, cfg: &Config, layers: &mut [La
         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
         if on("mlp") {
             if std::env::var("FE_FP4_SWIGLU").map(|v| v != "0").unwrap_or(true) {
-                layer.swiglu_fp4 = Some(PromptLinear::load_swiglu_sliced(ck, refs[0], refs[1], slices(&refs)?.as_deref())?);
+                layer.swiglu_fp4 = Some(fin(HostLinear::load_sliced(ck, &refs, false, slices(&refs)?.as_deref())?.into_swiglu()?)?);
             } else {
                 layer.gate_up.prompt = Some((load(&refs)?, 2));
             }
@@ -804,12 +953,63 @@ fn attach_fp4(ck: &fe_fp4::Checkpoint, pfx: &str, cfg: &Config, layers: &mut [La
         if on("down") {
             layer.down.p = Some(load(&[nm("mlp.down_proj").as_str()])?);
         }
+        if stream {
+            // the layer's blob: every linear's codes then scales, each piece on a 256-byte boundary
+            let pend = std::mem::take(&mut *pending.borrow_mut());
+            let (mut total, mut lo) = (0usize, Vec::new());
+            for (c, sf) in &pend {
+                let ow = total;
+                let os = ow + align(c.len());
+                total = os + align(sf.len());
+                lo.push((ow, os));
+            }
+            let mut blob = fe_cuda::HostBuffer::<u8>::alloc(total)?;
+            let dst = blob.as_mut_slice();
+            for ((c, sf), &(ow, os)) in pend.iter().zip(&lo) {
+                dst[ow..ow + c.len()].copy_from_slice(c);
+                dst[os..os + sf.len()].copy_from_slice(sf);
+            }
+            blobs.push(blob);
+            offs.push(lo);
+        }
     }
     let _ = cfg;
     if on("lm") {
         lm_head.p = Some(load(&["lm_head"])?);
     }
-    Ok(())
+    if !stream {
+        return Ok(None);
+    }
+    let n_ring = std::env::var("FE_PROMPT_RING").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).clamp(1, layers.len());
+    let slot = blobs.iter().map(|b| b.len()).max().unwrap_or(0).div_ceil(4096) * 4096;
+    let ring = DeviceBuffer::<u8>::alloc(n_ring * slot)?;
+    for (l, layer) in layers.iter_mut().enumerate() {
+        let base = ring.ptr().byte_add((l % n_ring) * slot);
+        let mut it = offs[l].iter();
+        let mut set = |lin: Option<&mut PromptLinear>| {
+            if let Some(lin) = lin {
+                let &(ow, os) = it.next().expect("streamed linear without a blob piece");
+                lin.set_views(base.byte_add(ow), base.byte_add(os));
+            }
+        };
+        match &mut layer.mixer {
+            Mixer::Attn { qkv, o, .. } => {
+                set(qkv.prompt.as_mut().map(|p| &mut p.0));
+                set(o.p.as_mut());
+            }
+            Mixer::Gdn { proj, out, .. } => {
+                set(proj.prompt.as_mut().map(|p| &mut p.0));
+                set(out.p.as_mut());
+            }
+        }
+        set(layer.swiglu_fp4.as_mut());
+        set(layer.gate_up.prompt.as_mut().map(|p| &mut p.0));
+        set(layer.down.p.as_mut());
+        ensure!(it.next().is_none(), "layer {l}: blob pieces left over");
+    }
+    let mk = |n: usize| -> Result<Vec<fe_cuda::Event>> { (0..n).map(|_| Ok(fe_cuda::Event::new_no_timing()?)).collect() };
+    Ok(Some(PromptStream { up: mk(blobs.len())?, done: mk(blobs.len())?, blobs, ring, slot, n_ring, copy: Stream::new()?,
+        dry: std::env::var("FE_PROMPT_STREAM_DRY").is_ok_and(|v| v == "1") }))
 }
 
 /// For layers whose gate/up are separate EXL3 linears with bf16 prompt copies: build the interleaved bf16
@@ -963,6 +1163,9 @@ pub struct MtpRow {
     pub src: MtpSrc,
 }
 
+/// device memory below which the captured graphs are dropped before another is captured
+const GRAPH_MIN_FREE: usize = 192 << 20;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct GraphKey {
     seg_lens: Vec<u32>,
@@ -1009,6 +1212,12 @@ pub struct Engine {
     /// tokens already in each slot's cache
     pub slot_len: Vec<usize>,
     kv: Vec<(DeviceBuffer<u16>, DeviceBuffer<u16>)>,
+    /// bits a value of the cache's records (kvq_bits; 0: a bf16 cache)
+    kvq: usize,
+    /// fe_attn_vk_q's splits a row (FE_VK_SPLITS; default SMs / 4 kv heads, within 16..=64)
+    vkq_splits: u32,
+    /// FE_FWD_PROF=1: (last mark, per-phase milliseconds) of prompt forwards
+    fwd_prof: Option<std::cell::RefCell<(std::time::Instant, Vec<(&'static str, f64)>)>>,
     conv_state: Vec<DeviceBuffer<u16>>,
     rec_state: Vec<DeviceBuffer<f32>>,
     /// per-row state history of the last verify forward (rows 0..hist_cap), per GDN layer; the recurrent one only
@@ -1044,7 +1253,7 @@ pub struct Engine {
     /// debug taps (set_mid_taps): every layer's residual after its mixer, [rows][n_layers * hidden] bf16
     mid: Option<DeviceBuffer<u16>>,
     /// prompt cache: the park pool (park_pool / park_save / park_restore), same size on every rank
-    park: Option<DeviceBuffer<u8>>,
+    park: Option<ParkMem>,
     /// prompt cache block layout on rank 0 (cache_pool): (state blocks, bytes a state block, KV blocks)
     park_layout: Option<(usize, usize, usize)>,
     /// captured graphs for batches made only of short segments (FE_GRAPHS=0 disables)
@@ -1052,6 +1261,24 @@ pub struct Engine {
     pub use_graphs: bool,
     /// tensor parallel state (crate::tp), attached after construction
     pub tp: Option<crate::tp::Tp>,
+    /// Embed::Host: pinned staging of a forward's embedding rows, their device copy [max_rows][hidden] and the
+    /// identity row index fe_embed gathers them with
+    emb: Option<(fe_cuda::HostBuffer<u16>, DeviceBuffer<u16>, DeviceBuffer<u32>)>,
+}
+
+/// The park pool's memory: on the device, or (small-memory devices, `FE_PARK_HOST`) pinned host memory, with the
+/// same block layout; entries then move over the bus on the engine stream instead of device to device.
+enum ParkMem {
+    Dev(DeviceBuffer<u8>),
+    Host(fe_cuda::HostBuffer<u8>),
+}
+impl ParkMem {
+    fn len(&self) -> usize {
+        match self {
+            ParkMem::Dev(b) => b.len(),
+            ParkMem::Host(b) => b.len(),
+        }
+    }
 }
 
 pub(crate) fn f16_bits_to_bf16(h: u16) -> u16 {
@@ -1081,11 +1308,19 @@ impl Engine {
         if std::env::var("FE_SWIGLU").map(|v| v != "0").unwrap_or(true) {
             fuse_swiglu(&mut w, &k, &stream, cfg.hidden)?;
         }
-        let kv_elems = n_slots * max_ctx * cfg.n_kv * cfg.head_dim;
+        let kvq = kvq_bits()?;
+        let vkq_splits = std::env::var("FE_VK_SPLITS").ok().and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(w.sm_count / cfg.n_kv as u32).clamp(16, 64);
+        ensure!(kvq == 0 || (cfg.n_kv == 4 && cfg.n_q == 24), "FE_KVQ: the quantized K/V cache is built for one GPU (no TP split)");
+        if kvq > 0 {
+            eprintln!("ferrite: {kvq}-bit K/V cache ({} bytes a token)", (cfg.n_full() + w.mtp.is_some() as usize) * 2 * cfg.n_kv * kvq_rec(kvq));
+        }
+        let kv_elems = n_slots * max_ctx * if kvq > 0 { cfg.n_kv * kvq_rec(kvq) / 2 } else { cfg.n_kv * cfg.head_dim };
         let mut kv = Vec::new();
         for _ in 0..cfg.n_full() + w.mtp.is_some() as usize {
             kv.push((DeviceBuffer::<u16>::zeroed(kv_elems)?, DeviceBuffer::<u16>::zeroed(kv_elems)?));
         }
+        crate::lowmem::trace("the K/V cache");
         let n_gdn = cfg.n_layers - cfg.n_full();
         let cd = cfg.conv_dim();
         let rs = cfg.lin_v_heads * cfg.lin_dk * cfg.lin_dv;
@@ -1106,13 +1341,14 @@ impl Engine {
                 }
             }
         }
+        crate::lowmem::trace("the GDN state and history");
         // RoPE table [pos][cos 32 | sin 32] in bf16, computed like HF: f32 inv_freq, f32 angle, bf16 cos/sin.
         let half = cfg.rotary_dim / 2;
         let inv: Vec<f32> = (0..half)
             .map(|i| 1.0f32 / (cfg.rope_theta as f32).powf((2 * i) as f32 / cfg.rotary_dim as f32))
             .collect();
-        let mut tab = vec![0u16; max_ctx * 64];
-        for p in 0..max_ctx {
+        let mut tab = vec![0u16; n_slots * max_ctx * 64];
+        for p in 0..n_slots * max_ctx {
             for i in 0..half {
                 let ang = (p as f32 * inv[i]) as f64;
                 tab[p * 64 + i] = bf16_bits(ang.cos() as f32);
@@ -1142,6 +1378,7 @@ impl Engine {
             taps: DeviceBuffer::alloc(max_rows * h)?,
             mtp_out: DeviceBuffer::alloc(max_rows * h)?,
         };
+        crate::lowmem::trace("the forward scratch");
         let logits = DeviceBuffer::alloc(max_logit_rows * cfg.vocab)?;
         let argmax_out = DeviceBuffer::alloc(max_logit_rows)?;
         let fp4_ws = if w.fp4.is_some() { Some(fe_fp4::Workspace::new(max_rows, cfg.inter.max(2 * cfg.hidden))?) } else { None };
@@ -1171,11 +1408,36 @@ impl Engine {
         } else {
             None
         };
-        Ok(Engine { slot_len: vec![0; n_slots], cfg, k, w, stream, n_slots, max_ctx, kv, conv_state, rec_state, conv_hist,
+        crate::lowmem::trace("logits, prompt workspaces, replay buffers");
+        let emb = match &w.embed {
+            Embed::Host(_) => Some((fe_cuda::HostBuffer::alloc(max_rows * h)?, DeviceBuffer::alloc(max_rows * h)?,
+                DeviceBuffer::from_slice(&(0..max_rows as u32).collect::<Vec<_>>())?)),
+            Embed::Dev(_) => None,
+        };
+        Ok(Engine { emb, slot_len: vec![0; n_slots], cfg, k, w, stream, n_slots, max_ctx, kv, kvq, vkq_splits,
+            fwd_prof: std::env::var("FE_FWD_PROF").is_ok_and(|v| v == "1").then(|| std::cell::RefCell::new((std::time::Instant::now(), Vec::new()))),
+            conv_state, rec_state, conv_hist,
             rec_hist, hist_rows, hist_cap, rope, sc, logits, max_logit_rows, argmax_out, fp4_ws,
             tree_path_host: fe_cuda::HostBuffer::alloc(32)?, tree_path: DeviceBuffer::alloc(32)?,
             gather_host: fe_cuda::HostBuffer::alloc(2 * GATHER_MAX)?, gather_tab: DeviceBuffer::alloc(2 * GATHER_MAX)?, fp4_act, gdn, replay, feat: None, mid: None, park: None, park_layout: None, graphs: Default::default(),
             use_graphs: std::env::var("FE_GRAPHS").map(|v| v != "0").unwrap_or(true), tp: None })
+    }
+
+    /// Tokens the K/V cache holds from `slot` to its end. The slots' caches are one buffer, a slot after another, each
+    /// `max_ctx` tokens: a sequence may run past its own slot into the slots after it when the scheduler keeps those
+    /// empty (its shared context pool), so this is the bound the engine checks.
+    pub fn cap(&self, slot: usize) -> usize {
+        (self.n_slots - slot.min(self.n_slots)) * self.max_ctx
+    }
+
+    /// Tokens of all slots together: what slot 0 holds when it has the pool to itself.
+    pub fn pool_ctx(&self) -> usize {
+        self.n_slots * self.max_ctx
+    }
+
+    /// u16 elements one token takes in a K (or V) cache buffer: its bf16 values, or its 4-bit records.
+    fn kv_tok(&self) -> usize {
+        if self.kvq > 0 { self.cfg.n_kv * kvq_rec(self.kvq) / 2 } else { self.cfg.n_kv * self.cfg.head_dim }
     }
 
     /// (max rows a forward, max logit rows): the sizes a crate::tp::Tp is built for.
@@ -1446,7 +1708,7 @@ impl Engine {
 
     /// Bytes one parked KV token takes on this rank.
     pub fn park_kv_bytes(&self) -> usize {
-        self.kv.len() * 2 * self.cfg.n_kv * self.cfg.head_dim * 2
+        self.kv.len() * 2 * self.kv_tok() * 2
     }
 
     /// Bytes of a slot's recurrent state (all GDN layers) on this rank.
@@ -1470,15 +1732,19 @@ impl Engine {
         self.mirror(|| crate::follow::Call::ParkPool { bytes })?;
         self.park = None;
         if bytes > 0 {
-            self.park = Some(DeviceBuffer::<u8>::alloc(bytes)?);
+            self.park = Some(if crate::lowmem::flag("FE_PARK_HOST") && self.tp.is_none() {
+                ParkMem::Host(fe_cuda::HostBuffer::alloc(bytes)?)
+            } else {
+                ParkMem::Dev(DeviceBuffer::<u8>::alloc(bytes)?)
+            });
         }
         Ok(())
     }
 
     /// (slot-side address, pool-side offset, bytes) of every piece of a park entry, in layout order.
     fn park_pieces(&self, slot: usize, kv: &std::ops::Range<usize>, gdn: bool) -> Result<Vec<(DevPtr, usize, usize)>> {
-        ensure!(slot < self.n_slots && kv.start <= kv.end && kv.end <= self.max_ctx, "park: slot {slot} tokens {kv:?}");
-        let tok = self.cfg.n_kv * self.cfg.head_dim;
+        ensure!(slot < self.n_slots && kv.start <= kv.end && kv.end <= self.cap(slot), "park: slot {slot} tokens {kv:?}");
+        let tok = self.kv_tok();
         let n = (kv.end - kv.start) * tok * 2;
         let mut v = Vec::new();
         let mut off = 0;
@@ -1502,10 +1768,42 @@ impl Engine {
         Ok(v)
     }
 
+    /// Device address of pool bytes [off, off + bytes) (a pool on the device only: a drafter's part of a snapshot).
     fn park_at(&self, off: usize, bytes: usize) -> Result<DevPtr> {
         let p = self.park.as_ref().ok_or_else(|| anyhow::anyhow!("park: no pool (park_pool)"))?;
         ensure!(off + bytes <= p.len(), "park: entry [{off}, {}) outside the {}-byte pool", off + bytes, p.len());
-        Ok(p.at(off))
+        match p {
+            ParkMem::Dev(b) => Ok(b.at(off)),
+            ParkMem::Host(_) => anyhow::bail!("park: the pool is in host memory (FE_PARK_HOST): no device address"),
+        }
+    }
+
+    /// Enqueue a copy of `n` bytes between pool offset `off` and device memory at `dev` (`out`: device -> pool).
+    fn park_xfer(&self, off: usize, dev: DevPtr, n: usize, out: bool) -> Result<()> {
+        let p = self.park.as_ref().ok_or_else(|| anyhow::anyhow!("park: no pool (park_pool)"))?;
+        ensure!(off + n <= p.len(), "park: entry [{off}, {}) outside the {}-byte pool", off + n, p.len());
+        match p {
+            ParkMem::Dev(b) => {
+                if out {
+                    self.stream.memcpy_dtod(b.at(off), dev, n)?;
+                } else {
+                    self.stream.memcpy_dtod(dev, b.at(off), n)?;
+                }
+            }
+            ParkMem::Host(h) => {
+                // SAFETY: the pool is only touched by these copies, on the engine thread, and every caller
+                // synchronises the stream before returning
+                let hs = unsafe { std::slice::from_raw_parts_mut((h.as_ptr() as *mut u8).add(off), n) };
+                unsafe {
+                    if out {
+                        self.stream.memcpy_dtoh(hs, dev)?;
+                    } else {
+                        self.stream.memcpy_htod(dev, hs)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn settled(&self, slot: usize) -> Result<()> {
@@ -1571,7 +1869,7 @@ impl Engine {
     }
 
     fn cache_restore_at(&mut self, slot: usize, pos: usize, off: usize) -> Result<()> {
-        ensure!(pos <= self.max_ctx, "cache_restore: position {pos}");
+        ensure!(pos <= self.pool_ctx(), "cache_restore: position {pos}");
         if let Some(rp) = self.replay.as_mut() {
             rp.pending[slot] = None;
         }
@@ -1603,7 +1901,7 @@ impl Engine {
     }
 
     fn kv_in_at(&mut self, slot: usize, rows: usize, offs: &[usize]) -> Result<()> {
-        ensure!(rows <= self.max_ctx, "kv_in: {rows} rows");
+        ensure!(rows <= self.pool_ctx(), "kv_in: {rows} rows");
         if let Some(rp) = self.replay.as_mut() {
             rp.pending[slot] = None;
         }
@@ -1614,23 +1912,17 @@ impl Engine {
 
     /// The copies of kv_out / kv_in (`out`: slot -> blocks), fixed-stride block layout.
     fn kv_blocks_copy(&self, slot: usize, rows: usize, offs: &[usize], out: bool) -> Result<()> {
-        ensure!(slot < self.n_slots && offs.len() >= rows.div_ceil(KV_BLOCK) && rows <= self.max_ctx,
+        ensure!(slot < self.n_slots && offs.len() >= rows.div_ceil(KV_BLOCK) && rows <= self.cap(slot),
             "kv blocks: slot {slot} rows {rows} blocks {}", offs.len());
-        let tok = self.cfg.n_kv * self.cfg.head_dim;
+        let tok = self.kv_tok();
         let tokb = tok * 2;
         for (j, &off) in offs.iter().enumerate().take(rows.div_ceil(KV_BLOCK)) {
-            let base = self.park_at(off, KV_BLOCK * self.park_kv_bytes())?;
             let (a, b) = (j * KV_BLOCK, rows.min((j + 1) * KV_BLOCK));
             let n = (b - a) * tokb;
             for (i, (k, v)) in self.kv.iter().enumerate() {
                 for (h, buf) in [k, v].into_iter().enumerate() {
                     let sp = buf.at((slot * self.max_ctx + a) * tok);
-                    let bp = base.add::<u8>((2 * i + h) * KV_BLOCK * tokb);
-                    if out {
-                        self.stream.memcpy_dtod(bp, sp, n)?;
-                    } else {
-                        self.stream.memcpy_dtod(sp, bp, n)?;
-                    }
+                    self.park_xfer(off + (2 * i + h) * KV_BLOCK * tokb, sp, n, out)?;
                 }
             }
         }
@@ -1640,13 +1932,8 @@ impl Engine {
 
     /// The copies of a park entry, without the mirror (`out`: slot -> pool, else pool -> slot).
     fn park_copy(&self, slot: usize, kv: &std::ops::Range<usize>, gdn: bool, off: usize, out: bool) -> Result<()> {
-        let base = self.park_at(off, self.park_bytes(kv.end - kv.start, gdn))?;
         for (sp, o, n) in self.park_pieces(slot, kv, gdn)? {
-            if out {
-                self.stream.memcpy_dtod(base.add::<u8>(o), sp, n)?;
-            } else {
-                self.stream.memcpy_dtod(sp, base.add::<u8>(o), n)?;
-            }
+            self.park_xfer(off + o, sp, n, out)?;
         }
         self.stream.sync()?;
         Ok(())
@@ -1658,9 +1945,8 @@ impl Engine {
         self.mirror(|| crate::follow::Call::ParkSave { slot, a: kv.start, b: kv.end, gdn, off })?;
         self.settled(slot)?;
         ensure!(kv.end <= self.slot_len[slot], "park_save: tokens {kv:?} past slot {slot}'s length {}", self.slot_len[slot]);
-        let base = self.park_at(off, self.park_bytes(kv.end - kv.start, gdn))?;
         for (sp, o, n) in self.park_pieces(slot, &kv, gdn)? {
-            self.stream.memcpy_dtod(base.add::<u8>(o), sp, n)?;
+            self.park_xfer(off + o, sp, n, true)?;
         }
         self.stream.sync()?;
         Ok(())
@@ -1672,13 +1958,12 @@ impl Engine {
     /// empty `kv`).
     pub fn park_restore(&mut self, slot: usize, kv: std::ops::Range<usize>, gdn: bool, off: usize, len: usize) -> Result<()> {
         self.mirror(|| crate::follow::Call::ParkRestore { slot, a: kv.start, b: kv.end, gdn, off, len })?;
-        ensure!(kv.end <= len && len <= self.max_ctx, "park_restore: tokens {kv:?}, length {len}");
-        let base = self.park_at(off, self.park_bytes(kv.end - kv.start, gdn))?;
+        ensure!(kv.end <= len && len <= self.cap(slot), "park_restore: tokens {kv:?}, length {len}");
         if let Some(rp) = self.replay.as_mut() {
             rp.pending[slot] = None;
         }
         for (sp, o, n) in self.park_pieces(slot, &kv, gdn)? {
-            self.stream.memcpy_dtod(sp, base.add::<u8>(o), n)?;
+            self.park_xfer(off + o, sp, n, false)?;
         }
         self.stream.sync()?;
         self.slot_len[slot] = len;
@@ -1690,7 +1975,7 @@ impl Engine {
     pub fn copy_slot(&mut self, src: usize, dst: usize, kv: std::ops::Range<usize>, gdn: bool, len: usize) -> Result<()> {
         self.mirror(|| crate::follow::Call::CopySlot { src, dst, a: kv.start, b: kv.end, gdn, len })?;
         self.settled(src)?;
-        ensure!(src != dst && kv.end <= len && kv.end <= self.slot_len[src] && len <= self.max_ctx,
+        ensure!(src != dst && kv.end <= len && kv.end <= self.slot_len[src] && len <= self.cap(dst),
             "copy_slot: {src} -> {dst} tokens {kv:?} length {len}");
         ensure!(!gdn || len == self.slot_len[src], "copy_slot: the recurrent state is {src}'s at {}, not {len}",
             self.slot_len[src]);
@@ -1854,7 +2139,7 @@ impl Engine {
         let si = self.replay.as_ref().and_then(|rp| rp.pending[slot]);
         let Some(si) = si else { anyhow::bail!("commit_tree: slot {slot} has no tree verify to replay") };
         let mut tab: Vec<(DevPtr, usize)> = Vec::with_capacity(GATHER_MAX);
-        let row = self.cfg.n_kv * self.cfg.head_dim;
+        let row = self.kv_tok();
         for (kc, vc) in &self.kv {
             for c in [kc, vc] {
                 tab.push((c.at((slot * self.max_ctx + start) * row), row));
@@ -1907,7 +2192,7 @@ impl Engine {
         for (i, r) in rows.iter().enumerate() {
             ensure!(matches!(r.src, MtpSrc::Tap(_)) == tap, "mtp: mixed sources");
             srcs.push(match r.src { MtpSrc::Tap(j) | MtpSrc::Out(j) => j as u32 });
-            ensure!(r.pos < self.max_ctx, "mtp: position {} past context", r.pos);
+            ensure!(r.pos < self.cap(r.slot), "mtp: position {} past context", r.pos);
             let cont = i > 0 && rows[i - 1].slot == r.slot && rows[i - 1].pos + 1 == r.pos;
             if cont {
                 segs.last_mut().unwrap().1.push(r.token);
@@ -1931,11 +2216,24 @@ impl Engine {
         let short = p.segs.iter().all(|s| (s.2 as usize) < FLASH_MIN) && p.rows <= 16;
         if self.use_graphs && short {
             if !self.graphs.contains_key(&key) {
+                // captured graphs hold device memory: with several sequences the batch shapes multiply, so drop them
+                // all when the device runs low, and run this batch directly if a capture still does not fit
+                if !self.graphs.is_empty() && fe_cuda::mem_info().is_ok_and(|(free, _)| free < GRAPH_MIN_FREE) {
+                    self.graphs.clear();
+                }
                 self.stream.begin_capture()?;
                 let r = f(self, p);
                 let g = self.stream.end_capture();
                 r?;
-                self.graphs.insert(key.clone(), g?);
+                match g {
+                    Ok(g) => { self.graphs.insert(key.clone(), g); }
+                    Err(_) => {
+                        self.graphs.clear();
+                        f(self, p)?;
+                        self.stream.sync()?;
+                        return Ok(());
+                    }
+                }
             }
             self.graphs[&key].launch(&self.stream)?;
         } else {
@@ -1973,7 +2271,7 @@ impl Engine {
         for (si, &(slot, toks)) in segs.iter().enumerate() {
             ensure!(slot < self.n_slots, "slot {slot}");
             let p0 = pos0[si];
-            ensure!(p0 + toks.len() <= self.max_ctx, "slot {slot}: context {} > {}", p0 + toks.len(), self.max_ctx);
+            ensure!(p0 + toks.len() <= self.cap(slot), "slot {slot}: context {} > {}", p0 + toks.len(), self.cap(slot));
             seginfo.push((slot as u32, ids.len() as u32, toks.len() as u32, p0 as u32));
             sslot.push(slot as u32);
             srow0.push(ids.len() as u32);
@@ -2075,9 +2373,65 @@ impl Engine {
         // the kernels could read the previous step's ids/positions (the hybrid run's random bad steps).
         self.sc.meta_host.as_mut_slice()[..meta.len()].copy_from_slice(&meta);
         unsafe { self.stream.memcpy_htod(self.sc.meta.ptr(), &self.sc.meta_host.as_slice()[..meta.len()])? };
+        if let (Embed::Host(tab), Some((host, dev, _))) = (&self.w.embed, self.emb.as_mut()) {
+            // host embedding: this forward's rows, gathered into pinned memory and uploaded on the engine stream
+            let hb = self.cfg.hidden * 2;
+            let dst = unsafe { std::slice::from_raw_parts_mut(host.as_mut_slice().as_mut_ptr() as *mut u8, rows * hb) };
+            for (r, &id) in meta[..rows].iter().enumerate() {
+                let o = id as usize * hb;
+                ensure!(o + hb <= tab.len(), "token id {id} outside the embedding table");
+                dst[r * hb..(r + 1) * hb].copy_from_slice(&tab[o..o + hb]);
+            }
+            unsafe { self.stream.memcpy_htod(dev.ptr(), &host.as_slice()[..rows * self.cfg.hidden])? };
+        }
         Ok(Prepared { rows, nseg, o_ids: 0, o_rslot, o_rpos, o_sslot, o_srow0, o_slen, o_lr, o_src,
             n_logits: logit_rows.len(), max_pos, segs: seginfo, dec: 0, lin_dec: 0, o_cpos, o_tbase, o_tmask, o_par,
             o_tstep, o_stree, seg_tree, asegs, aseg_vk, o_asrow0, o_aslen })
+    }
+
+    /// FE_FWD_PROF=1: synchronise and add the time since the last mark to `label` (a forward's phases; printed by
+    /// fwd_prof_report). Off: nothing.
+    fn mark(&self, label: &'static str) {
+        if let Some(p) = &self.fwd_prof {
+            let _ = self.stream.sync();
+            let mut p = p.borrow_mut();
+            let now = std::time::Instant::now();
+            let dt = now.duration_since(p.0).as_secs_f64() * 1e3;
+            p.0 = now;
+            match p.1.iter_mut().find(|e| e.0 == label) {
+                Some(e) => e.1 += dt,
+                None => p.1.push((label, dt)),
+            }
+        }
+    }
+
+    /// Print and reset the FE_FWD_PROF totals.
+    pub fn fwd_prof_report(&self, what: &str) {
+        if let Some(p) = &self.fwd_prof {
+            let mut p = p.borrow_mut();
+            let tot: f64 = p.1.iter().map(|e| e.1).sum();
+            eprintln!("fwd prof ({what}): {:.1} ms: {}", tot, p.1.iter().map(|e| format!("{} {:.1}", e.0, e.1)).collect::<Vec<_>>().join(" | "));
+            p.1.clear();
+            p.0 = std::time::Instant::now();
+        }
+    }
+
+    /// (table, row ids) for fe_embed: the device table with the batch's token ids, or the uploaded rows of a host
+    /// table with the identity index.
+    fn embed_src(&self, pr: &Prepared) -> (DevPtr, DevPtr) {
+        match (&self.w.embed, &self.emb) {
+            (Embed::Dev(t), _) => (t.ptr(), self.sc.meta.at(pr.o_ids)),
+            (Embed::Host(_), Some((_, dev, ident))) => (dev.ptr(), ident.ptr()),
+            (Embed::Host(_), None) => unreachable!("host embedding without staging"),
+        }
+    }
+
+    /// The embedding table on the device (None when it lives in host memory).
+    pub fn embed_dev(&self) -> Option<DevPtr> {
+        match &self.w.embed {
+            Embed::Dev(t) => Some(t.ptr()),
+            Embed::Host(_) => None,
+        }
     }
 
     /// Enqueue the target forward (no host syncs: capturable).
@@ -2090,10 +2444,20 @@ impl Engine {
         let h = cfg.hidden as u32;
         let (x, taps) = (self.sc.x.ptr(), self.sc.taps.ptr());
         unsafe {
-            s.launch(&k.embed, pr.rows as u32, 256, 0, (x, self.w.embed.ptr(), self.sc.meta.at(pr.o_ids), h))?;
+            let (tab, ids) = self.embed_src(pr);
+            s.launch(&k.embed, pr.rows as u32, 256, 0, (x, tab, ids, h))?;
         }
+        // streamed prompt weights: only forwards with prompt rows past the decode rows read them
+        let ps = self.w.pstream.as_ref().filter(|_| pr.rows > X3_ROWS && pr.lin_dec < pr.rows);
+        self.mark("other");
         for (li, layer) in self.w.layers.iter().enumerate() {
+            if let Some(ps) = ps {
+                ps.fetch(li, s)?;
+            }
             self.enqueue_layer(layer, pr, &lc, hist)?;
+            if let Some(ps) = ps {
+                ps.release(li, s)?;
+            }
             if let Some((ls, buf)) = &self.feat {
                 if let Some(j) = ls.iter().position(|&t| t == li) {
                     let ld = (ls.len() * cfg.hidden) as u32;
@@ -2137,7 +2501,8 @@ impl Engine {
         let (x, xn, cat, out) = (self.sc.x.ptr(), self.sc.xn.ptr(), self.sc.big.ptr(), self.sc.mtp_out.ptr());
         let src = if tap { self.sc.taps.ptr() } else { out };
         unsafe {
-            s.launch(&k.embed, r32, 256, 0, (x, self.w.embed.ptr(), self.sc.meta.at(pr.o_ids), h))?;
+            let (tab, ids) = self.embed_src(pr);
+            s.launch(&k.embed, r32, 256, 0, (x, tab, ids, h))?;
             s.launch(&k.gather_rows, r32, 256, 0, (xn, src, self.sc.meta.at(pr.o_src), h))?;
             s.launch(&k.rmsnorm, r32, 256, 0, (cat, x, m.pre_e.ptr(), h, cfg.eps, h, 2 * h))?;
             s.launch(&k.rmsnorm, r32, 256, 0, (cat.add::<u16>(h as usize), xn, m.pre_h.ptr(), h, cfg.eps, h, 2 * h))?;
@@ -2169,13 +2534,26 @@ impl Engine {
         let (x, xn, big) = (self.sc.x.ptr(), self.sc.xn.ptr(), self.sc.big.ptr());
         let eps = cfg.eps;
         let r32 = rows as u32;
-        let slot_stride = (self.max_ctx * cfg.n_kv * cfg.head_dim) as u64;
+        // the cache's slot stride as its kernels want it: bf16 elements, or bytes of 4-bit records
+        let slot_stride = if self.kvq > 0 { (self.max_ctx * cfg.n_kv * kvq_rec(self.kvq)) as u64 } else { (self.max_ctx * cfg.n_kv * cfg.head_dim) as u64 };
+        // splits of a decode / verify row: fe_attn_vk has VK_SPLITS built in; the quantized forms take the grid's,
+        // one block an SM for each segment's four K/V heads (a block of these kernels fills an SM's shared memory)
+        let vk_splits = if self.kvq > 0 { self.vkq_splits } else { VK_SPLITS };
+        let (k_prep, k_flash, k_vk, k_comb, flash_smem, seg_smem) = if self.kvq > 0 {
+            let q = &k.kvq[(self.kvq == 6) as usize];
+            (&q[0], &q[1], &q[2], &q[3], flash_q_smem(self.kvq), seg_q_smem(self.kvq))
+        } else {
+            (&k.attn_prep, &k.flash, &k.attn_vk, &k.attn_combine, FLASH_SMEM, SEG_SMEM)
+        };
         let attn_smem = 4 * (6 * 256 + 12) * 4;
+        let flash_threads = if self.kvq > 0 && flash_prod() { 256u32 } else { 128 };
         let h32 = h as u32;
         unsafe { s.launch(&k.rmsnorm, r32, 256, 0, (xn, x, layer.in_norm.ptr(), h32, eps, h32, h32))? };
+        self.mark("norm");
         match &layer.mixer {
             Mixer::Gdn { proj, conv_w, a_log, dt_bias, norm_w, out, idx } => {
                 let p = proj.forward(lc, big, xn, h, rows)?;
+                self.mark("gdn proj");
                 let ((qkv, ldqkv), (z, ldz), (a, lda), (b, ldb)) = (p[0], p[1], p[2], p[3]);
                 ensure!(lda == ldb, "GDN a/b strides differ");
                 let cd = cfg.conv_dim() as u32;
@@ -2228,15 +2606,18 @@ impl Engine {
                     s.launch(&k.gdn_norm, (r32, 2u32), 16 * cfg.lin_v_heads as u32, 0,
                         (self.sc.mix.ptr(), o, z, ldz as u32, norm_w.ptr(), eps))?;
                 }
+                self.mark("gdn core");
                 self.resid_linear(lc, out, self.sc.mix.ptr(), vd, rows, 0)?;
+                self.mark("gdn out");
             }
             Mixer::Attn { qkv, q_norm, k_norm, o, idx } => {
                 let p = qkv.forward(lc, big, xn, h, rows)?;
+                self.mark("attn proj");
                 let ((qg, ldqg), (kx, ldk), (vx, ldv)) = (p[0], p[1], p[2]);
                 let (kc, vc) = (&self.kv[*idx].0, &self.kv[*idx].1);
                 let q = self.sc.q.ptr();
                 unsafe {
-                    s.launch(&k.attn_prep, r32, ((cfg.n_q + 2 * cfg.n_kv) * 32) as u32, 0, (q, kc.ptr(), vc.ptr(), qg, ldqg as u32, kx, ldk as u32, vx,
+                    s.launch(k_prep, r32, ((cfg.n_q + 2 * cfg.n_kv) * 32) as u32, 0, (q, kc.ptr(), vc.ptr(), qg, ldqg as u32, kx, ldk as u32, vx,
                         ldv as u32, q_norm.ptr(), k_norm.ptr(), self.rope.ptr(), mp(pr.o_rslot), mp(pr.o_rpos), mp(pr.o_cpos), slot_stride,
                         eps))?;
                 }
@@ -2247,7 +2628,7 @@ impl Engine {
                     let (slot, r0, n, p0) = pr.asegs[i];
                     if n as usize >= FLASH_MIN && !pr.aseg_vk[i] {
                         unsafe {
-                            s.launch(&k.flash, (n.div_ceil(64), cfg.n_q as u32), 128, FLASH_SMEM,
+                            s.launch(k_flash, (n.div_ceil(64), cfg.n_q as u32), flash_threads, flash_smem,
                                 (self.sc.mix.ptr(), q, qg, ldqg as u32, kc.ptr(), vc.ptr(), slot_stride, slot, r0, n, p0,
                                  scale_log2))?;
                         }
@@ -2260,22 +2641,23 @@ impl Engine {
                         cnt += pr.asegs[j].2;
                         j += 1;
                     }
+                    ensure!(seg_attn() || self.kvq == 0, "FE_KVQ needs FE_ATTN_SEG (the split-K kernel reads a bf16 cache)");
                     if seg_attn() {
-                        // the run in pieces of <= PART_ROWS / VK_SPLITS rows (the partials budget)
+                        // the run in pieces of <= PART_ROWS / splits rows (the partials budget)
                         let mut a = i;
                         while a < j {
                             let (pr0, mut pc, mut b) = (pr.asegs[a].1, 0u32, a);
-                            while b < j && (pc + pr.asegs[b].2) as usize * VK_SPLITS as usize <= PART_ROWS {
+                            while b < j && (pc + pr.asegs[b].2) as usize * vk_splits as usize <= PART_ROWS {
                                 pc += pr.asegs[b].2;
                                 b += 1;
                             }
                             unsafe {
-                                s.launch(&k.attn_vk, ((b - a) as u32, cfg.n_kv as u32, VK_SPLITS), 32 * (cfg.n_q / cfg.n_kv) as u32,
-                                    SEG_SMEM, (self.sc.part_o.ptr(), self.sc.part_ml.ptr(), q, kc.ptr(), vc.ptr(), mp(pr.o_rslot),
+                                s.launch(k_vk, ((b - a) as u32, cfg.n_kv as u32, vk_splits), 32 * (cfg.n_q / cfg.n_kv) as u32,
+                                    seg_smem, (self.sc.part_o.ptr(), self.sc.part_ml.ptr(), q, kc.ptr(), vc.ptr(), mp(pr.o_rslot),
                                      mp(pr.o_rpos), mp(pr.o_tbase), mp(pr.o_tmask), mp(pr.o_asrow0), mp(pr.o_aslen), a as u32, pr0,
                                      slot_stride, scale_log2))?;
-                                s.launch(&k.attn_combine, (pc, cfg.n_q as u32), 256, 0,
-                                    (self.sc.mix.ptr(), self.sc.part_o.ptr(), self.sc.part_ml.ptr(), qg, ldqg as u32, VK_SPLITS,
+                                s.launch(k_comb, (pc, cfg.n_q as u32), 256, 0,
+                                    (self.sc.mix.ptr(), self.sc.part_o.ptr(), self.sc.part_ml.ptr(), qg, ldqg as u32, vk_splits,
                                      pr0))?;
                             }
                             a = b;
@@ -2294,7 +2676,9 @@ impl Engine {
                     }
                     i = j;
                 }
+                self.mark("attn core");
                 self.resid_linear(lc, o, self.sc.mix.ptr(), cfg.n_q * cfg.head_dim, rows, 0)?;
+                self.mark("attn out");
             }
         }
         if let Some(buf) = &self.mid {
@@ -2308,6 +2692,7 @@ impl Engine {
             }
         }
         unsafe { s.launch(&k.rmsnorm, r32, 256, 0, (xn, x, layer.post_norm.ptr(), h32, eps, h32, h32))? };
+        self.mark("norm");
         let inter = cfg.inter as u32;
         // prompt rows [d, rows) may take a fused SwiGLU path; decode rows [0, d) always the per-linear one
         let d = if rows > X3_ROWS { lc.dec.min(rows) } else { rows };
@@ -2350,6 +2735,7 @@ impl Engine {
             }
             self.resid_linear(&c2, &layer.down, self.sc.act.ptr(), cfg.inter, n_rest, 0)?;
         }
+        self.mark("mlp");
         Ok(())
     }
 

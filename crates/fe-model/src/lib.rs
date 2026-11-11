@@ -2,6 +2,7 @@
 pub mod config;
 pub mod copy;
 pub mod follow;
+pub mod lowmem;
 pub mod model;
 pub mod pcache;
 pub mod tp;

@@ -97,6 +97,7 @@ async fn serve(args: Args) -> Result<()> {
                 prefill_tps: args.mock_prefill_tps,
                 max_batch: args.max_concurrent.unwrap_or(4),
                 max_context: args.max_model_len,
+                cached_prompt_tokens: 0,
             },
         ))
     } else {
@@ -106,9 +107,19 @@ async fn serve(args: Args) -> Result<()> {
     let cfg = ServerConfig {
         model_id: args.served_model_name.clone(),
         max_concurrent: args.max_concurrent.unwrap_or(info.max_batch).max(1),
-        max_context: args.max_model_len.min(info.max_context),
+        // an engine with a shared context pool (FE_POOL) holds more than --max-model-len in one request
+        max_context: if info.max_context > args.max_model_len && std::env::var("FE_POOL").is_ok_and(|v| v == "1") { info.max_context } else { args.max_model_len.min(info.max_context) },
         defaults,
     };
+    if args.max_concurrent.is_some_and(|n| n > info.max_batch) {
+        tracing::warn!(
+            "--max-concurrent {} is above the {} requests the {} engine decodes at once: running {} at a time",
+            cfg.max_concurrent, info.max_batch, info.name, info.max_batch
+        );
+    }
+    // AppState::new keeps both limits within what the engine reports: /health never claims more
+    let state = AppState::new(engine, tok, template, cfg);
+    let cfg = &state.cfg;
     tracing::info!(
         "engine {} | model id {} | {} concurrent | context {} | eos {:?} | defaults temp {} top_p {} top_k {}",
         info.name,
@@ -120,7 +131,6 @@ async fn serve(args: Args) -> Result<()> {
         cfg.defaults.top_p,
         cfg.defaults.top_k
     );
-    let state = AppState::new(engine, tok, template, cfg);
     let addr = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
     tracing::info!("listening on http://{addr}");

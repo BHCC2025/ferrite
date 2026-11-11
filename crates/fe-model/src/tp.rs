@@ -129,8 +129,11 @@ pub fn load_engine(model: &std::path::Path, n_slots: usize, max_ctx: usize, max_
         }
         fab = Some((f, mirror));
     }
-    let (free, _) = ctx.mem_info()?;
-    eprintln!("ferrite: {} free {:.1} GB; loading {model:?}", ctx.name(), free as f64 / 1e9);
+    let (free, total) = ctx.mem_info()?;
+    crate::lowmem::init(total, ctx.compute_capability()?);
+    eprintln!("ferrite: {} free {:.1} GB{}; loading {model:?}", ctx.name(), free as f64 / 1e9,
+        if crate::lowmem::on() { " (small-memory forms on)" } else { "" });
+    crate::lowmem::trace("the context and kernels");
     let t = std::time::Instant::now();
     let w = Weights::load(&cfg, model, &LoadOpts::from_env(), ctx.sm_count()? as u32)?;
     eprintln!("ferrite: weights loaded in {:.1}s", t.elapsed().as_secs_f32());
