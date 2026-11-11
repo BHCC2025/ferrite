@@ -4,46 +4,46 @@ version = 4
 
 [[package]]
 name = "kx-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kxcommon",
 ]
 
 [[package]]
 name = "kx-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kxcommon",
 ]
 
 [[package]]
 name = "kx-dflash"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kxcommon",
 ]
 
 [[package]]
 name = "kx-test"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kxcommon",
 ]
 
 [[package]]
 name = "kx-xq"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kxcommon",
 ]
 
 [[package]]
 name = "kx-xqpf"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kxcommon",
 ]
 
 [[package]]
 name = "kxcommon"
-version = "0.3.0"
+version = "0.4.0"

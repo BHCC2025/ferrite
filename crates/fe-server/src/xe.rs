@@ -123,6 +123,15 @@ pub struct XeOpts {
     /// DFlash2 drafting (the default; FE_XE_DRAFT=mtp selects arc-engine's MTP policy above): the drafter checkpoint (FE_DRAFT_DIR).
     /// In DFlash2 mode the MTP head and its draft head are not loaded.
     pub dflash: Option<String>,
+    /// lanes (FE_XE_LANES, default 1): requests served at once, each on KV caches of its own. Lane 0 has `ctx` positions, the
+    /// others `lane_ctx`. With more than one lane the side pool is not used and drafting is DFlash2.
+    pub lanes: usize,
+    /// positions of lanes 1.. (FE_XE_LANE_CTX, 28672)
+    pub lane_ctx: usize,
+    /// decode windows a lane runs before the next lane's turn (FE_XE_QUANTUM, 8)
+    pub quantum: usize,
+    /// rows a lane gets in a shared verify window by the number of lanes decoding (index 2..8; FE_XE_LANE_ROWS="r2,r3,..")
+    pub lane_rows: [usize; 9],
 }
 
 impl Default for XeOpts {
@@ -138,6 +147,10 @@ impl Default for XeOpts {
             spec: SpecCfg::default(),
             dhead: None,
             dflash: None,
+            lanes: 1,
+            lane_ctx: 28672,
+            quantum: 8,
+            lane_rows: [8, 8, 8, 5, 4, 3, 2, 2, 2],
         }
     }
 }
@@ -170,6 +183,33 @@ impl XeOpts {
             Ok("dflash") | Err(_) => Some(default_draft_dir()?),
             Ok(v) => anyhow::bail!("FE_XE_DRAFT={v}: dflash (default) or mtp"),
         };
+        if let Ok(n) = std::env::var("FE_XE_LANES") {
+            o.lanes = n.parse::<usize>().context("FE_XE_LANES")?.clamp(1, 8);
+        }
+        if let Ok(n) = std::env::var("FE_XE_LANE_CTX") {
+            o.lane_ctx = n.parse().context("FE_XE_LANE_CTX")?;
+        }
+        if let Ok(n) = std::env::var("FE_XE_QUANTUM") {
+            o.quantum = n.parse::<usize>().context("FE_XE_QUANTUM")?.max(1);
+        }
+        if let Ok(v) = std::env::var("FE_XE_LANE_ROWS") {
+            for (i, x) in v.split(',').enumerate().take(7) {
+                let r = x.trim().parse::<usize>().context("FE_XE_LANE_ROWS")?;
+                ensure!(r >= 1 && r * (i + 2) <= 16, "FE_XE_LANE_ROWS: {r} rows a lane at {} lanes (16 rows a window)", i + 2);
+                o.lane_rows[i + 2] = r;
+            }
+        }
+        if o.lanes > 1 {
+            ensure!(o.dflash.is_some(), "FE_XE_LANES > 1 needs DFlash2 drafting (FE_XE_DRAFT=dflash)");
+            // lanes share a prefix at prompt-window boundaries: checkpoint every window unless told otherwise
+            if std::env::var("FE_XE_CKPT_EVERY").is_err() {
+                o.ckpt_every = rcap;
+            }
+            if std::env::var("FE_XE_CKPT_SLOTS").is_err() {
+                o.ckpt_slots = 10;
+            }
+            o.side_ctx = 0;
+        }
         if let Ok(d) = std::env::var("MTP_DHEAD") {
             o.dhead = if d.is_empty() || d == "none" { None } else { Some(d) };
         }
@@ -192,6 +232,10 @@ struct Ckpt {
     buf: DeviceBuffer<u8>,
     /// the DFlash2 draft context at `pos` (DFlash::save_window), with the drafter
     dbuf: Option<DeviceBuffer<u8>>,
+    /// lanes: the state is what any prompt with these first `pos` tokens and the hints `hints` below `pos` computes from
+    /// nothing (a prompt-window boundary of a run that started cold), so another lane may start from it
+    clean: bool,
+    hints: Vec<usize>,
 }
 
 /// Snapshot the engine state at `pos` of pool `pool`'s sequence into the slot already holding it, else a free slot, else the pool's own
@@ -218,6 +262,8 @@ fn take_ckpt(e: &XeDev, df: Option<&DFlash>, ckpts: &mut [Ckpt], clock: &mut u64
     c.pool = pool;
     c.used = true;
     c.stamp = *clock;
+    c.clean = false;
+    c.hints.clear();
     Ok(())
 }
 
@@ -241,6 +287,9 @@ struct Worker {
     other_hist: Vec<u32>,
     other_pos: usize,
     promotions: u64,
+    /// FE_XE_LANES > 1: the lanes and the one the engine points at
+    lanes: Vec<Lane>,
+    lcur: usize,
 }
 
 struct XeJob {
@@ -268,7 +317,7 @@ impl XeEngine {
                     return;
                 }
             };
-            let _ = info_tx.send(Ok(EngineInfo { name: "xe".into(), max_batch: 1, max_context: w.opts.ctx }));
+            let _ = info_tx.send(Ok(EngineInfo { name: "xe".into(), max_batch: w.opts.lanes.max(1), max_context: w.opts.ctx }));
             w.run(rx);
         })?;
         let info = info_rx.recv().map_err(|_| anyhow::anyhow!("the xe engine thread died while loading"))?.map_err(|e| anyhow::anyhow!(e))?;
@@ -294,7 +343,7 @@ impl Worker {
         let ck = fe_xe::fe_xq::Checkpoint::open(dir)?;
         let mt = if opts.dflash.is_none() { Some(Mtp::load(&e, &ck, opts.dhead.as_deref())?) } else { None };
         opts.spec.rows = opts.rcap;
-        let df = match &opts.dflash {
+        let mut df = match &opts.dflash {
             Some(d) => Some(DFlash::load(&mut e, Path::new(d))?),
             None => None,
         };
@@ -305,7 +354,7 @@ impl Worker {
                 Some(d) => Some(e.dev.alloc::<u8>(d.window_bytes())?),
                 None => None,
             };
-            ckpts.push(Ckpt { pos: 0, pool: 0, used: false, stamp: 0, buf: e.dev.alloc::<u8>(bytes)?, dbuf });
+            ckpts.push(Ckpt { pos: 0, pool: 0, used: false, stamp: 0, buf: e.dev.alloc::<u8>(bytes)?, dbuf, clean: false, hints: Vec::new() });
         }
         let other = if opts.side_ctx > 0 && opts.side_ctx < opts.ctx { Some(e.alloc_pool(opts.side_ctx as u32, mt.is_some())?) } else { None };
         tracing::info!(
@@ -322,10 +371,26 @@ impl Worker {
             if df.is_some() { "DFlash2" } else { "MTP" },
             e.dev.bytes.get() as f64 / 1e9
         );
-        Ok(Worker { e, mt, df, opts, hist: Vec::new(), ckpts, clock: 0, cur: 0, other, other_hist: Vec::new(), other_pos: 0, promotions: 0 })
+        let mut lanes = Vec::new();
+        if opts.lanes > 1 {
+            for i in 0..opts.lanes {
+                let (kv, cap) = if i == 0 { (None, opts.ctx) } else { (Some(e.alloc_pool(opts.lane_ctx as u32, false)?), opts.lane_ctx) };
+                // lane i's draft context is the drafter's context i
+                if let (Some(d), true) = (df.as_mut(), i > 0) {
+                    d.add_ring(&e)?;
+                }
+                lanes.push(Lane { kv, cap, hist: Vec::new(), pos: 0, live: e.dev.alloc::<u8>(bytes)?, saved: false, stamp: 0, run: None });
+            }
+            tracing::info!("xe: {} lanes: lane 0 of {} positions, the others of {} | {} decode windows a turn | {:.2} GB on the device",
+                opts.lanes, opts.ctx, opts.lane_ctx, opts.quantum, e.dev.bytes.get() as f64 / 1e9);
+        }
+        Ok(Worker { e, mt, df, opts, hist: Vec::new(), ckpts, clock: 0, cur: 0, other, other_hist: Vec::new(), other_pos: 0, promotions: 0, lanes, lcur: 0 })
     }
 
     fn run(mut self, rx: mpsc::Receiver<XeJob>) {
+        if self.opts.lanes > 1 {
+            return self.run_lanes(rx);
+        }
         while let Ok(XeJob { req, sink }) = rx.recv() {
             if req.cancel.is_cancelled() || sink.is_closed() {
                 sink.finish(Finish::new(FinishReason::Cancelled));
@@ -641,6 +706,616 @@ impl Drafting {
         match self {
             Drafting::Mtp(s) => &s.st,
             Drafting::Df(s) => &s.st,
+        }
+    }
+}
+
+
+// ------------------------------------------------------------------------------------------------------------------------------
+// Lanes (FE_XE_LANES > 1): several requests served at once, each on its own KV caches.
+//
+// The engine holds one sequence. A lane is a set of KV caches plus, while its request is not on the engine, a copy of the
+// engine state the request needs (GDN state, draft context). The worker gives the running lanes turns of `quantum` decode
+// windows; switching lanes swaps the cache pointers and copies those states, which reproduces the engine state exactly, so a
+// lane's tokens are the tokens of the same request served alone.
+//
+// Shared prefix: a request may start from another lane's checkpoint when that checkpoint is `clean`: taken at a prompt-window
+// boundary (a multiple of the window rows) of a run that started from nothing or from a clean checkpoint, before that run's
+// tail cut, with the same hints below it. Up to such a point every prompt with those tokens is computed in the same windows,
+// so the copied caches and state are what the request would have computed itself. A request waits while another one that
+// shares more than a window with it has not processed its prompt yet.
+
+struct Lane {
+    /// this lane's caches while the engine points at another lane (None: the engine holds them)
+    kv: Option<fe_xe::engine::KvPool>,
+    cap: usize,
+    /// an idle lane's kept sequence (its first `pos` tokens are in the caches)
+    hist: Vec<u32>,
+    pos: usize,
+    /// the engine state of this lane's request while another lane is on the engine
+    live: DeviceBuffer<u8>,
+    /// the lane's GDN state is in `live` (not in the engine): set when the engine moves to another lane, and while the lane
+    /// decodes in shared windows, which work on `live` in place
+    saved: bool,
+    stamp: u64,
+    run: Option<Box<Run>>,
+}
+
+struct Run {
+    req: GenRequest,
+    sink: TokenSink,
+    sp: DfSpec,
+    sampler: Sampler,
+    row16: Vec<u16>,
+    picked: usize,
+    greedy: bool,
+    stops: Vec<u32>,
+    max_new: usize,
+    generated: usize,
+    c0: usize,
+    cuts: Vec<usize>,
+    /// the request's hints (all of them, empty when hints are off) and its tail cut
+    hints: Vec<usize>,
+    tailcut: Option<usize>,
+    /// started from nothing or from a clean checkpoint
+    clean: bool,
+    started: bool,
+    t0: Instant,
+    prefill_s: f64,
+}
+
+impl Worker {
+    fn run_lanes(mut self, rx: mpsc::Receiver<XeJob>) {
+        let mut pending: std::collections::VecDeque<XeJob> = Default::default();
+        let mut next = 0usize;
+        loop {
+            if pending.is_empty() && self.lanes.iter().all(|l| l.run.is_none()) {
+                match rx.recv() {
+                    Ok(j) => pending.push_back(j),
+                    Err(_) => return,
+                }
+                // requests sent together (the lanes of one job) are a few milliseconds apart: let them queue
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            while let Ok(j) = rx.try_recv() {
+                pending.push_back(j);
+            }
+            // admit what can start now, in arrival order; the rest keeps its place
+            let mut wait = std::collections::VecDeque::new();
+            while let Some(j) = pending.pop_front() {
+                if let Some(j) = self.admit(j) {
+                    wait.push_back(j);
+                }
+            }
+            pending = wait;
+            let n = self.lanes.len();
+            // a request that has not processed its prompt yet goes first (one a pass), then the decoding lanes get their windows
+            let fresh = (0..n).map(|k| (next + k) % n).find(|&i| self.lanes[i].run.as_ref().is_some_and(|r| !r.started));
+            if let Some(li) = fresh {
+                next = li + 1;
+                self.turn(li);
+            }
+            let dec: Vec<usize> = (0..n).filter(|&i| self.lanes[i].run.as_ref().is_some_and(|r| r.started)).collect();
+            if dec.is_empty() {
+                if fresh.is_none() && !pending.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                continue;
+            }
+            let waiting = self.lanes.iter().any(|l| l.run.as_ref().is_some_and(|r| !r.started));
+            let turns = if waiting { self.opts.quantum } else { 1 };
+            for _ in 0..turns {
+                let go = if dec.len() == 1 { self.turn(dec[0]) } else { self.forest_turn(&dec) };
+                if !go || !pending.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// One call of [`Worker::advance`] for lane `li`; false when the request has ended.
+    fn turn(&mut self, li: usize) -> bool {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.advance(li)));
+        match res {
+            Ok(Ok(None)) => true,
+            Ok(Ok(Some(reason))) => {
+                if let Err(e) = self.finish_run(li, reason) {
+                    tracing::error!("xe lane {li}: {e:#}");
+                    self.fail_lane(li, format!("xe engine: {e:#}"));
+                }
+                false
+            }
+            Ok(Err(e)) => {
+                self.fail_lane(li, format!("xe engine: {e:#}"));
+                false
+            }
+            Err(_) => {
+                self.fail_lane(li, "xe engine: panic".to_string());
+                false
+            }
+        }
+    }
+
+    /// One shared window of the decoding lanes `ls`; false when one of them has ended.
+    fn forest_turn(&mut self, ls: &[usize]) -> bool {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.forest_step(ls)));
+        let msg = match res {
+            Ok(Ok(done)) => {
+                let go = done.is_empty();
+                for (li, reason) in done {
+                    if let Err(e) = self.finish_run(li, reason) {
+                        tracing::error!("xe lane {li}: {e:#}");
+                        self.fail_lane(li, format!("xe engine: {e:#}"));
+                    }
+                }
+                return go;
+            }
+            Ok(Err(e)) => format!("xe engine: {e:#}"),
+            Err(_) => "xe engine: panic".to_string(),
+        };
+        // a shared window failed: none of its lanes can be trusted
+        for &li in ls {
+            self.fail_lane(li, msg.clone());
+        }
+        false
+    }
+
+    /// The decoding lanes `ls` (two or more) run one verify window together: each drafts its tree on its own draft context, one
+    /// window verifies all trees (the weights are read once for all rows), each lane keeps its path. Returns the lanes that ended.
+    fn forest_step(&mut self, ls: &[usize]) -> Result<Vec<(usize, FinishReason)>> {
+        let t0 = Instant::now();
+        let mut done = Vec::new();
+        let mut act = Vec::new();
+        for &li in ls {
+            let run = self.lanes[li].run.as_ref().context("no request on the lane")?;
+            if run.req.cancel.is_cancelled() || run.sink.is_closed() {
+                done.push((li, FinishReason::Cancelled));
+            } else if run.generated >= run.max_new {
+                done.push((li, FinishReason::Length));
+            } else {
+                act.push(li);
+            }
+        }
+        if act.is_empty() {
+            return Ok(done);
+        }
+        // the shared window works on each lane's state in its live buffer
+        let cur = self.lcur;
+        if act.contains(&cur) && !self.lanes[cur].saved {
+            self.lanes[cur].pos = self.e.pos as usize;
+            self.e.snapshot(&self.lanes[cur].live)?;
+            self.lanes[cur].saved = true;
+        }
+        let per = self.opts.lane_rows[act.len().min(8)].max(1);
+        let Worker { e, df, lanes, .. } = self;
+        let d = df.as_mut().context("lanes need the DFlash2 drafter")?;
+        let mut plans = Vec::new();
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut seqs = Vec::new();
+        let mut row0s = Vec::new();
+        for &li in &act {
+            ensure!(lanes[li].saved, "lane {li}: its state is not in its live buffer");
+            d.select_ring(li);
+            let pos = lanes[li].pos;
+            let run = lanes[li].run.as_mut().unwrap();
+            let plan = run.sp.plan(e, d, pos, run.max_new - run.generated, per)?;
+            row0s.push(tokens.len());
+            tokens.extend_from_slice(&plan.win);
+            seqs.push(fe_xe::engine::ForestSeq { pos: pos as u32, ctx: lanes[li].cap as u32, par: plan.par.clone(),
+                gdn: e.gdn_view(Some(&lanes[li].live)), kv: e.kv_view(lanes[li].kv.as_ref()) });
+            plans.push(plan);
+        }
+        e.taps = Some(d.taps(0));
+        let r = e.forward_forest(&tokens, &seqs);
+        e.taps = None;
+        r?;
+        let mut am = [0i32; 16];
+        e.argmax(&mut am)?;
+        for (k, &li) in act.iter().enumerate() {
+            d.select_ring(li);
+            let lane = &mut lanes[li];
+            let lpos = &mut lane.pos;
+            let run = lane.run.as_mut().unwrap();
+            let Run { req, sink, sp, sampler, row16, picked, greedy, stops, max_new, generated, .. } = &mut **run;
+            let p = &req.params;
+            let greedy = *greedy;
+            let stops: &[u32] = stops;
+            let pk = Cell::new(*picked);
+            let before = pk.get();
+            let host = !greedy || (before < p.min_tokens && !stops.is_empty());
+            let mut pick_fn = |row: &[f32]| -> u32 {
+                for (d, &x) in row16.iter_mut().zip(row) {
+                    *d = fe_xe::eval::to_bf16(x);
+                }
+                let banned: &[u32] = if pk.get() < p.min_tokens { stops } else { &[] };
+                let t = sampler.sample_bf16_banning(row16, banned);
+                sampler.accept(t);
+                pk.set(pk.get() + 1);
+                t
+            };
+            let (row0, rows) = (row0s[k], plans[k].win.len());
+            let seq = &seqs[k];
+            let mut commit = |e: &mut XeDev, path: &[usize]| e.commit_forest(k, seq, path);
+            let (kept, send, hit) = {
+                let pick: Pick = if host { Some(&mut pick_fn) } else { None };
+                sp.settle(e, d, &plans[k], row0, &am[row0..row0 + rows], *max_new - *generated, stops, pick, &mut commit, 0.0)?
+            };
+            if pk.get() == before {
+                pk.set(before + kept.len());
+            }
+            *picked = pk.get();
+            *lpos += kept.len();
+            let mut out: Vec<u32> = kept[..send].to_vec();
+            if hit {
+                let t = out.pop().unwrap();
+                if !out.is_empty() {
+                    sink.send_tokens(out);
+                }
+                done.push((li, FinishReason::Stop(t)));
+            } else {
+                *generated += out.len();
+                if !sink.send_tokens(out) {
+                    done.push((li, FinishReason::Cancelled));
+                } else if *generated >= *max_new {
+                    done.push((li, FinishReason::Length));
+                }
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        for &li in &act {
+            if let Some(run) = lanes[li].run.as_mut() {
+                run.sp.st.gen_s += secs;
+            }
+        }
+        Ok(done)
+    }
+
+    /// The request on lane `li` ends with an error: its sequence and checkpoints are dropped (the other lanes keep theirs).
+    fn fail_lane(&mut self, li: usize, msg: String) {
+        if let Some(run) = self.lanes[li].run.take() {
+            tracing::error!("{}: {msg}", run.req.id);
+            run.sink.finish(Finish::new(FinishReason::Error(msg)));
+        }
+        let l = &mut self.lanes[li];
+        l.hist.clear();
+        l.pos = 0;
+        l.saved = false;
+        for c in &mut self.ckpts {
+            if c.pool == li as u8 {
+                c.used = false;
+            }
+        }
+        if self.lcur == li {
+            let _ = self.e.reset();
+        }
+    }
+
+    /// Points the engine (and the drafter) at lane `li`: the lane it leaves keeps its request's state in its live buffer.
+    fn to_lane(&mut self, li: usize) -> Result<()> {
+        if let Some(d) = self.df.as_mut() {
+            d.select_ring(li);
+        }
+        let cur = self.lcur;
+        if li != cur {
+            if !self.lanes[cur].saved {
+                self.lanes[cur].pos = self.e.pos as usize;
+                if self.lanes[cur].run.is_some() {
+                    self.e.snapshot(&self.lanes[cur].live)?;
+                    self.lanes[cur].saved = true;
+                }
+            }
+            let mut pool = self.lanes[li].kv.take().context("lane caches")?;
+            self.e.swap_kv(None, &mut pool);
+            self.lanes[cur].kv = Some(pool);
+            self.lcur = li;
+            self.e.pos = self.lanes[li].pos as u32;
+        }
+        if self.lanes[li].saved {
+            let pos = self.lanes[li].pos as u32;
+            self.e.restore(&self.lanes[li].live, pos)?;
+            self.lanes[li].saved = false;
+        }
+        Ok(())
+    }
+
+    /// Gives the request a lane and sets the engine state it starts from, or returns it to wait (no free lane that fits it, or
+    /// a request it shares a prefix with has not processed its prompt yet).
+    fn admit(&mut self, job: XeJob) -> Option<XeJob> {
+        if job.req.cancel.is_cancelled() || job.sink.is_closed() {
+            job.sink.finish(Finish::new(FinishReason::Cancelled));
+            return None;
+        }
+        let n = job.req.prompt_ids.len();
+        let cap0 = self.lanes[0].cap;
+        if n < 2 || n + 32 >= cap0 {
+            job.sink.finish(Finish::new(FinishReason::Error(format!("a prompt of {n} tokens does not fit the {cap0}-token context"))));
+            return None;
+        }
+        let need = n + job.req.params.max_tokens.min(cap0) + 32;
+        let elig: Vec<usize> = (0..self.lanes.len()).filter(|&i| self.lanes[i].run.is_none() && (i == 0 || need <= self.lanes[i].cap)).collect();
+        if elig.is_empty() {
+            return Some(job);
+        }
+        let rcap = self.opts.rcap;
+        if self.lanes.iter().any(|l| l.run.as_ref().is_some_and(|r| !r.started && lcp(&r.req.prompt_ids, &job.req.prompt_ids) > rcap)) {
+            return Some(job);
+        }
+        match self.place(job, &elig) {
+            Ok(()) => None,
+            Err((job, e)) => {
+                tracing::error!("{}: {e:#}", job.req.id);
+                job.sink.finish(Finish::new(FinishReason::Error(format!("xe engine: {e:#}"))));
+                None
+            }
+        }
+    }
+
+    fn place(&mut self, job: XeJob, elig: &[usize]) -> std::result::Result<(), (XeJob, anyhow::Error)> {
+        let ids = &job.req.prompt_ids;
+        let n = ids.len();
+        let (rcap, tail) = (self.opts.rcap, self.opts.ckpt_tail);
+        let hints_all: Vec<usize> = if self.opts.hints { job.req.snapshots.iter().copied().filter(|&s| s < n).collect() } else { Vec::new() };
+        // the latest checkpoint of each eligible lane's own sequence
+        let own = |w: &Worker, i: usize| -> usize {
+            let l = lcp(&w.lanes[i].hist, ids).saturating_sub(1);
+            w.ckpts.iter().filter(|c| c.used && c.pool == i as u8 && c.pos <= l).map(|c| c.pos).max().unwrap_or(0)
+        };
+        // lanes 1.. before lane 0 (the long one), least recently used first
+        let order = |w: &Worker, i: usize| (i == 0, w.lanes[i].stamp);
+        let best_own = elig.iter().copied().max_by_key(|&i| (own(self, i), std::cmp::Reverse(order(self, i)))).unwrap();
+        let own_pos = own(self, best_own);
+        // a clean checkpoint of another lane's sequence
+        let mut cross: Option<(usize, usize)> = None; // (checkpoint index, position)
+        for (ci, c) in self.ckpts.iter().enumerate() {
+            if !(c.used && c.clean && c.pos > own_pos && c.pos % rcap == 0 && c.pos + 4 * tail.max(1) <= n) {
+                continue;
+            }
+            let lane = &self.lanes[c.pool as usize];
+            let seq: &[u32] = match &lane.run {
+                Some(r) => &r.req.prompt_ids,
+                None => &lane.hist,
+            };
+            if c.pos < lcp(seq, ids) && c.hints.iter().copied().eq(hints_all.iter().copied().filter(|&h| h < c.pos)) && cross.is_none_or(|x| c.pos > x.1) {
+                cross = Some((ci, c.pos));
+            }
+        }
+        let (t, c0, clean) = match cross {
+            Some((ci, pos)) => {
+                let src = self.ckpts[ci].pool as usize;
+                let t = elig.iter().copied().filter(|&i| i != src).min_by_key(|&i| order(self, i));
+                match t {
+                    Some(t) => {
+                        let r = (|| -> Result<()> {
+                            self.to_lane(t)?;
+                            for c in &mut self.ckpts {
+                                if c.pool == t as u8 {
+                                    c.used = false;
+                                }
+                            }
+                            let sp = self.lanes[src].kv.as_ref().context("source lane caches")?;
+                            self.e.copy_kv_from(None, sp, pos)?;
+                            self.clock += 1;
+                            let c = &mut self.ckpts[ci];
+                            c.stamp = self.clock;
+                            self.e.restore(&c.buf, pos as u32)?;
+                            if let (Some(d), Some(db)) = (self.df.as_ref(), c.dbuf.as_ref()) {
+                                d.restore_window(&self.e, pos, db.ptr())?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = r {
+                            return Err((job, e));
+                        }
+                        (t, pos, true)
+                    }
+                    None => (usize::MAX, 0, false),
+                }
+            }
+            None => (usize::MAX, 0, false),
+        };
+        let (t, c0, clean) = if t != usize::MAX {
+            (t, c0, clean)
+        } else {
+            let t = best_own;
+            let r = (|| -> Result<(usize, bool)> {
+                self.to_lane(t)?;
+                let l = lcp(&self.lanes[t].hist, ids);
+                for c in &mut self.ckpts {
+                    if c.used && c.pool == t as u8 && c.pos > l {
+                        c.used = false;
+                    }
+                }
+                let limit = l.saturating_sub(1);
+                let best = self.ckpts.iter().enumerate().filter(|(_, c)| c.used && c.pool == t as u8 && c.pos <= limit).max_by_key(|(_, c)| c.pos).map(|(i, _)| i);
+                match best {
+                    Some(i) => {
+                        self.clock += 1;
+                        let c = &mut self.ckpts[i];
+                        c.stamp = self.clock;
+                        self.e.restore(&c.buf, c.pos as u32)?;
+                        if let (Some(d), Some(db)) = (self.df.as_ref(), c.dbuf.as_ref()) {
+                            d.restore_window(&self.e, c.pos, db.ptr())?;
+                        }
+                        Ok((c.pos, c.clean))
+                    }
+                    None => {
+                        self.e.reset()?;
+                        for c in &mut self.ckpts {
+                            if c.pool == t as u8 {
+                                c.used = false;
+                            }
+                        }
+                        Ok((0, true))
+                    }
+                }
+            })();
+            match r {
+                Ok((c0, clean)) => (t, c0, clean),
+                Err(e) => return Err((job, e)),
+            }
+        };
+        let cap = self.lanes[t].cap;
+        let p = &job.req.params;
+        let max_new = p.max_tokens.min(cap - n - 32);
+        // cuts: the window grid, a few tokens before the prompt end, the hints (as the one-lane engine)
+        let mut cuts: Vec<usize> = Vec::new();
+        if self.opts.ckpt_every > 0 {
+            let mut c = (c0 / self.opts.ckpt_every + 1) * self.opts.ckpt_every;
+            while c < n {
+                cuts.push(c);
+                c += self.opts.ckpt_every;
+            }
+        }
+        let hints: Vec<usize> = hints_all.iter().copied().filter(|&s| s > c0).collect();
+        let mut tailcut = None;
+        if tail > 0 && n - c0 > 4 * tail && !hints.iter().any(|&h| h + 4 * tail >= n) {
+            cuts.push(n - tail);
+            tailcut = Some(n - tail);
+        }
+        cuts.extend(hints);
+        cuts.sort_unstable();
+        cuts.dedup();
+        let sampler = Sampler::new(p, ids);
+        let greedy = sampler.is_plain_greedy();
+        let stops = p.stop_token_ids.clone();
+        let sp = DfSpec::new(DfCfg { rows: self.opts.rcap, k: self.opts.spec.k, ..Default::default() });
+        self.clock += 1;
+        let l = &mut self.lanes[t];
+        l.hist.clear();
+        l.pos = c0;
+        l.saved = false;
+        l.stamp = self.clock;
+        let row16 = vec![0u16; self.e.cfg.vocab];
+        let XeJob { req, sink } = job;
+        l.run = Some(Box::new(Run { req, sink, sp, sampler, row16, picked: 0, greedy, stops, max_new, generated: 0, c0, cuts, hints: hints_all, tailcut, clean,
+            started: false, t0: Instant::now(), prefill_s: 0.0 }));
+        Ok(())
+    }
+
+    /// The request on lane `li` processes its prompt (the first call) or runs one decode window. Some(reason): it has ended.
+    fn advance(&mut self, li: usize) -> Result<Option<FinishReason>> {
+        self.to_lane(li)?;
+        let rcap = self.opts.rcap;
+        let Worker { e, df, ckpts, clock, lanes, .. } = self;
+        let d = df.as_mut().context("lanes need the DFlash2 drafter")?;
+        let run = lanes[li].run.as_mut().context("no request on the lane")?;
+        let Run { req, sink, sp, sampler, row16, picked, greedy, stops, max_new, generated, c0, cuts, hints, tailcut, clean, started, t0, prefill_s } = &mut **run;
+        if *max_new == 0 {
+            return Ok(Some(FinishReason::Length));
+        }
+        let p = &req.params;
+        let greedy = *greedy;
+        let stops: &[u32] = stops;
+        let pk = Cell::new(*picked);
+        let host = |picked: usize| !greedy || (picked < p.min_tokens && !stops.is_empty());
+        let mut pick_fn = |row: &[f32]| -> u32 {
+            for (d, &x) in row16.iter_mut().zip(row) {
+                *d = fe_xe::eval::to_bf16(x);
+            }
+            let banned: &[u32] = if pk.get() < p.min_tokens { stops } else { &[] };
+            let t = sampler.sample_bf16_banning(row16, banned);
+            sampler.accept(t);
+            pk.set(pk.get() + 1);
+            t
+        };
+        let out = if !*started {
+            let ids = &req.prompt_ids;
+            let (run_clean, tc, pool) = (*clean, *tailcut, li as u8);
+            let hints: &[usize] = hints;
+            let dp: *const DFlash = d;
+            let mut on_cut = |e: &mut XeDev, pos: usize| -> Result<()> {
+                take_ckpt(e, Some(unsafe { &*dp }), ckpts, clock, pool, pos)?;
+                if run_clean && pos % rcap == 0 && tc.is_none_or(|t| t >= pos) {
+                    if let Some(c) = ckpts.iter_mut().find(|c| c.used && c.pool == pool && c.pos == pos) {
+                        c.clean = true;
+                        c.hints = hints.iter().copied().filter(|&h| h < pos).collect();
+                    }
+                }
+                Ok(())
+            };
+            let first = {
+                let pick: Pick = if host(0) { Some(&mut pick_fn) } else { None };
+                sp.prefill(e, d, ids, *c0, cuts, &mut on_cut, pick)?
+            };
+            if !host(0) {
+                pk.set(1);
+            }
+            *started = true;
+            *prefill_s = t0.elapsed().as_secs_f64();
+            if stops.contains(&first) {
+                Some(FinishReason::Stop(first))
+            } else if !sink.send_tokens(vec![first]) {
+                Some(FinishReason::Cancelled)
+            } else {
+                *generated = 1;
+                (*generated >= *max_new).then_some(FinishReason::Length)
+            }
+        } else if req.cancel.is_cancelled() || sink.is_closed() {
+            Some(FinishReason::Cancelled)
+        } else {
+            let before = pk.get();
+            let (kept, send, hit) = {
+                let pick: Pick = if host(before) { Some(&mut pick_fn) } else { None };
+                sp.step(e, d, *max_new - *generated, stops, pick)?
+            };
+            if pk.get() == before {
+                pk.set(before + kept.len());
+            }
+            let mut out: Vec<u32> = kept[..send].to_vec();
+            if hit {
+                let t = out.pop().unwrap();
+                if !out.is_empty() {
+                    sink.send_tokens(out);
+                }
+                Some(FinishReason::Stop(t))
+            } else {
+                *generated += out.len();
+                if !sink.send_tokens(out) {
+                    Some(FinishReason::Cancelled)
+                } else {
+                    (*generated >= *max_new).then_some(FinishReason::Length)
+                }
+            }
+        };
+        *picked = pk.get();
+        Ok(out)
+    }
+
+    /// The request on lane `li` has ended: the lane keeps its sequence and a checkpoint of its end.
+    fn finish_run(&mut self, li: usize, reason: FinishReason) -> Result<()> {
+        let mut run = self.lanes[li].run.take().context("no request on the lane")?;
+        let sink = run.sink;
+        if !run.started {
+            // ended before its prompt was processed (cancelled, or nothing to generate): nothing new is in the caches
+            sink.finish(Finish { reason, cached_prompt_tokens: 0, timings: None });
+            return Ok(());
+        }
+        let r = (|| -> Result<()> {
+            self.to_lane(li)?;
+            let pos = self.e.pos as usize;
+            self.lanes[li].hist = std::mem::take(&mut run.sp.hist);
+            self.lanes[li].pos = pos;
+            take_ckpt(&self.e, self.df.as_ref(), &mut self.ckpts, &mut self.clock, li as u8, pos)?;
+            self.e.dev.sync()
+        })();
+        let s = &run.sp.st;
+        let n = run.req.prompt_ids.len();
+        tracing::info!(
+            "{}: lane {li}: prompt {n} (cached {}) {:.0} tok/s | {} tokens {:.1} tok/s | windows {} plain {} drafted {} accepted {} copies {} vetoed {} | {:?}",
+            run.req.id, run.c0, (n - run.c0) as f64 / run.prefill_s.max(1e-9), s.tokens, s.tokens.saturating_sub(1) as f64 / s.gen_s.max(1e-9),
+            s.windows, s.plain, s.drafted, s.accepted, s.copies, s.vetoed, reason
+        );
+        let timings = Timings { prompt_n: n - run.c0, cache_n: run.c0, prompt_ms: run.prefill_s * 1e3, predicted_n: s.tokens, predicted_ms: s.gen_s * 1e3,
+            draft: Some((s.drafted, s.accepted)) };
+        match r {
+            Ok(()) => {
+                sink.finish(Finish { reason, cached_prompt_tokens: run.c0, timings: Some(timings) });
+                Ok(())
+            }
+            Err(e) => {
+                sink.finish(Finish::new(FinishReason::Error(format!("xe engine: {e:#}"))));
+                Err(e)
+            }
         }
     }
 }

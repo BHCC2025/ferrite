@@ -4,6 +4,16 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-11
+
+### Added
+
+- **Up to four requests at once on the Intel Arc Pro B70** (`FERRITE_SLOTS=4` with `scripts/serve-xe.sh`). Each
+  request gets a lane with its own conversation state; lanes that decode together share one verify window, so the
+  weights are read once for all of them (four lanes total about 1.4x the speed of one request), and a prompt that
+  starts like another lane's reuses that part in whole prompt windows. Every lane's text is what the same request
+  gives alone. `/health` reports `max_batch_size` 4 in this mode. See [docs/arc-b70.md](docs/arc-b70.md).
+
 ## [0.3.0] - 2026-11-11
 
 ### Added

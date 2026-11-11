@@ -4,8 +4,8 @@ Ferrite also serves Qwen3.8-27B on a single **Intel Arc Pro B70** (32 GB, Xe2 / 
 HTTP server down to the GPU kernels here too: the kernels are compiled by rustc to LLVM IR, translated to SPIR-V and
 loaded through Level Zero, with no OpenCL C in the engine.
 
-> **Status: experimental.** One model, one card, one request at a time (more wait in a queue), built from source
-> only. It was developed and measured on a single machine. Reports from other B70 machines are welcome.
+> **Status: experimental.** One model, one card, one request at a time by default and up to four with
+> `FERRITE_SLOTS=4` (more wait in a queue), built from source only. It was developed and measured on a single machine. Reports from other B70 machines are welcome.
 
 ## What you get
 
@@ -18,6 +18,8 @@ loaded through Level Zero, with no OpenCL C in the engine.
 - **A prefix cache**: the server keeps the last conversation's state with checkpoints at turn boundaries, so a
   follow-up turn computes only what is new. A 16K side pool serves short unrelated requests (titles, summaries)
   without evicting a long conversation.
+- **Up to four requests at once** (`FERRITE_SLOTS=4`): each gets a lane with its own conversation state, lanes that
+  decode together share one verify window, and text that requests sent together have in common is processed once.
 
 ## Results
 
@@ -75,6 +77,27 @@ scripts/fetch-models.sh xq draft        # about 34 GB, sha256-checked
 | Weights: XQ mixed 5.0 bpw, with the MTP draft head | [`BHCC2025/Qwen3.8-27B-XQ-5.0bpw-mix`](model-card-xq.md) | Apache-2.0 |
 | Draft model: DFlash2 | [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) | Apache-2.0 |
 
+### Four requests at once
+
+`FERRITE_SLOTS=4`, same card and settings. N streaming requests sent together that share a prefix of P tokens, 800
+tokens each (`tools/bench/lanes.py`, medians of 3 sets). Total tokens per second over the whole set, prompt
+processing included, and each lane's decode speed:
+
+| N | P | total tok/s | decode tok/s a lane | prompt tokens sent | computed |
+|---|---|---|---|---|---|
+| 1 | 2K | 90 | 104 | 2,155 | 2,155 |
+| 2 | 2K | 110 | 64 | 4,319 | 4,319 |
+| 3 | 2K | 113 | 46 | 6,495 | 6,495 |
+| 4 | 2K | 126 | 38 | 8,692 | 8,692 |
+| 1 | 16K | 46 | 96 | 16,153 | 16,153 |
+| 2 | 16K | 66 | 57 | 32,313 | 20,025 |
+| 3 | 16K | 77 | 41 | 48,486 | 23,910 |
+| 4 | 16K | 85 | 32 | 64,676 | 27,812 |
+
+Every lane's text is what the same request gives alone (greedy and seeded sampling; the gate of `lanes.py` and a
+cancel-one-lane check). The shared part of a prompt is reused at 4096-token boundaries, so a 2K prefix is computed
+by every lane and 12K of a 16K prefix is computed once.
+
 ## Serve
 
 ```bash
@@ -91,9 +114,29 @@ loading the weights takes under a minute once the files are in the page cache, a
 | `FERRITE_MODELS` | `/var/tmp/models` | Folder holding the model folders |
 | `FERRITE_XQ_DIR` / `FERRITE_DRAFT_DIR` | under `$FERRITE_MODELS` | Each model folder, if stored elsewhere |
 | `FERRITE_MODEL_ID` | `b70` | Model id the API reports |
-| `FERRITE_PORT`, `FERRITE_CTX` | `8000`, `131072` | Port and context length |
+| `FERRITE_PORT`, `FERRITE_CTX` | `8000`, `131072` | Port and context length (`81920` with `FERRITE_SLOTS` above 1) |
+| `FERRITE_SLOTS` | `1` | Requests served at once, 1 to 4 (see below) |
 | `FERRITE_DRAFT` | `dflash` when the drafter is present | `dflash` or `mtp` |
 | `FERRITE_PREFILL` | `i8` | `i8` (int8 prompt GEMM) or `f16` (fp16, slower, slightly lower KL) |
+
+### Several requests at once
+
+```bash
+FERRITE_SLOTS=4 scripts/serve-xe.sh     # /health reports max_batch_size 4
+```
+
+The server then keeps four lanes. Lane 0 has `FERRITE_CTX` positions (81,920 by default in this mode) and the others
+`FE_XE_LANE_CTX` (28,672), which together with the weights fill the card (30.6 GB); a request that does not fit a
+short lane waits for lane 0. Each lane keeps its own conversation, so a client that comes back to its lane computes
+only what is new, and a request whose prompt starts like one that is running or kept in another lane copies that
+part instead of computing it (in whole 4096-token prompt windows, which keeps the result identical to a request
+sent alone).
+
+Lanes that are decoding share one verify window of up to 16 rows: 8 rows each for two lanes, 5 for three, 4 for
+four (`FE_XE_LANE_ROWS`). The weights are read once for all rows, which is where the gain over taking turns comes
+from; each lane's drafter pass, state update and cache append run on their own. A request that is alone decodes
+exactly as with `FERRITE_SLOTS=1`. Prompt processing takes the whole card: while one request processes its prompt
+the other lanes wait, and between two prompts that are waiting the decoding lanes get `FE_XE_QUANTUM` (8) windows.
 
 ## How it gets its speed
 
@@ -106,8 +149,8 @@ loading the weights takes under a minute once the files are in the page cache, a
   [kernels-xe/README.md](../kernels-xe/README.md).
 - **The matrix engine for prompts and attention.** Prompt GEMMs run as int8 DPAS with per-channel weight scales and
   per-token activation scales; decode attention packs a window's rows into matrix tiles so they share key reads.
-- **DFlash2 trees at 8 rows.** A 16-row verify window costs more than it returns on this card, so drafts and trees
-  stay at 8 rows; the drafter's own linears run as 4-bit XQ on the same kernels.
+- **DFlash2 trees at 8 rows.** A 16-row verify window costs more than it returns for one request on this card, so
+  drafts and trees stay at 8 rows (several lanes share 16); the drafter's own linears run as 4-bit XQ on the same kernels.
 - **Small-kernel fusions.** The many tiny launches of a window (norms, gates, convolutions) are fused where the
   result stays bit-exact.
 
@@ -116,7 +159,9 @@ The design of the engine is written up in [crates/fe-xe/DESIGN.md](../crates/fe-
 
 ## Limits
 
-- One request at a time. The prefix cache keeps one conversation (plus the side pool), not one per client.
+- One request at a time by default. With `FERRITE_SLOTS=4` the context is split (81,920 + 3 x 28,672 positions)
+  instead of one 128K conversation, and four lanes total about 1.4x one request's speed, not 4x: the drafter still
+  runs once a lane.
 - Built from source only; there is no release tarball or installer for this target yet.
 - The check tools under `crates/fe-kx-tests` and `crates/fe-kxcore` compare the Rust kernels bit for bit with the
   OpenCL kernels of the engine Ferrite's Arc port was developed against. Those reference modules are not in this

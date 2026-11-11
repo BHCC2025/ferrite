@@ -139,6 +139,9 @@ pub struct DFlash {
     prep: Option<(u64, u64, u32, u32)>,
     pub times: DraftTimes,
     pub bytes: usize,
+    /// draft contexts of other sequences (lanes): rings[i] = Some while context i is not the one in the layers ([`DFlash::select_ring`])
+    rings: Vec<Option<Vec<(DeviceBuffer<u16>, DeviceBuffer<u16>)>>>,
+    ring: usize,
 }
 
 fn bf16s(st: &SafeTensors, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
@@ -396,6 +399,8 @@ impl DFlash {
             prep: None,
             times: DraftTimes::default(),
             bytes: 0,
+            rings: vec![None],
+            ring: 0,
         };
         let mut d = d;
         d.bytes = e.dev.bytes.get() - b0;
@@ -403,6 +408,41 @@ impl DFlash {
         e.dev.sync()?;
         eprintln!("fe-xdf: DFlash2 drafter {dir:?}: block {block}, window {window}, head span {span}, {:.2} GB on the device", d.bytes as f64 / 1e9);
         Ok(d)
+    }
+
+    /// One more draft context (the K / V rings of every layer, 84 MB): a sequence of its own next to context 0. Returns its index.
+    pub fn add_ring(&mut self, e: &Engine) -> Result<usize> {
+        let mut v = Vec::new();
+        for _ in 0..self.layers.len() {
+            v.push((e.dev.zeros(RING * NKV * HD)?, e.dev.zeros(RING * NKV * HD)?));
+        }
+        self.rings.push(Some(v));
+        Ok(self.rings.len() - 1)
+    }
+
+    /// Points the drafter at draft context `i` (absorbs, drafts and window snapshots work on it). No copy.
+    pub fn select_ring(&mut self, i: usize) {
+        if i == self.ring {
+            return;
+        }
+        let mut v = self.rings[i].take().expect("draft context");
+        for (l, (k, vv)) in self.layers.iter_mut().zip(v.iter_mut()) {
+            std::mem::swap(&mut l.kc, k);
+            std::mem::swap(&mut l.vc, vv);
+        }
+        self.rings[self.ring] = Some(v);
+        self.ring = i;
+    }
+
+    /// Moves feature-tap rows row0 + rows[i] -> row0 + i (rows ascending, rows[i] >= i). Queued.
+    pub fn gather_taps_at(&self, e: &Engine, row0: usize, rows: &[usize]) -> Result<()> {
+        let w = 5 * H;
+        for (i, &r) in rows.iter().enumerate() {
+            if r != i {
+                ze(e.dev.q.copy_dtod(self.taps_buf.ptr().add::<u16>((row0 + i) * w), self.taps_buf.ptr().add::<u16>((row0 + r) * w), w * 2))?;
+            }
+        }
+        Ok(())
     }
 
     /// The engine taps for a window whose rows row0.. need features (row0 = 0: all).

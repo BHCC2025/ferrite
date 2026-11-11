@@ -370,6 +370,113 @@ impl DfSpec {
     }
 }
 
+/// A sequence's rows of a shared verify window ([`DfSpec::plan`]): the last token and its draft tree.
+pub struct Plan {
+    pub win: Vec<u32>,
+    /// parents within the sequence's rows (par[0] = -1)
+    pub par: Vec<i32>,
+    pub pos0: usize,
+    copied: bool,
+}
+
+/// Decoding next to other sequences (lanes): a step in two halves around a window that the sequences share
+/// (fe-xe `forward_forest`). The kept tokens are those of [`DfSpec::step`]: every row is verified exactly, whatever was drafted.
+impl DfSpec {
+    /// The sequence (at `pos0`, the drafter on its context) drafts its rows of the next window: at most `rows` (>= 1) with the
+    /// last token. A context copy that beats the draft tree is a chain.
+    pub fn plan(&mut self, e: &Engine, d: &mut DFlash, pos0: usize, left: usize, rows: usize) -> Result<Plan> {
+        anyhow::ensure!(left > 0 && rows >= 1, "plan with nothing left");
+        let lastt = *self.hist.last().unwrap();
+        let budget = self.cfg.k.min(d.block - 1).min(rows - 1).min(left - 1);
+        let mut win = vec![lastt];
+        let mut par = vec![-1i32];
+        let mut copied = false;
+        if budget > 0 && d.cb_host.is_some() {
+            let (tk, pa) = d.draft_tree(e, lastt, pos0, budget)?;
+            let mut used = false;
+            if self.cfg.copy && !tk.is_empty() {
+                let c = self.gram.draft(&self.hist, self.cfg.copy_len.min(15), 64, self.cfg.copy_match, &mut self.copy);
+                if c.cnt > budget && self.copy[0] == tk[0] {
+                    for i in 0..budget {
+                        win.push(self.copy[i]);
+                        par.push(i as i32);
+                    }
+                    self.st.copies += 1;
+                    used = true;
+                    copied = true;
+                } else if c.cnt > budget {
+                    self.st.vetoed += 1;
+                }
+            }
+            if !used {
+                win.extend_from_slice(&tk);
+                par.extend(pa.iter().map(|&p| p + 1));
+            }
+        }
+        Ok(Plan { win, par, pos0, copied })
+    }
+
+    /// After the shared window: walks the sequence's tree from the targets of its rows (`am`: the greedy token of each of its rows;
+    /// a sampled request reads the logits of its rows, `row0`.. of the window), keeps the path with `commit` and absorbs it into the
+    /// draft context (the drafter on this sequence's context). Returns (kept tokens, how many to send, stop hit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle(&mut self, e: &mut Engine, d: &mut DFlash, plan: &Plan, row0: usize, am: &[i32], left: usize, stop: &[u32], mut pick: Pick,
+                  commit: &mut dyn FnMut(&mut Engine, &[usize]) -> Result<()>, secs: f64) -> Result<(Vec<u32>, usize, bool)> {
+        let rows = plan.win.len();
+        if pick.is_some() {
+            let v = e.cfg.vocab;
+            if self.logits.len() < rows * v {
+                self.logits.resize(rows * v, 0.0);
+            }
+            e.dev.download(&mut self.logits[..rows * v], e.sc.logits.ptr().add::<f32>(row0 * v))?;
+        }
+        let mut path = vec![0usize];
+        let mut kept = Vec::new();
+        loop {
+            let row = *path.last().unwrap();
+            let g = match pick.as_mut() {
+                None => am[row] as u32,
+                Some(f) => {
+                    let v = e.cfg.vocab;
+                    f(&self.logits[row * v..(row + 1) * v])
+                }
+            };
+            kept.push(g);
+            match (row + 1..rows).find(|&c| plan.par[c] == row as i32 && plan.win[c] == g) {
+                Some(c) if kept.len() < left => path.push(c),
+                _ => break,
+            }
+        }
+        let a = path.len() - 1;
+        commit(e, &path)?;
+        if rows > 1 {
+            self.st.windows += 1;
+            self.st.drafted += (rows - 1) as u64;
+            self.st.accepted += a as u64;
+            self.tm.hist[a] += 1;
+            self.acc_ema = 0.7 * self.acc_ema + 0.3 * a as f32;
+        } else {
+            self.st.plain += 1;
+        }
+        let _ = plan.copied;
+        d.gather_taps_at(e, row0, &path)?;
+        d.absorb(e, d.taps_buf.ptr().add::<u16>(row0 * 5 * crate::draft::H), a + 1, plan.pos0)?;
+        // (the absorb's RoPE rows are staged: the next absorb must not rewrite them before this one has run)
+        e.dev.sync()?;
+        let mut send = kept.len();
+        let mut hit = false;
+        if let Some(i) = kept.iter().position(|x| stop.contains(x)) {
+            send = i + 1;
+            hit = true;
+        }
+        send = send.min(left);
+        self.hist.extend_from_slice(&kept);
+        self.st.tokens += send;
+        self.st.gen_s += secs;
+        Ok((kept, send, hit))
+    }
+}
+
 /// Greedy generation of up to `max_new` tokens after `prompt` from an empty context with DFlash2 drafts.
 pub fn generate(e: &mut Engine, d: &mut DFlash, prompt: &[u32], max_new: usize, cfg: &DfCfg, stop: &[u32],
                 mut emit: impl FnMut(&[u32]) -> bool) -> Result<(SpecStats, DfTimes, Option<Vec<crate::tree::Round>>)> {

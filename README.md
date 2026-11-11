@@ -145,7 +145,7 @@ Everything has a default; set only what differs on your machines. `tools/site.sh
 
 Ferrite also runs on a single Intel Arc Pro B70 (32 GB): the same model and server, a separate engine
 (`fe-server --engine xe`) whose kernels are Rust compiled to SPIR-V. It is experimental, serves one request at a time
-and is built from source. One card capped at 180 W, greedy decoding, tokens per second:
+(up to four with `FERRITE_SLOTS=4`) and is built from source. One card capped at 180 W, greedy decoding, tokens per second:
 
 | | Ferrite on one Arc Pro B70 |
 |---|---|

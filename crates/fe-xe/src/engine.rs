@@ -593,6 +593,20 @@ pub struct TreeBufs {
     gqkv: DeviceBuffer<u16>,
     gb: DeviceBuffer<u16>,
     ga: DeviceBuffer<u16>,
+    /// the last window was a forest ([`Engine::forward_forest`]): (first row, table) of each sequence
+    forest: Vec<(u32, TreeTable)>,
+}
+
+/// One sequence's part of a forest window ([`Engine::forward_forest`]): its tree, position and state.
+pub struct ForestSeq {
+    pub pos: u32,
+    pub ctx: u32,
+    /// the parent of each of its rows, within the sequence (par[0] = -1)
+    pub par: Vec<i32>,
+    /// (conv state, delta-rule state) of every GDN layer, in layer order ([`Engine::gdn_view`])
+    pub gdn: Vec<(DevPtr, DevPtr)>,
+    /// (K, V) q8 cache of every attention layer, in layer order ([`Engine::kv_view`])
+    pub kv: Vec<(DevPtr, DevPtr)>,
 }
 
 /// keys of a tree row's K / V tail window (kx-core tree.rs TAIL_KEYS)
@@ -1208,6 +1222,9 @@ impl Engine {
         let pos0 = self.pos;
         ensure!(pos0 + m <= self.ctx, "context full");
         self.tree = None;
+        if let Some(tb) = self.tbuf.as_mut() {
+            tb.forest.clear();
+        }
         self.upload_rows(tokens, pos0)?;
         let (emb, tok, x) = (self.w.emb.ptr(), self.sc.tok.ptr(), self.sc.x.ptr());
         self.run("basic", "embed_bf16", [64, 1, 1], [m, 1, 1], &[&emb, &tok, &x, &HIDDEN])?;
@@ -1281,6 +1298,7 @@ impl Engine {
             gqkv: d.zeros(n16 * GDN_QKV as usize)?,
             gb: d.zeros(n16 * GDN_HEADS as usize)?,
             ga: d.zeros(n16 * GDN_HEADS as usize)?,
+            forest: Vec::new(),
         });
         Ok(())
     }
@@ -1295,6 +1313,7 @@ impl Engine {
         ensure!((1..=MAX_ROWS).contains(&m) && par.len() == tokens.len(), "tree window of {m} rows");
         let tt = TreeTable::new(par)?;
         self.tree_bufs()?;
+        self.tbuf.as_mut().unwrap().forest.clear();
         ensure!(tt.slots <= self.tbuf.as_ref().unwrap().slots, "tree needs {} state slots", tt.slots);
         let pos0 = self.pos;
         let maxd = *tt.depth.iter().max().unwrap();
@@ -1576,6 +1595,239 @@ impl Engine {
     /// Greedy token of each head row (syncs).
     pub fn argmax(&self, out: &mut [i32]) -> Result<()> {
         self.dev.download(&mut out[..self.head_rows as usize], self.sc.am_out.ptr())
+    }
+}
+
+/// Forest windows: one verify window shared by several sequences (lanes). Each sequence brings a draft tree of its own rows;
+/// the weight passes (XQ GEMVs, norms, MLP, head) run once over all rows, the kernels that read a sequence's state (the GDN
+/// conv / delta rule, the KV append, the decode attention) once a sequence on its row range, state and caches. A row's result
+/// is that of the same tree verified alone ([`Engine::forward_tree`]): the row kernels do not depend on the other rows of a
+/// launch, and the per-sequence kernels get the tree window's arguments, offset to the sequence's rows.
+impl Engine {
+    /// (conv state, delta-rule state) of every GDN layer: the engine's own (None) or those inside a [`Engine::snapshot`] slot.
+    pub fn gdn_view(&self, slot: Option<&DeviceBuffer<u8>>) -> Vec<(DevPtr, DevPtr)> {
+        let mut off = 0;
+        let mut v = Vec::new();
+        for s in &self.st {
+            if let LayerState::Gdn(g) = s {
+                match slot {
+                    None => v.push((g.cstate.ptr(), g.sstate.ptr())),
+                    Some(b) => {
+                        v.push((b.ptr().byte_add(off), b.ptr().byte_add(off + g.cstate.bytes())));
+                        off += g.cstate.bytes() + g.sstate.bytes();
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// (K, V) cache of every attention layer: the engine's current ones (None) or a pool's.
+    pub fn kv_view(&self, pool: Option<&KvPool>) -> Vec<(DevPtr, DevPtr)> {
+        match pool {
+            Some(p) => p.kv.iter().map(|(k, v)| (k.ptr(), v.ptr())).collect(),
+            None => self.st.iter().filter_map(|s| match s {
+                LayerState::Attn(a) => Some((a.kc.ptr(), a.vc.ptr())),
+                _ => None,
+            }).collect(),
+        }
+    }
+
+    /// A verify window over the trees of `seqs` (never in place): `tokens` = every sequence's rows in order (<= 16 in all);
+    /// logits and argmax of every row as after [`Engine::forward_tree`], taps of all rows. The engine's own position and GDN
+    /// state are not used. Keep each sequence's root path with [`Engine::commit_forest`].
+    pub fn forward_forest(&mut self, tokens: &[u32], seqs: &[ForestSeq]) -> Result<()> {
+        let mt = tokens.len() as u32;
+        ensure!((1..=MAX_ROWS).contains(&mt) && !seqs.is_empty(), "forest window of {mt} rows");
+        self.tree_bufs()?;
+        let slots = self.tbuf.as_ref().unwrap().slots;
+        let (ng, na) = (self.cfg.full_attn.iter().filter(|&&a| !a).count(), self.cfg.full_attn.iter().filter(|&&a| a).count());
+        let mut forest = Vec::new();
+        let mut words = Vec::new();
+        let mut tab = vec![0f32; mt as usize * 64];
+        let mut r0 = 0u32;
+        for s in seqs {
+            let tt = TreeTable::new(&s.par)?;
+            let m = s.par.len() as u32;
+            ensure!(tt.slots <= slots, "tree needs {} state slots", tt.slots);
+            ensure!(r0 + m <= mt && s.pos + m <= s.ctx, "forest: rows {r0} + {m} of {mt}, position {} + {m} of {}", s.pos, s.ctx);
+            ensure!(s.gdn.len() == ng && s.kv.len() == na, "forest: a sequence with {} / {} layer states", s.gdn.len(), s.kv.len());
+            for r in 0..m as usize {
+                let g = r0 as usize + r;
+                rope::row(&self.inv_freq, s.pos + tt.depth[r], &mut tab[g * 64..(g + 1) * 64]);
+            }
+            words.extend_from_slice(&tt.words);
+            forest.push((r0, tt));
+            r0 += m;
+        }
+        ensure!(r0 == mt, "forest: {r0} tree rows for {mt} tokens");
+        self.dev.q.upload(self.sc.tok.ptr(), tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.dev.q.upload(self.sc.rope.ptr(), &tab).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tb = self.tbuf.as_ref().unwrap();
+        self.dev.q.upload(tb.table.ptr(), &words).map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.xq_key = None;
+        self.pf_key = None;
+        self.tree = None;
+        let (emb, tok, x) = (self.w.emb.ptr(), self.sc.tok.ptr(), self.sc.x.ptr());
+        self.run("basic", "embed_bf16", [64, 1, 1], [mt, 1, 1], &[&emb, &tok, &x, &HIDDEN])?;
+        self.pending = false;
+        let rows: Vec<(u32, u32, u32)> = forest.iter().map(|(r0, tt)| (*r0, tt.par.len() as u32, *tt.depth.iter().max().unwrap())).collect();
+        let (mut gi, mut ai) = (0usize, 0usize);
+        for li in 0..self.cfg.n_layers {
+            if self.cfg.full_attn[li] {
+                self.attention_forest(li, ai, mt, seqs, &rows)?;
+                ai += 1;
+            } else {
+                self.gdn_forest(li, gi, mt, seqs, &rows)?;
+                gi += 1;
+            }
+            self.mlp(li, mt)?;
+            self.tap(li, mt)?;
+        }
+        self.rows = mt;
+        self.inplace = false;
+        let fnorm = self.w.final_norm.ptr();
+        self.norm_in(fnorm, mt)?;
+        self.head_batch(0, mt)?;
+        self.tbuf.as_mut().unwrap().forest = forest;
+        Ok(())
+    }
+
+    fn gdn_forest(&mut self, li: usize, gi: usize, mt: u32, seqs: &[ForestSeq], rows: &[(u32, u32, u32)]) -> Result<()> {
+        let Mixer::Gdn(g) = &self.w.layers[li].mixer else { unreachable!() };
+        let LayerState::Gdn(gs) = &self.st[li] else { unreachable!() };
+        let g: *const GdnW = g;
+        let gs: *const GdnState = gs;
+        let (g, gs) = unsafe { (&*g, &*gs) };
+        let (wqkv, wb, wa) = (gs.wqkv.ptr(), gs.wb.ptr(), gs.wa.ptr());
+        let s = &self.sc;
+        let (xn, z, y, yg, delta) = (s.xn.ptr(), s.z.ptr(), s.y.ptr(), s.yg.ptr(), s.delta.ptr());
+        let (qn, kn, vconv, gbeta, ggate) = (s.qn.ptr(), s.kn.ptr(), s.vconv.ptr(), s.gbeta.ptr(), s.ggate.ptr());
+        let tb = self.tbuf.as_ref().unwrap();
+        let (table, sscr) = (tb.table.ptr(), tb.sscr.ptr());
+        self.norm_in(g.norm.ptr(), mt)?;
+        self.proj(&g.qkv, xn, mt, wqkv, false)?;
+        self.proj(&g.z, xn, mt, z, false)?;
+        self.proj(&g.b, xn, mt, wb, false)?;
+        self.proj(&g.a, xn, mt, wa, false)?;
+        let (eps, conv) = (self.eps, g.conv.ptr());
+        for (sq, &(r0, m, _)) in seqs.iter().zip(rows) {
+            let r = r0 as usize;
+            let (cst, sst) = sq.gdn[gi];
+            let (wqkv, wb, wa) = (wqkv.add::<u16>(r * GDN_QKV as usize), wb.add::<u16>(r * GDN_HEADS as usize), wa.add::<u16>(r * GDN_HEADS as usize));
+            // qn / kn [row][16 key heads][128] fp32; vconv / y [row][48][128] bf16; beta / g [row][48] fp32
+            let (qn, kn) = (qn.add::<f32>(r * 16 * 128), kn.add::<f32>(r * 16 * 128));
+            let (vconv, y) = (vconv.add::<u16>(r * GDN_V as usize), y.add::<u16>(r * GDN_V as usize));
+            let (gbeta, ggate) = (gbeta.add::<f32>(r * GDN_HEADS as usize), ggate.add::<f32>(r * GDN_HEADS as usize));
+            let table = table.add::<u32>(4 * r);
+            if self.gdnpre {
+                let gx = if self.gates_by_proj { 100 } else { 101 };
+                self.run("rows", "gdn_pre_tr", [64, 1, 1], [gx, m, 1],
+                    &[&wqkv, &cst, &conv, &qn, &kn, &vconv, &GDN_QKV, &wb, &wa, &g.a_log.ptr(), &g.dt_bias.ptr(), &gbeta, &ggate, &table])?;
+            } else {
+                self.run("rows", "gdn_conv_prep_tr", [16, 1, 1], [16, m, 1], &[&wqkv, &cst, &conv, &qn, &kn, &GDN_QKV, &table])?;
+                self.run("rows", "gdn_vconv_tr", [64, 1, 1], [m, 96, 1], &[&wqkv, &cst, &conv, &vconv, &GDN_QKV, &table])?;
+                if !self.gates_by_proj {
+                    self.run("rows", "gdn_gates_r", [48, 1, 1], [m, 1, 1], &[&wb, &wa, &g.a_log.ptr(), &g.dt_bias.ptr(), &gbeta, &ggate])?;
+                }
+            }
+            self.run("rows", "gdn_step_tr", [64, 1, 1], [GDN_HEADS, 8, 1], &[&qn, &kn, &vconv, &gbeta, &ggate, &sst, &sscr, &y, &0u32, &m, &table])?;
+        }
+        self.run("rows", "gdn_gate_norm_r", [16, 1, 1], [GDN_HEADS, mt, 1], &[&y, &z, &g.gnorm.ptr(), &yg, &eps])?;
+        self.proj(&g.out, yg, mt, delta, false)?;
+        self.pending = true;
+        Ok(())
+    }
+
+    fn attention_forest(&mut self, li: usize, ai: usize, mt: u32, seqs: &[ForestSeq], rows: &[(u32, u32, u32)]) -> Result<()> {
+        let Mixer::Attn(a) = &self.w.layers[li].mixer else { unreachable!() };
+        let a: *const AttnW = a;
+        let a = unsafe { &*a };
+        let s = &self.sc;
+        let (xn, qg, kraw, vtmp, ktmp, rope, q, att, delta) =
+            (s.xn.ptr(), s.qg.ptr(), s.kraw.ptr(), s.vtmp.ptr(), s.ktmp.ptr(), s.rope.ptr(), s.q.ptr(), s.att.ptr(), s.delta.ptr());
+        let (po, pm, pl) = (s.po.ptr(), s.pm.ptr(), s.pl.ptr());
+        let tb = self.tbuf.as_ref().unwrap();
+        let (table, tk, tv) = (tb.table.ptr(), tb.tk.ptr(), tb.tv.ptr());
+        self.norm_in(a.norm.ptr(), mt)?;
+        self.proj(&a.q, xn, mt, qg, false)?;
+        self.proj(&a.k, xn, mt, kraw, false)?;
+        self.proj(&a.v, xn, mt, vtmp, false)?;
+        let eps = self.eps;
+        self.run("rows", "attn_prep_r", [256, 1, 1], [HEADS + KV_HEADS, mt, 1], &[&qg, &kraw, &a.qn.ptr(), &a.kn.ptr(), &rope, &q, &ktmp, &0u64, &eps])?;
+        let scale = 0.0625f32;
+        let (qd, mc) = (Q_DIM as usize, MAX_CHUNKS as usize);
+        for (sq, &(r0, m, maxd)) in seqs.iter().zip(rows) {
+            let r = r0 as usize;
+            let (kc, vc) = sq.kv[ai];
+            let pos0 = sq.pos;
+            let (ktmp, vtmp) = (ktmp.add::<u16>(r * KV_DIM as usize), vtmp.add::<u16>(r * KV_DIM as usize));
+            // q / att [row][24][256] bf16, qg [row][24][512]; po [row][chunks][24][256] fp32, pm / pl [row][chunks][24]
+            let (q, att, qg) = (q.add::<u16>(r * qd), att.add::<u16>(r * qd), qg.add::<u16>(r * 2 * qd));
+            let (po, pm, pl) = (po.add::<f32>(r * mc * qd), pm.add::<f32>(r * mc * HEADS as usize), pl.add::<f32>(r * mc * HEADS as usize));
+            let table = table.add::<u32>(4 * r);
+            self.run("kvq", "kvq_quant8", [32, 1, 1], [m, 1, 1], &[&ktmp, &kc, &pos0])?;
+            self.run("kvq", "kvq_quant8", [32, 1, 1], [m, 1, 1], &[&vtmp, &vc, &pos0])?;
+            let kbase = pos0 & !31;
+            self.run("rows", "kv_tree_tail", [272, 1, 1], [TREE_TAIL_KEYS, m, 1], &[&kc, &vc, &tk, &tv, &table, &pos0, &kbase])?;
+            let nch = (pos0 + maxd + 1).div_ceil(KV_CHUNK);
+            let tiles = (6 * m).div_ceil(8);
+            let tg = self.pick_tg(tiles, pos0 + maxd + 1);
+            let (name, local) = match tg {
+                4 => ("attn_dec_tree4", 512),
+                2 => ("attn_dec_tree2", 256),
+                _ => ("attn_dec_tree", 128),
+            };
+            self.run("attn_dec_q8", name, [local, 1, 1], [4 * tiles.div_ceil(tg), nch, 1],
+                &[&q, &kc, &vc, &po, &pm, &pl, &pos0, &scale, &MAX_CHUNKS, &m, &table, &tk, &tv])?;
+            self.run("attn_long_q8", "attn_long_merge_tr", [256, 1, 1], [HEADS, m, 1], &[&po, &pm, &pl, &qg, &att, &pos0, &MAX_CHUNKS, &table])?;
+        }
+        self.proj(&a.o, att, mt, delta, false)?;
+        self.pending = true;
+        Ok(())
+    }
+
+    /// After a forest window: sequence `si` keeps the root path `path` of its tree (its own rows, path[0] = 0), as
+    /// [`Engine::commit_tree`] does for one tree. `s` = the sequence as given to the window; its position advances by path.len()
+    /// (the caller's count: the engine's own position is not touched).
+    pub fn commit_forest(&mut self, si: usize, s: &ForestSeq, path: &[usize]) -> Result<()> {
+        let tb = self.tbuf.as_ref().context("commit_forest without a forest window")?;
+        let (r0, tt) = tb.forest.get(si).context("commit_forest: no such sequence in the window")?;
+        let r0 = *r0 as usize;
+        let n = path.len() as u32;
+        ensure!(!self.inplace && n >= 1 && n as usize <= tt.par.len() && path[0] == 0
+            && path.windows(2).all(|w| tt.par[w[1]] == w[0] as i32), "commit_forest: path {path:?} of {:?}", tt.par);
+        let p32: Vec<u32> = path.iter().map(|&r| r as u32).collect();
+        // (the upload waits for the queue: the previous sequence's commit has read the path buffer)
+        self.dev.q.upload(tb.path.ptr(), &p32).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (pp, gq, gb, ga) = (tb.path.ptr(), tb.gqkv.ptr(), tb.gb.ptr(), tb.ga.ptr());
+        let pos0 = s.pos;
+        let (mut gi, mut ai) = (0usize, 0usize);
+        for li in 0..self.cfg.n_layers {
+            match (&self.w.layers[li].mixer, &self.st[li]) {
+                (Mixer::Attn(_), LayerState::Attn(_)) => {
+                    let (kc, vc) = s.kv[ai];
+                    ai += 1;
+                    self.run("rows", "kv_tree_commit", [256, 1, 1], [1, 1, 1], &[&kc, &vc, &pp, &n, &pos0])?;
+                }
+                (Mixer::Gdn(g), LayerState::Gdn(gs)) => {
+                    let g: *const GdnW = g;
+                    let gs: *const GdnState = gs;
+                    let (g, gs) = unsafe { (&*g, &*gs) };
+                    let (cst, sst) = s.gdn[gi];
+                    gi += 1;
+                    let (sq, sb, sa) = (gs.wqkv.ptr().add::<u16>(r0 * GDN_QKV as usize), gs.wb.ptr().add::<u16>(r0 * GDN_HEADS as usize),
+                        gs.wa.ptr().add::<u16>(r0 * GDN_HEADS as usize));
+                    let (eq, eh) = (GDN_QKV, GDN_HEADS);
+                    self.run("rows", "rows_gather_u16", [256, 1, 1], [n, eq.div_ceil(256), 1], &[&sq, &gq, &pp, &eq])?;
+                    self.run("rows", "rows_gather_u16", [256, 1, 1], [n, eh.div_ceil(256), 1], &[&sb, &gb, &pp, &eh])?;
+                    self.run("rows", "rows_gather_u16", [256, 1, 1], [n, eh.div_ceil(256), 1], &[&sa, &ga, &pp, &eh])?;
+                    self.gdn_core(g, cst, sst, (gq, gb, ga), n, true, sst, false)?;
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
     }
 }
 

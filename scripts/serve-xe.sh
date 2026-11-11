@@ -5,7 +5,8 @@
 #
 # Serves /v1/chat/completions, /v1/completions, /v1/models and /health (streaming, tool calls, thinking via
 # chat_template_kwargs.enable_thinking) at http://$FERRITE_HOST:$FERRITE_PORT/v1 under the model id
-# $FERRITE_MODEL_ID. One request runs at a time; more wait in a queue. It runs in the foreground; Ctrl-C stops it.
+# $FERRITE_MODEL_ID. One request runs at a time (FERRITE_SLOTS: up to 4); more wait in a queue. It runs in the
+# foreground; Ctrl-C stops it.
 #
 # Environment (defaults in brackets):
 #   FERRITE_MODELS    folder with the model folders from `scripts/fetch-models.sh xq draft` [/var/tmp/models]; or set
@@ -14,6 +15,8 @@
 #   FERRITE_PORT      [8000]
 #   FERRITE_MODEL_ID  model id reported by /v1/models; requests may name any model [b70]
 #   FERRITE_CTX       context length [131072; the q8 KV cache is ~35 KB a token]
+#   FERRITE_SLOTS     requests served at once, 1..4 [1]. Above 1 the server keeps that many lanes: lane 0 of FERRITE_CTX
+#                     positions [81920 in this mode], the others of FE_XE_LANE_CTX [28672]; needs the DFlash2 drafter
 #   FERRITE_DRAFT     speculative decoding: dflash (DFlash2 drafter with verify trees) or mtp (the model's own MTP head
 #                     with the draft head dhead_q8.bin from the XQ folder) [dflash when the drafter is present, else mtp]
 #   FERRITE_PREFILL   prompt GEMM: i8 (int8, the default) or f16 (fp16: about 1.5x slower prompts, bit-exact with the
@@ -60,8 +63,16 @@ case ${FERRITE_PREFILL:-i8} in
   *) die "FERRITE_PREFILL is i8 or f16, not '${FERRITE_PREFILL}'" ;;
 esac
 
-ctx=${FERRITE_CTX:-131072}
-echo "serve-xe: $xq, drafting $dr, prompt GEMM ${FERRITE_PREFILL:-i8}, ctx $ctx"
+slots=${FERRITE_SLOTS:-1}
+case $slots in
+  1) ctx=${FERRITE_CTX:-131072} ;;
+  2|3|4)
+    [ "$dr" = dflash ] || die "FERRITE_SLOTS=$slots needs the DFlash2 drafter (FERRITE_DRAFT=dflash)"
+    ctx=${FERRITE_CTX:-81920}
+    export FE_XE_LANES=$slots ;;
+  *) die "FERRITE_SLOTS is 1 to 4, not '$slots'" ;;
+esac
+echo "serve-xe: $xq, drafting $dr, prompt GEMM ${FERRITE_PREFILL:-i8}, ctx $ctx, requests at once $slots"
 echo "serve-xe: http://${FERRITE_HOST:-127.0.0.1}:${FERRITE_PORT:-8000}/v1 as model '${FERRITE_MODEL_ID:-b70}' (loading takes a few minutes from a hard disk)"
 mkdir -p "$(dirname "$FERRITE_GPU_LOCK")"
 flock -n "$FERRITE_GPU_LOCK" true || die "another Ferrite GPU job holds $FERRITE_GPU_LOCK"
