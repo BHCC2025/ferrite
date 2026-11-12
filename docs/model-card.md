@@ -129,7 +129,7 @@ scripts/check-deps.sh --build --install                    # pinned Rust toolcha
 cargo build --release -p fe-server --features ferrite -p fe-cli
 export FERRITE_MODELS=/var/tmp/models                      # ~38 GB free
 scripts/fetch-models.sh                                    # this quant + NVFP4 prompt weights + DFlash2 drafter, sha256-checked
-scripts/serve.sh                                           # one Spark: OpenAI-compatible server on :8000, model id "spark"
+scripts/serve.sh                                           # one Spark: OpenAI-compatible server on :8000, model id "qwen3.8-27b"
 ```
 
 - One Spark needs about 95 GB of free memory (model + 4 x 128K context + a 12 GB prompt-cache pool).

@@ -75,7 +75,7 @@ rustup toolchain install nightly-2026-11-04 --component rust-src --component llv
 cargo build --release --features xe -p fe-server
 export FERRITE_MODELS=$HOME/models                # ~36 GB free
 scripts/fetch-models.sh xq draft                  # this quant + the DFlash2 drafter, sha256-checked
-scripts/serve-xe.sh                               # OpenAI-compatible server on :8000, model id "b70"
+scripts/serve-xe.sh                               # OpenAI-compatible server on :8000, model id "qwen3.8-27b"
 ```
 
 Companion: [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), the draft model for

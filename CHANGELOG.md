@@ -4,6 +4,14 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-11-11
+
+### Changed
+
+- **Model cards use the model id `qwen3.8-27b`.** The cards of both quants on Hugging Face (and their copies in
+  `docs/`) showed the old ids `spark` and `b70` in their serve examples. `scripts/models.manifest` pins the
+  re-uploaded revisions; only the card and the checksum list changed there, the weights are the same files.
+
 ## [0.4.1] - 2026-11-11
 
 ### Changed
@@ -108,6 +116,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.4.2]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.2
 [0.4.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.1
 [0.4.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.0
 [0.3.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.3.0

@@ -25,12 +25,12 @@
 #   FERRITE_MODELS       the model folder [/var/tmp/models]; the other settings of scripts/serve.sh (FERRITE_PORT,
 #                        FERRITE_HOST, FERRITE_CTX, FERRITE_SLOTS, ...) apply to the server it starts
 #   FERRITE_MIN_FREE_GB  memory that must be available before it starts the server [95]
-#   FERRITE_VERSION      the release to install [0.4.1]
+#   FERRITE_VERSION      the release to install [0.4.2]
 #   FERRITE_RELEASE_URL  the release tarball [the GitHub release of FERRITE_VERSION]; its .sha256 is checked
 #   FERRITE_REPO_URL     the repository to clone when there is no release [https://github.com/BHCC2025/ferrite.git]
 set -euo pipefail
 
-VERSION=${FERRITE_VERSION:-0.4.1}
+VERSION=${FERRITE_VERSION:-0.4.2}
 REPO_URL=${FERRITE_REPO_URL:-https://github.com/BHCC2025/ferrite.git}
 RELEASE_URL=${FERRITE_RELEASE_URL:-https://github.com/BHCC2025/ferrite/releases/download/v$VERSION/ferrite-$VERSION-dgx-spark-aarch64.tar.gz}
 source_build=0
