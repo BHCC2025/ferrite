@@ -69,8 +69,38 @@ pub const TUNED_RTX5080: &[((u32, u32, u32), Plan)] = &[
     ((17408, 5120, 4), Plan { sk: 4, wk: 8, ver: 8, occ: 2 }), // 53.8 / 58.2 us
 ];
 
-/// The tuned plan of a shape on a device with `sm_count` SMs: the RTX 5080's table on 84 SMs, else GB10's.
+/// Tuned plans for the RTX 5060 Ti (36 SMs, sm_120), from `exl3-tune` on the same quant (rows 1 + 0.25 x rows 16, median
+/// of 5 runs for the 8 best; 2026-11-11). Count-weighted sum over the model's linears: 27.4 ms at 1 row, 32.6 ms at
+/// 16 rows (GB10's table on this card: 31.0 / 38.4). The v1 winner (17408 x 5120, 4 bits) is listed as v9 with the
+/// same splits, as above.
+pub const TUNED_RTX5060TI: &[((u32, u32, u32), Plan)] = &[
+    ((5120, 1024, 3), Plan { sk: 8, wk: 8, ver: 8, occ: 2 }), // 9.0 / 12.1 us
+    ((5120, 1024, 4), Plan { sk: 4, wk: 8, ver: 9, occ: 0 }), // 9.8 / 12.7 us
+    ((5120, 6144, 2), Plan { sk: 5, wk: 4, ver: 8, occ: 4 }), // 28.5 / 37.8 us
+    ((5120, 6144, 3), Plan { sk: 20, wk: 4, ver: 8, occ: 4 }), // 34.0 / 49.0 us
+    ((5120, 10240, 2), Plan { sk: 10, wk: 4, ver: 8, occ: 4 }), // 43.5 / 59.1 us
+    ((5120, 10240, 3), Plan { sk: 5, wk: 4, ver: 8, occ: 0 }), // 55.0 / 65.1 us
+    ((5120, 12288, 3), Plan { sk: 4, wk: 4, ver: 8, occ: 0 }), // 65.5 / 73.4 us
+    ((5120, 12288, 4), Plan { sk: 1, wk: 4, ver: 8, occ: 0 }), // 81.1 / 88.0 us
+    ((5120, 17408, 2), Plan { sk: 1, wk: 4, ver: 8, occ: 4 }), // 70.0 / 94.0 us
+    ((5120, 17408, 3), Plan { sk: 1, wk: 4, ver: 8, occ: 0 }), // 85.9 / 96.8 us
+    ((5120, 17408, 4), Plan { sk: 1, wk: 8, ver: 8, occ: 2 }), // 109.8 / 116.2 us
+    ((5120, 248320, 5), Plan { sk: 1, wk: 8, ver: 8, occ: 2 }), // 1881.6 / 1973.7 us
+    ((6144, 5120, 3), Plan { sk: 8, wk: 4, ver: 8, occ: 4 }), // 37.1 / 45.6 us
+    ((6144, 5120, 4), Plan { sk: 8, wk: 4, ver: 8, occ: 4 }), // 43.5 / 51.0 us
+    ((10240, 5120, 4), Plan { sk: 5, wk: 8, ver: 8, occ: 2 }), // 67.1 / 75.2 us
+    ((17408, 5120, 2), Plan { sk: 16, wk: 4, ver: 8, occ: 4 }), // 71.8 / 97.5 us
+    ((17408, 5120, 3), Plan { sk: 8, wk: 8, ver: 8, occ: 2 }), // 92.0 / 114.0 us
+    ((17408, 5120, 4), Plan { sk: 8, wk: 4, ver: 9, occ: 0 }), // 114.0 / 128.9 us (v1)
+];
+
+/// The tuned plan of a shape on a device with `sm_count` SMs: the RTX 5080's table on 84 SMs, the RTX 5060 Ti's on
+/// 36, else GB10's.
 pub fn tuned(k: u32, n: u32, bits: u32, sm_count: u32) -> Option<Plan> {
-    let t = if sm_count == 84 { TUNED_RTX5080 } else { TUNED };
+    let t = match sm_count {
+        84 => TUNED_RTX5080,
+        36 => TUNED_RTX5060TI,
+        _ => TUNED,
+    };
     t.iter().find(|(key, _)| *key == (k, n, bits)).map(|(_, p)| *p)
 }

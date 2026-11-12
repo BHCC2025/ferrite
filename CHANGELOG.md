@@ -4,6 +4,15 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-11-11
+
+### Changed
+
+- **Decode plans for the RTX 5060 Ti 16 GB.** The EXL3 decode kernels have a plan table tuned on the card (36 SMs);
+  until now it ran with the DGX Spark's. Code generation goes from 139 to 155 tokens per second at 2K context
+  (121 to 136 at 16K, 86 to 97 at 56K) and 500-token edits from 343 to 357. Replies with drafting on and off are
+  the same text. See [docs/rtx-5080.md](docs/rtx-5080.md). The DGX Spark and RTX 5080 engines are unchanged.
+
 ## [0.4.2] - 2026-11-11
 
 ### Changed
@@ -116,6 +125,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.4.3]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.3
 [0.4.2]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.2
 [0.4.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.1
 [0.4.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.0

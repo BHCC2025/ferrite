@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
    available memory (`FERRITE_MIN_FREE_GB`);
-2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the release tarball of `FERRITE_VERSION` (0.4.2), its sha256
+2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the release tarball of `FERRITE_VERSION` (0.4.3), its sha256
    checked, or when there is no release a clone of the repository and a source build (`--source` forces it). Run
    inside a checkout or an unpacked release, it uses that folder instead;
 3. installs the Hugging Face CLI into `~/.venvs/hf`;
