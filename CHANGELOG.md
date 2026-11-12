@@ -4,6 +4,15 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-12
+
+### Changed
+
+- **Faster prompt MLP on the RTX 5060 Ti 16 GB.** The NVFP4 GEMMs take the mbarrier pipeline on that card (36 SMs):
+  the same bits as the default pipeline, the MLP 17% faster. Prompt processing goes from about 1,780 to 1,890
+  tokens per second at 16K (128K context configured), 1,420 to 1,470 at 56K and 1,020 to 1,040 at 110K.
+  `FE_FP4_KERNEL` picks another variant. The other targets are unchanged.
+
 ## [0.5.0] - 2026-11-12
 
 ### Added
@@ -144,6 +153,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.5.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.1
 [0.5.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.0
 [0.4.3]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.3
 [0.4.2]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.2

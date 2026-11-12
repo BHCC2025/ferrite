@@ -872,6 +872,11 @@ impl Weights {
                 if std::env::var("FE_FP8_BS").is_err() {
                     fk.fp8_bs = crate::lowmem::compute_capability() == 120;
                 }
+                // NVFP4 GEMMs on the mbarrier pipeline on the RTX 5060 Ti (36 SMs): the same bits as the default
+                // (fp4-determinism, the servers' texts), the MLP 17% faster there; FE_FP4_KERNEL overrides
+                if std::env::var("FE_FP4_KERNEL").is_err() && sm_count == 36 {
+                    fk.variant = 2;
+                }
                 let t = std::time::Instant::now();
                 ensure!(!(o.prompt_stream && o.tp.is_some()), "FE_PROMPT_STREAM: one GPU only");
                 pstream = attach_fp4(&ck, pfx, cfg, &mut layers, &mut lm_head, o.tp, o.prompt_stream)?;
