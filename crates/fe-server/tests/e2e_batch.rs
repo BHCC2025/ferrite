@@ -43,7 +43,7 @@ fn setup(delay_ms: u64) -> Option<Setup> {
         Ok(m)
     })
     .unwrap();
-    let cfg = ServerConfig { model_id: "spark".into(), max_concurrent: 4, max_context: 8192, defaults: GenDefaults::from_dir(&dir, &tok) };
+    let cfg = ServerConfig { model_id: "qwen3.8-27b".into(), max_concurrent: 4, max_context: 8192, defaults: GenDefaults::from_dir(&dir, &tok) };
     let state = AppState::new(Arc::new(engine), tok, Arc::new(ChatTemplate::from_dir(&dir).unwrap()), cfg);
     Some(Setup { state, eos, text_vocab })
 }

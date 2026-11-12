@@ -21,7 +21,7 @@ def ask(url, i, tokens, res):
     code = "".join(open(path).readlines()[:lines])
     msg = (f"Here is a Python module:\n\n```python\n{code}```\n\n{task} Reply with the complete updated module in one "
            "code block and nothing else.")
-    body = {"model": "spark", "messages": [{"role": "user", "content": msg}], "max_tokens": tokens, "temperature": 0,
+    body = {"model": "qwen3.8-27b", "messages": [{"role": "user", "content": msg}], "max_tokens": tokens, "temperature": 0,
             "stream": True, "stream_options": {"include_usage": True}, "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(url.rstrip("/") + "/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})

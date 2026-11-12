@@ -323,7 +323,7 @@ def gate_point(a, n, p, cal, ref, save):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default="http://127.0.0.1:8000/v1")
-    ap.add_argument("--model", default="spark")
+    ap.add_argument("--model", default="qwen3.8-27b")
     ap.add_argument("--lanes", default="1,2,4,8", help="lane counts (those above the server's max_batch_size are skipped)")
     ap.add_argument("--prefix", default="2000,16000", help="shared prefix sizes in tokens")
     ap.add_argument("--runs", type=int, default=3, help="measured sets per point, after one warm-up set")

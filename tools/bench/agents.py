@@ -75,7 +75,7 @@ def agent_script(i, rng):
 
 
 def chat(url, messages, max_tokens, think):
-    body = {"model": "spark", "messages": messages, "max_tokens": max_tokens, "temperature": 0, "stream": True,
+    body = {"model": "qwen3.8-27b", "messages": messages, "max_tokens": max_tokens, "temperature": 0, "stream": True,
             "stream_options": {"include_usage": True}, "chat_template_kwargs": {"enable_thinking": think}}
     req = urllib.request.Request(url.rstrip("/") + "/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})

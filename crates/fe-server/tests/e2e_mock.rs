@@ -33,7 +33,7 @@ fn state_with(delay_ms: u64, max_concurrent: usize) -> Option<Arc<AppState>> {
         tok.clone(),
         MockConfig { delay: Duration::from_millis(delay_ms), max_batch: max_concurrent, ..Default::default() },
     ));
-    let cfg = ServerConfig { model_id: "spark".into(), max_concurrent, max_context: 131_072, defaults };
+    let cfg = ServerConfig { model_id: "qwen3.8-27b".into(), max_concurrent, max_context: 131_072, defaults };
     Some(AppState::new(engine, tok, template, cfg))
 }
 
@@ -77,7 +77,7 @@ fn sse_events(bytes: &[u8]) -> Vec<Json> {
 fn assemble(events: &[Json]) -> (String, String, Vec<(String, String, String)>, Option<String>, Option<Json>) {
     let (mut reasoning, mut content, mut calls, mut finish, mut usage) = (String::new(), String::new(), Vec::new(), None, None);
     for (i, ev) in events.iter().enumerate() {
-        assert_eq!(ev["model"], "spark");
+        assert_eq!(ev["model"], "qwen3.8-27b");
         assert_eq!(ev["object"], "chat.completion.chunk");
         assert!(ev["id"].as_str().unwrap().starts_with("chatcmpl-"));
         if let Some(u) = ev.get("usage").filter(|u| !u.is_null()) {
@@ -130,7 +130,7 @@ async fn health_and_models() {
     assert_eq!(v["max_batch_size"], 4);
     let resp = router(s.clone()).oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
     let v: Json = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(v["data"][0]["id"], "spark");
+    assert_eq!(v["data"][0]["id"], "qwen3.8-27b");
     assert_eq!(v["data"][0]["max_model_len"], 131_072);
 }
 
@@ -139,7 +139,7 @@ async fn chat_non_stream_with_reasoning() {
     let Some(s) = state() else { return };
     let v = post_json(&s, "/v1/chat/completions", json!({"model": "whatever", "messages": [{"role": "user", "content": "Hi there"}]})).await;
     assert_eq!(v["object"], "chat.completion");
-    assert_eq!(v["model"], "spark");
+    assert_eq!(v["model"], "qwen3.8-27b");
     let m = &v["choices"][0]["message"];
     assert_eq!(m["role"], "assistant");
     assert!(m["reasoning_content"].as_str().unwrap().starts_with("The user wrote: \"Hi there\""), "{m}");
@@ -319,7 +319,7 @@ async fn completions_endpoint() {
     let Some(s) = state() else { return };
     let v = post_json(&s, "/v1/completions", json!({"model": "x", "prompt": "Once upon a time", "max_tokens": 200})).await;
     assert_eq!(v["object"], "text_completion");
-    assert_eq!(v["model"], "spark");
+    assert_eq!(v["model"], "qwen3.8-27b");
     let text = v["choices"][0]["text"].as_str().unwrap();
     assert!(text.starts_with(" and so the mock engine continues after \"Once upon a time\"."), "{text}");
     assert_eq!(v["choices"][0]["finish_reason"], "stop");
@@ -375,7 +375,7 @@ async fn burst_tokens_like_speculative_decoding() {
     let Some(dir) = model_dir() else { return };
     let tok = Arc::new(Tok::from_dir(&dir).unwrap());
     let engine = Arc::new(MockEngine::new(tok.clone(), MockConfig { delay: Duration::ZERO, burst: 5, ..Default::default() }));
-    let cfg = ServerConfig { model_id: "spark".into(), max_concurrent: 4, max_context: 131_072, defaults: GenDefaults::from_dir(&dir, &tok) };
+    let cfg = ServerConfig { model_id: "qwen3.8-27b".into(), max_concurrent: 4, max_context: 131_072, defaults: GenDefaults::from_dir(&dir, &tok) };
     let s = AppState::new(engine, tok, Arc::new(ChatTemplate::from_dir(&dir).unwrap()), cfg);
     let reference = post_json(&state().unwrap(), "/v1/chat/completions", json!({"messages": [{"role": "user", "content": "Hi"}]})).await;
     let v = post_json(&s, "/v1/chat/completions", json!({"messages": [{"role": "user", "content": "Hi"}]})).await;

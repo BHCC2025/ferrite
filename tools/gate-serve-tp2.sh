@@ -38,7 +38,7 @@ P=("Write a Python function that parses an ISO 8601 date string, with tests."
    "Write a short story about a lighthouse keeper in winter.")
 CURL=()
 for i in 0 1 2 3; do
-  body=$(python3 -c 'import json,sys; print(json.dumps({"model": "spark", "messages": [{"role": "user", "content": sys.argv[1]}],
+  body=$(python3 -c 'import json,sys; print(json.dumps({"model": "qwen3.8-27b", "messages": [{"role": "user", "content": sys.argv[1]}],
     "max_tokens": 200, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}))' "${P[$i]}")
   curl -s --max-time 600 http://127.0.0.1:$PORT/v1/chat/completions -H 'Content-Type: application/json' -d "$body" \
     > $OUT/r$i.json &

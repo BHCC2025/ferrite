@@ -30,14 +30,14 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
    available memory (`FERRITE_MIN_FREE_GB`);
-2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the release tarball of `FERRITE_VERSION` (0.4.0), its sha256
+2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the release tarball of `FERRITE_VERSION` (0.4.1), its sha256
    checked, or when there is no release a clone of the repository and a source build (`--source` forces it). Run
    inside a checkout or an unpacked release, it uses that folder instead;
 3. installs the Hugging Face CLI into `~/.venvs/hf`;
 4. downloads and verifies the models into `FERRITE_MODELS` (`/var/tmp/models`);
 5. starts `scripts/serve.sh` in the background, with its log in `logs/server.log` and its process group id in
    `logs/server.pid` (`--no-serve` stops before this);
-6. sends a test request and prints `OK: Ferrite is serving http://127.0.0.1:8000/v1 (model id 'spark')`.
+6. sends a test request and prints `OK: Ferrite is serving http://127.0.0.1:8000/v1 (model id 'qwen3.8-27b')`.
 
 It needs no `sudo`: when a system package is missing it stops and prints the `apt` command to run. Every
 `scripts/serve.sh` setting below (`FERRITE_PORT`, `FERRITE_CTX`, ...) applies to the server it starts. Stop the server
@@ -96,7 +96,7 @@ values. `scripts/serve.sh` adds the server settings:
 | `FERRITE_GPU_LOCK` | `/var/tmp/ferrite-gpu.lock` | the node's GPU lock: the server holds it while it runs and does not start while another Ferrite GPU job holds it |
 | `FERRITE_HOST` | `127.0.0.1` | `0.0.0.0` serves the LAN. There is no API key, so only do that on a trusted network or behind a firewall. |
 | `FERRITE_PORT` | `8000` | |
-| `FERRITE_MODEL_ID` | `spark` | the id `/v1/models` reports. Requests may name any model; the server always runs this one. |
+| `FERRITE_MODEL_ID` | `qwen3.8-27b` | the id `/v1/models` reports. Requests may name any model; the server always runs this one. |
 | `FERRITE_CTX` | `131072` | context per request. The KV cache takes ~64 KB a token a slot (128K x 4 slots = 34 GB), so lower this to save memory. |
 | `FERRITE_SLOTS` | `4` | requests at once: at most 4 with DFlash2 drafting; more requests wait in a queue |
 | `FERRITE_PROMPT` | `fp4` | prompt weights: `fp4` (the NVIDIA checkpoint) or `bf16` (see [Without the NVIDIA checkpoint](#without-the-nvidia-checkpoint)) |
@@ -112,7 +112,7 @@ Extra arguments go to `fe-server` (`bin/fe-server --help` lists them).
 curl -s http://127.0.0.1:8000/v1/models
 
 curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "spark",
+  "model": "qwen3.8-27b",
   "messages": [{"role": "user", "content": "Write a Python function that reverses a string."}],
   "max_tokens": 300,
   "chat_template_kwargs": {"enable_thinking": false}
@@ -125,14 +125,14 @@ turns it off. When it is on, the reasoning comes back in `reasoning_content`, se
 
 ## 5. Point a client at it
 
-Any OpenAI-compatible client works. Use base URL `http://<spark-address>:8000/v1`, model `spark` (or your
+Any OpenAI-compatible client works. Use base URL `http://<spark-address>:8000/v1`, model `qwen3.8-27b` (or your
 `FERRITE_MODEL_ID`) and any non-empty API key.
 
 - Open WebUI: Settings, Connections, add an OpenAI API connection with the base URL above.
 - Continue (VS Code / JetBrains): a model with `provider: openai`, `apiBase: http://<spark-address>:8000/v1`,
   `model: spark`.
-- Cline: API provider "OpenAI Compatible", the base URL above, model id `spark`.
-- Pi: an OpenAI-compatible provider with the base URL above; it sends the model id `spark`.
+- Cline: API provider "OpenAI Compatible", the base URL above, model id `qwen3.8-27b`.
+- Pi: an OpenAI-compatible provider with the base URL above; it sends the model id `qwen3.8-27b`.
 
 For another machine to reach the server, start it with `FERRITE_HOST=0.0.0.0`.
 

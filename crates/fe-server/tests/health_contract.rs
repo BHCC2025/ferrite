@@ -35,7 +35,7 @@ fn state(engine: MockConfig, flag_concurrent: usize, flag_context: usize) -> Opt
     let template = Arc::new(ChatTemplate::from_dir(&dir).unwrap());
     let defaults = GenDefaults::from_dir(&dir, &tok);
     let engine = Arc::new(MockEngine::new(tok.clone(), engine));
-    let cfg = ServerConfig { model_id: "spark".into(), max_concurrent: flag_concurrent, max_context: flag_context, defaults };
+    let cfg = ServerConfig { model_id: "qwen3.8-27b".into(), max_concurrent: flag_concurrent, max_context: flag_context, defaults };
     Some(AppState::new(engine, tok, template, cfg))
 }
 

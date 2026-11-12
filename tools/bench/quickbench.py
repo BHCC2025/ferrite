@@ -60,7 +60,7 @@ def stream(url, mode, max_tokens, context_tokens, echo=True):
     prompt = build_prompt(ctx, ask, context_tokens)
     parts = []
     body = {
-        "model": "spark",
+        "model": "qwen3.8-27b",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0,

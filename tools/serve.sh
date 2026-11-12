@@ -1,5 +1,5 @@
 #!/bin/bash
-# ferrite OpenAI-compatible server on :8000 (model id "spark", FERRITE_MODEL_ID): EXL3 3.0 mix decode + speculative decoding,
+# ferrite OpenAI-compatible server on :8000 (model id "qwen3.8-27b", FERRITE_MODEL_ID): EXL3 3.0 mix decode + speculative decoding,
 # prompt rows via NVFP4/FP8 (PROMPT=fp4, the default when $FERRITE_NVFP4_DIR holds a checkpoint) or bf16 (PROMPT=bf16, the
 # default otherwise). Holds the GPU lock for its whole life.
 # usage: tools/serve.sh [--help: the settings and the command it would run]

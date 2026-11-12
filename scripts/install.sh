@@ -25,12 +25,12 @@
 #   FERRITE_MODELS       the model folder [/var/tmp/models]; the other settings of scripts/serve.sh (FERRITE_PORT,
 #                        FERRITE_HOST, FERRITE_CTX, FERRITE_SLOTS, ...) apply to the server it starts
 #   FERRITE_MIN_FREE_GB  memory that must be available before it starts the server [95]
-#   FERRITE_VERSION      the release to install [0.4.0]
+#   FERRITE_VERSION      the release to install [0.4.1]
 #   FERRITE_RELEASE_URL  the release tarball [the GitHub release of FERRITE_VERSION]; its .sha256 is checked
 #   FERRITE_REPO_URL     the repository to clone when there is no release [https://github.com/BHCC2025/ferrite.git]
 set -euo pipefail
 
-VERSION=${FERRITE_VERSION:-0.4.0}
+VERSION=${FERRITE_VERSION:-0.4.1}
 REPO_URL=${FERRITE_REPO_URL:-https://github.com/BHCC2025/ferrite.git}
 RELEASE_URL=${FERRITE_RELEASE_URL:-https://github.com/BHCC2025/ferrite/releases/download/v$VERSION/ferrite-$VERSION-dgx-spark-aarch64.tar.gz}
 source_build=0
@@ -202,7 +202,7 @@ fi
 
 # ---------------------------------------------------------------------------------------------------- 6. test
 step "A test request"
-body='{"model": "spark", "messages": [{"role": "user", "content": "Reply with the single word OK."}], "max_tokens": 16,
+body='{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Reply with the single word OK."}], "max_tokens": 16,
        "temperature": 0, "chat_template_kwargs": {"enable_thinking": false}}'
 reply=$(curl -s -m 120 "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' -d "$body") \
   || die "no answer from http://127.0.0.1:$port/v1/chat/completions"
@@ -211,5 +211,5 @@ text=$(printf '%s' "$reply" | python3 -c 'import json, sys; print(json.load(sys.
 [ -n "$text" ] || die "the server answered with an empty reply: $(printf '%s' "$reply" | head -c 300)"
 say "the model answered: $text"
 echo
-echo "OK: Ferrite is serving http://${FERRITE_HOST:-127.0.0.1}:$port/v1 (model id '${FERRITE_MODEL_ID:-spark}')"
+echo "OK: Ferrite is serving http://${FERRITE_HOST:-127.0.0.1}:$port/v1 (model id '${FERRITE_MODEL_ID:-qwen3.8-27b}')"
 echo "    log: $root/logs/server.log    stop: kill -- -\$(cat $root/logs/server.pid)    docs: $root/docs/quickstart.md"

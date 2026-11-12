@@ -4,7 +4,7 @@ Instructions for an AI coding agent asked to install Ferrite and start its serve
 steps in order, run each verification before going on, and when a stop condition applies, stop and ask the human
 instead of working around it.
 
-When you are done, an OpenAI-compatible server answers at `http://127.0.0.1:8000/v1` with the model id `spark`
+When you are done, an OpenAI-compatible server answers at `http://127.0.0.1:8000/v1` with the model id `qwen3.8-27b`
 (Qwen3.8-27B, 128K context, up to 4 requests at once).
 
 ## Rules
@@ -54,7 +54,7 @@ models (about 38 GB) takes most of the time; checking them takes about 2 minutes
 minute.
 
 **Success** is a final line like
-`OK: Ferrite is serving http://127.0.0.1:8000/v1 (model id 'spark')`, followed by the log path and the stop command.
+`OK: Ferrite is serving http://127.0.0.1:8000/v1 (model id 'qwen3.8-27b')`, followed by the log path and the stop command.
 
 **Stop and ask the human if** it ends with `install: ERROR: ...`. The message says what is wrong: a missing system
 package (with the `sudo apt install` command for the human to run), too little memory, the wrong GPU, a failed
@@ -67,11 +67,11 @@ message; do not retry with other settings unless the human says so.
 curl -s http://127.0.0.1:8000/health
 ```
 
-Pass: JSON with `"status":"ok"` and `"model":"spark"`.
+Pass: JSON with `"status":"ok"` and `"model":"qwen3.8-27b"`.
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "spark",
+  "model": "qwen3.8-27b",
   "messages": [{"role": "user", "content": "Write a Python function that reverses a string."}],
   "max_tokens": 300,
   "chat_template_kwargs": {"enable_thinking": false}
@@ -82,7 +82,7 @@ Pass: JSON whose `choices[0].message.content` holds the function.
 
 ## 4. Use, stop and restart the server
 
-- **API:** base URL `http://127.0.0.1:8000/v1`, model `spark`, any non-empty API key. Any OpenAI-compatible client
+- **API:** base URL `http://127.0.0.1:8000/v1`, model `qwen3.8-27b`, any non-empty API key. Any OpenAI-compatible client
   works. The server listens on 127.0.0.1 only; serving the network (`FERRITE_HOST=0.0.0.0`) has no API key, so ask
   the human first.
 - **Log:** `~/ferrite/logs/server.log`.

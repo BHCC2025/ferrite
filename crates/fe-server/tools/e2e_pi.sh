@@ -10,7 +10,7 @@ cat > "$T/agent/models.json" <<EOF
 {"providers": {"ferrite-test": {"baseUrl": "$URL", "api": "openai-completions", "apiKey": "none",
   "compat": {"supportsDeveloperRole": false, "supportsReasoningEffort": false, "supportsFinishReason": false,
              "thinkingFormat": "qwen-chat-template"},
-  "models": [{"id": "spark", "name": "ferrite mock", "reasoning": true, "input": ["text"], "contextWindow": 131072,
+  "models": [{"id": "qwen3.8-27b", "name": "ferrite mock", "reasoning": true, "input": ["text"], "contextWindow": 131072,
               "maxTokens": 16384, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}]}}}
 EOF
 echo "hello file" > "$T/work/notes.txt"

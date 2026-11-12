@@ -101,7 +101,7 @@ by every lane and 12K of a 16K prefix is computed once.
 ## Serve
 
 ```bash
-scripts/serve-xe.sh                     # http://127.0.0.1:8000/v1, model id "b70"
+scripts/serve-xe.sh                     # http://127.0.0.1:8000/v1, model id "qwen3.8-27b"
 curl -s localhost:8000/v1/models
 ```
 
@@ -113,7 +113,7 @@ loading the weights takes under a minute once the files are in the page cache, a
 |---|---|---|
 | `FERRITE_MODELS` | `/var/tmp/models` | Folder holding the model folders |
 | `FERRITE_XQ_DIR` / `FERRITE_DRAFT_DIR` | under `$FERRITE_MODELS` | Each model folder, if stored elsewhere |
-| `FERRITE_MODEL_ID` | `b70` | Model id the API reports |
+| `FERRITE_MODEL_ID` | `qwen3.8-27b` | Model id the API reports |
 | `FERRITE_PORT`, `FERRITE_CTX` | `8000`, `131072` | Port and context length (`81920` with `FERRITE_SLOTS` above 1) |
 | `FERRITE_SLOTS` | `1` | Requests served at once, 1 to 4 (see below) |
 | `FERRITE_DRAFT` | `dflash` when the drafter is present | `dflash` or `mtp` |

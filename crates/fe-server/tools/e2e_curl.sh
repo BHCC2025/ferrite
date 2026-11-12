@@ -10,7 +10,7 @@ post() { curl -s -m 60 "$B$1" -H 'Content-Type: application/json' -d "$2"; }
 has() { if grep -qF -- "$2" <<<"$3"; then ok "$1"; else bad "$1: $(head -c 400 <<<"$3")"; fi; }
 
 r=$(curl -s -m 5 "$B/health");                       has "/health max_batch_size" '"max_batch_size":' "$r"
-r=$(curl -s -m 5 "$B/v1/models");                    has "/v1/models id spark" '"id":"spark"' "$r"
+r=$(curl -s -m 5 "$B/v1/models");                    has "/v1/models id qwen3.8-27b" '"id":"qwen3.8-27b"' "$r"
 
 r=$(post /v1/chat/completions '{"model":"x","messages":[{"role":"user","content":"Hello!"}]}')
 has "chat: reasoning_content"   '"reasoning_content":"The user wrote' "$r"

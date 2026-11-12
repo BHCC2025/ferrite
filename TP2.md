@@ -16,7 +16,7 @@ TP_ENV="FE_PROMPT=fp4" tools/kl-tp2.sh $FERRITE_EXL3_DIR text
 TP_ENV="FE_MTP=1 FE_SPEC=4" tools/tp2.sh $FERRITE_EXL3_DIR generate "def fibonacci(n):" 256     # MTP speculative decode
 # serving: rank 0 runs the scheduler / server, rank 1 replays its engine calls (`ferrite <model> follow`)
 FOLLOW=$FERRITE_EXL3_DIR tools/tp2.sh target/release/ferrite $FERRITE_EXL3_DIR sched-test 6
-PROMPT=fp4 tools/serve-tp2.sh          # the OpenAI server (model "spark") on node A :8000 as TP2
+PROMPT=fp4 tools/serve-tp2.sh          # the OpenAI server (model "qwen3.8-27b") on node A :8000 as TP2
 TP2_DRY=1 tools/tp2.sh ...             # print what both ranks would run, run nothing
 # by hand: FE_TP_WORLD=2 FE_TP_RANK=0|1 FERRITE_TP_ADDR=<rank 0 fabric address>:<port> on both ranks, plus the
 #          NCCL_IB_GID_INDEX / NCCL_SOCKET_IFNAME / NCCL_IB_HCA and FERRITE_ROCE_* settings tools/site.sh prints

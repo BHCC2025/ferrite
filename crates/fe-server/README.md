@@ -33,7 +33,7 @@ flock $FERRITE_GPU_LOCK ./target/release/fe-server --engine ferrite \
 |---|---|---|
 | `--model-dir DIR` | (required) | `tokenizer.json`, `chat_template.jinja` (or `tokenizer_config.json` `chat_template`), `generation_config.json` |
 | `--host` / `--port` | `0.0.0.0` / `8000` | |
-| `--served-model-name` | `spark` | the id reported everywhere; requests may name any model |
+| `--served-model-name` | `qwen3.8-27b` | the id reported everywhere; requests may name any model |
 | `--max-concurrent N` | engine `max_batch` (mock: 4) | requests generating at once; the rest wait in a FIFO queue (never 503) |
 | `--max-model-len N` | `131072` | prompt + output tokens; `max_tokens` is clamped to what is left |
 | `--mock` | off | deterministic mock engine (below) |
@@ -51,7 +51,7 @@ SIGINT / SIGTERM stop accepting requests and exit after at most 5 s.
 
 - `GET /health` (also `/v1/health`): `{"status":"ok","max_batch_size":4,"max_model_len":131072,"running":n,"queued":m,...}`
   (quickbench reads `max_batch_size`).
-- `GET /v1/models`, `GET /v1/models/{id}`: one model, id `spark`, with `max_model_len` / `context_length`.
+- `GET /v1/models`, `GET /v1/models/{id}`: one model, id `qwen3.8-27b`, with `max_model_len` / `context_length`.
 - `POST /v1/chat/completions`: stream (SSE `data: {...}\n\n`, final `data: [DONE]`) and non-stream.
 - `POST /v1/completions`: raw prompt (string, `[string]`, token ids or `[[ids]]`; one prompt), stream and
   non-stream, `echo`. Default `max_tokens` 16 (OpenAI); chat defaults to the rest of the context window.

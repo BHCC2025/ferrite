@@ -106,7 +106,7 @@ scripts/check-deps.sh
 export FERRITE_MODELS=$HOME/models
 scripts/fetch-models.sh
 
-# 3. serve an OpenAI-compatible API on :8000 (model id "spark")
+# 3. serve an OpenAI-compatible API on :8000 (model id "qwen3.8-27b")
 scripts/serve.sh
 curl -s localhost:8000/v1/models
 ```
@@ -134,7 +134,7 @@ Everything has a default; set only what differs on your machines. `tools/site.sh
 |---|---|---|
 | `FERRITE_MODELS` | `/var/tmp/models` | Folder holding the three model folders |
 | `FERRITE_EXL3_DIR` / `FERRITE_NVFP4_DIR` / `FERRITE_DRAFT_DIR` | under `$FERRITE_MODELS` | Each model folder, if stored elsewhere |
-| `FERRITE_MODEL_ID` | `spark` | Model id the API reports |
+| `FERRITE_MODEL_ID` | `qwen3.8-27b` | Model id the API reports |
 | `FERRITE_PORT`, `FERRITE_CTX`, `FERRITE_SLOTS` | `8000`, `131072`, `4` | Port, context per request, requests at once (at most 4 with DFlash2) |
 | `FERRITE_STATE_DIR` | `/var/tmp/ferrite` | Logs, run files and locks |
 | `FERRITE_PEER` | none | Second Spark's ssh host (required in two-node mode) |

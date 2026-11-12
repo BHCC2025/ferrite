@@ -13,7 +13,7 @@
 #                     FERRITE_XQ_DIR / FERRITE_DRAFT_DIR one by one
 #   FERRITE_HOST      listen address [127.0.0.1; 0.0.0.0 to serve the LAN; there is no API key, so firewall it]
 #   FERRITE_PORT      [8000]
-#   FERRITE_MODEL_ID  model id reported by /v1/models; requests may name any model [b70]
+#   FERRITE_MODEL_ID  model id reported by /v1/models; requests may name any model [qwen3.8-27b]
 #   FERRITE_CTX       context length [131072; the q8 KV cache is ~35 KB a token]
 #   FERRITE_SLOTS     requests served at once, 1..4 [1]. Above 1 the server keeps that many lanes: lane 0 of FERRITE_CTX
 #                     positions [81920 in this mode], the others of FE_XE_LANE_CTX [28672]; needs the DFlash2 drafter
@@ -73,9 +73,9 @@ case $slots in
   *) die "FERRITE_SLOTS is 1 to 4, not '$slots'" ;;
 esac
 echo "serve-xe: $xq, drafting $dr, prompt GEMM ${FERRITE_PREFILL:-i8}, ctx $ctx, requests at once $slots"
-echo "serve-xe: http://${FERRITE_HOST:-127.0.0.1}:${FERRITE_PORT:-8000}/v1 as model '${FERRITE_MODEL_ID:-b70}' (loading takes a few minutes from a hard disk)"
+echo "serve-xe: http://${FERRITE_HOST:-127.0.0.1}:${FERRITE_PORT:-8000}/v1 as model '${FERRITE_MODEL_ID:-qwen3.8-27b}' (loading takes a few minutes from a hard disk)"
 mkdir -p "$(dirname "$FERRITE_GPU_LOCK")"
 flock -n "$FERRITE_GPU_LOCK" true || die "another Ferrite GPU job holds $FERRITE_GPU_LOCK"
 exec flock -n -E 75 "$FERRITE_GPU_LOCK" "$bin" --engine xe --model-dir "$xq" \
-  --host "${FERRITE_HOST:-127.0.0.1}" --port "${FERRITE_PORT:-8000}" --served-model-name "${FERRITE_MODEL_ID:-b70}" \
+  --host "${FERRITE_HOST:-127.0.0.1}" --port "${FERRITE_PORT:-8000}" --served-model-name "${FERRITE_MODEL_ID:-qwen3.8-27b}" \
   --max-model-len "$ctx" --prefill-chunk 4096 "$@"

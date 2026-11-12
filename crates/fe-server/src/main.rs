@@ -24,7 +24,7 @@ struct Args {
     #[arg(long, default_value_t = 8000)]
     port: u16,
     /// Model id reported by the API (requests may name any model).
-    #[arg(long, env = "FERRITE_MODEL_ID", default_value = "spark")]
+    #[arg(long, env = "FERRITE_MODEL_ID", default_value = "qwen3.8-27b")]
     served_model_name: String,
     /// Real engine: the NVIDIA NVFP4 / FP8 checkpoint for prompt rows (FE_PROMPT=fp4); default fe_site::nvfp4_dir.
     #[arg(long, env = "FERRITE_NVFP4_DIR")]

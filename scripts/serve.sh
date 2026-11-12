@@ -13,7 +13,7 @@
 #                     FERRITE_EXL3_DIR / FERRITE_NVFP4_DIR / FERRITE_DRAFT_DIR one by one
 #   FERRITE_HOST      listen address [127.0.0.1; 0.0.0.0 to serve the LAN; there is no API key, so firewall it]
 #   FERRITE_PORT      [8000]
-#   FERRITE_MODEL_ID  model id reported by /v1/models; requests may name any model [spark]
+#   FERRITE_MODEL_ID  model id reported by /v1/models; requests may name any model [qwen3.8-27b]
 #   FERRITE_GPU_LOCK  the node's GPU lock; the server holds it while it runs and refuses to start when another
 #                     Ferrite GPU job holds it [/var/tmp/ferrite-gpu.lock]
 #   FERRITE_CTX       context length per request [131072 with fp4 prompt weights, 32768 with bf16; lower it to save
@@ -97,10 +97,10 @@ need=${user_min_free:-$(( 13 + wts + 4 + ctx * ${FERRITE_SLOTS:-4} * 64 / 104857
 FERRITE_MIN_FREE_GB=$need "$root/scripts/check-deps.sh" "$bin" || die "fix the errors above first"
 echo "serve: $quant, prompt weights $prompt, drafting $dr, ctx $ctx x ${FERRITE_SLOTS:-4} slots, prompt cache \
 $([ "$cache" = 1 ] && echo "on (a pool of up to ${park} GB, keeping 20 GB available)" || echo off)"
-echo "serve: http://${FERRITE_HOST:-127.0.0.1}:${FERRITE_PORT:-8000}/v1 as model '${FERRITE_MODEL_ID:-spark}' (loading takes a minute)"
+echo "serve: http://${FERRITE_HOST:-127.0.0.1}:${FERRITE_PORT:-8000}/v1 as model '${FERRITE_MODEL_ID:-qwen3.8-27b}' (loading takes a minute)"
 mkdir -p "$(dirname "$FERRITE_GPU_LOCK")"
 flock -n "$FERRITE_GPU_LOCK" true || die "another Ferrite GPU job holds $FERRITE_GPU_LOCK on this node"
 exec flock -n -E 75 "$FERRITE_GPU_LOCK" "$bin" --engine ferrite --model-dir "$quant" --weights-dir "$quant" \
   --nvfp4-dir "$nvfp4" --draft-dir "$draft" \
-  --host "${FERRITE_HOST:-127.0.0.1}" --port "${FERRITE_PORT:-8000}" --served-model-name "${FERRITE_MODEL_ID:-spark}" \
+  --host "${FERRITE_HOST:-127.0.0.1}" --port "${FERRITE_PORT:-8000}" --served-model-name "${FERRITE_MODEL_ID:-qwen3.8-27b}" \
   --slots "${FERRITE_SLOTS:-4}" --max-model-len "$ctx" --prefill-chunk 2048 "$@"

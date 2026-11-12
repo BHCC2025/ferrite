@@ -4,6 +4,27 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-11-11
+
+### Changed
+
+- **The default model id is `qwen3.8-27b` on every target.** It was `spark` on the CUDA engine and `b70` on the Intel
+  Arc Pro B70 engine, names that only made sense on those machines. `/v1/models`, `/health` and the replies report
+  the new id; requests may still name any model, so existing clients keep working. `FERRITE_MODEL_ID` (or
+  `--served-model-name`) sets another id, for example `FERRITE_MODEL_ID=spark` to keep the old one.
+
+### Fixed
+
+- **RTX 5080 preset without the NVIDIA checkpoint.** `PROMPT=bf16` (also the fallback when the checkpoint is
+  missing) ran out of device memory while loading, because bf16 copies of the prompt weights were built on the
+  card. On small-memory devices the prompt now goes through the EXL3 weights on the decode kernels, as
+  [docs/rtx-5080.md](docs/rtx-5080.md) describes (`FE_BF16=1` brings the copies back).
+
+### Added
+
+- **RTX 5060 Ti 16 GB results** in [docs/rtx-5080.md](docs/rtx-5080.md): the RTX 5080 build runs on it, with
+  measured speeds and the prompt chunk size that suits its 8-lane link.
+
 ## [0.4.0] - 2026-11-11
 
 ### Added
@@ -87,6 +108,8 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.4.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.1
+[0.4.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.0
 [0.3.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.3.0
 [0.2.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.2.0
 [0.1.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.1.0

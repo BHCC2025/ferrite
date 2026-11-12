@@ -525,14 +525,16 @@ impl Default for LoadOpts {
     }
 }
 impl LoadOpts {
-    /// FE_BF16=0 drops the bf16 prompt weights (decode-only runs), FE_EXL3_DECODE=0 forces the bf16 GEMM path,
+    /// FE_BF16=0 drops the bf16 prompt weights (decode-only runs; the default on small-memory devices), FE_EXL3_DECODE=0 forces the bf16 GEMM path,
     /// FE_MTP=0 skips the MTP head, FE_PROMPT=fp4 selects the NVFP4/FP8 prompt GEMMs (checkpoint: FERRITE_NVFP4_DIR).
     pub fn from_env() -> LoadOpts {
         let on = |k: &str| std::env::var(k).map(|v| v != "0").unwrap_or(true);
         let fp4 = std::env::var("FE_PROMPT").map(|v| v == "fp4").unwrap_or(false);
         let path = fe_site::nvfp4_dir();
         let keep_bf16 = std::env::var("FE_BF16").map(|v| v == "1").unwrap_or(false);
-        LoadOpts { bf16: (on("FE_BF16") && !fp4) || keep_bf16, exl3_decode: on("FE_EXL3_DECODE"), mtp: on("FE_MTP"),
+        // small-memory devices have no room for bf16 copies: prompt rows then take the trellis GEMV (FE_BF16=1 keeps them)
+        let bf16 = std::env::var("FE_BF16").map(|v| v != "0").unwrap_or(!crate::lowmem::on());
+        LoadOpts { bf16: (bf16 && !fp4) || keep_bf16, exl3_decode: on("FE_EXL3_DECODE"), mtp: on("FE_MTP"),
             prompt_fp4: fp4.then_some(path), tp: crate::tp::from_env(),
             embed_host: crate::lowmem::flag("FE_EMBED_HOST"), prompt_stream: fp4 && crate::lowmem::flag("FE_PROMPT_STREAM"),
             mtp_bf16: std::env::var("FE_MTP_BF16").map(|v| v != "0").unwrap_or(!crate::lowmem::on()) }
