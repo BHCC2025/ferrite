@@ -4,60 +4,60 @@ version = 4
 
 [[package]]
 name = "k-core"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-core-tp2"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-dflash"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-exl3"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-fabric"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-fp4"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-gdn"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-gdn-tp2"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "kcommon"
-version = "0.4.3"
+version = "0.5.0"

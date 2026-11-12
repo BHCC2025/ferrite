@@ -617,6 +617,10 @@ impl Worker {
     /// Give waiting requests a slot: the free slot whose cache is the longest proper prefix of the prompt,
     /// else the least recently used free slot (reset).
     fn admit(&mut self) {
+        // a prompt group is being taken in (a few short steps): its forwards must be the group's chunks alone
+        if self.e.group_slot().is_some() {
+            return;
+        }
         // requests waiting for another one to prefill their shared prefix (put back in order at the end)
         let mut held: Vec<(Request, Sink)> = Vec::new();
         self.admit_inner(&mut held);
@@ -1091,6 +1095,46 @@ impl Worker {
             }
         }
         let step_t0 = Instant::now();
+        // a long prompt alone on a device that streams its prompt weights: the layers of its next chunks run as one
+        // group (layer by layer, the weights cross the bus once); the chunks then go through the steps below as
+        // always, cut the same way (at every snapshot point too), and only add the head
+        if rows == 0 && self.active.len() == 1 && self.e.group_slot().is_none() && self.e.group_capable() {
+            let a = &self.active[0];
+            let len = a.req.prompt_ids.len();
+            if a.pending.is_none() && a.fed < len {
+                let lim = self.o.prefill_chunk.min(budget);
+                let cap = self.e.group_rows();
+                let (mut f, mut ends) = (a.fed, Vec::new());
+                while f < len {
+                    let n = if self.cache { prompt_cut_at(len, &a.cuts, f, lim) } else { prompt_cut(len, a.cached, f, lim) };
+                    if n <= crate::model::X3_ROWS || f + n - a.fed > cap {
+                        break;
+                    }
+                    f += n;
+                    ends.push(f);
+                }
+                // what fits the device beside its reserve (the parked rows, the state at snapshot points inside)
+                let inside = |ends: &[usize]| ends[..ends.len() - 1].iter().filter(|e| self.cache && a.cuts.binary_search(e).is_ok()).count();
+                while ends.len() > 1 && !self.e.group_fits(ends[ends.len() - 1] - a.fed, ends.len(), inside(&ends)) {
+                    ends.pop();
+                }
+                if ends.len() > 1 {
+                    let mut from = a.fed;
+                    let chunks: Vec<&[u32]> = ends.iter().map(|&e| {
+                        let c = &a.req.prompt_ids[from..e];
+                        from = e;
+                        c
+                    }).collect();
+                    let snaps: Vec<bool> = ends.iter().map(|e| self.cache && a.cuts.binary_search(e).is_ok()).collect();
+                    if !self.e.group_prefill(a.slot, &chunks, &snaps, &a.req.cancel)? {
+                        // cancelled part way: finish resets the slot (its state is between layers)
+                        let a = self.active.swap_remove(0);
+                        self.finish(a, Finish::Cancelled);
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let first_prompt = segs.len();
         for (ai, a) in self.active.iter().enumerate() {
             if a.pending.is_none() && a.fed < a.req.prompt_ids.len() && rows < budget {
@@ -1582,7 +1626,12 @@ impl Worker {
         (a.sink)(Event::Finished { reason, cached_prompt_tokens: a.cached });
         self.slot_busy[a.slot] = false;
         // the slot keeps prompt + generated (minus an unfed last token) as its prompt cache
-        if self.slot_tokens[a.slot].len() != self.e.slot_len[a.slot] {
+        // (a prompt group left pending by a cancelled request: the slot's state is past its length)
+        let group = self.e.group_slot() == Some(a.slot);
+        if group {
+            self.e.group_abort();
+        }
+        if group || self.slot_tokens[a.slot].len() != self.e.slot_len[a.slot] {
             self.slot_tokens[a.slot].clear();
             let b: Vec<usize> = self.slot_snaps[a.slot].drain(..).map(|x| x.blk).collect();
             self.blocks.release(b);

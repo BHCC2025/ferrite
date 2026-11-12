@@ -170,6 +170,8 @@ const FLASH_MIN: usize = 17; // segments of up to 16 rows (decode, 16-row verifi
 const VK_ROWS: u32 = 16;
 /// Row counts up to this use the EXL3 GEMV when a linear has a trellis form.
 pub const X3_ROWS: usize = 16;
+/// Device memory a prompt group leaves free while it is pending (nothing else is allocated in those steps).
+const GROUP_RESERVE: usize = 96 << 20;
 /// Decode / verify rows per EXL3 GEMV call: one call reads the weights once (32 rows cost a TP2 rank 34.8 ms over
 /// all linears, two 16-row calls 56.9); 33-48 rows run as one 48-row pass (g6), 49-64 as 48 + 16 (or 32 + 32 with
 /// `FE_EXL3_G6=0`). A row's bits do not depend on the call's row count (exl3-rowcheck 1-64, TP1 and both TP2
@@ -1066,6 +1068,28 @@ fn x3_linears<'a>(layers: &'a [Layer], lm_head: &'a Linear) -> Vec<&'a fe_exl3::
     lins.iter().filter_map(|l| l.q.as_ref()).collect()
 }
 
+/// A prompt group (Engine::group_prefill): consecutive prompt chunks of one slot whose layers already ran, layer by
+/// layer over all chunks, so streamed prompt weights crossed the bus once for the group instead of once a chunk.
+/// The chunks' hidden states after the last layer wait here; the forwards that follow (the same chunks, in order)
+/// take them instead of running the layers.
+struct Group {
+    slot: usize,
+    /// the slot's length when the group was computed
+    pos: usize,
+    chunks: Vec<Vec<u32>>,
+    /// first row of each chunk in `x`
+    row0: Vec<usize>,
+    /// [rows][hidden] of every chunk after the last layer
+    x: DeviceBuffer<u16>,
+    next: usize,
+    /// per chunk: the slot's GDN state after it (every GDN layer's conv window and recurrent state), kept for the
+    /// chunks that end on a snapshot point inside the group
+    stage: Vec<Option<DeviceBuffer<u8>>>,
+    /// the slot's GDN state at the group's end while a staged one is in its place
+    hold: Option<DeviceBuffer<u8>>,
+    swapped: bool,
+}
+
 struct Prepared {
     rows: usize,
     nseg: usize,
@@ -1213,6 +1237,7 @@ pub struct Engine {
     pub max_ctx: usize,
     /// tokens already in each slot's cache
     pub slot_len: Vec<usize>,
+    group: Option<Group>,
     kv: Vec<(DeviceBuffer<u16>, DeviceBuffer<u16>)>,
     /// bits a value of the cache's records (kvq_bits; 0: a bf16 cache)
     kvq: usize,
@@ -1416,7 +1441,7 @@ impl Engine {
                 DeviceBuffer::from_slice(&(0..max_rows as u32).collect::<Vec<_>>())?)),
             Embed::Dev(_) => None,
         };
-        Ok(Engine { emb, slot_len: vec![0; n_slots], cfg, k, w, stream, n_slots, max_ctx, kv, kvq, vkq_splits,
+        Ok(Engine { emb, group: None, slot_len: vec![0; n_slots], cfg, k, w, stream, n_slots, max_ctx, kv, kvq, vkq_splits,
             fwd_prof: std::env::var("FE_FWD_PROF").is_ok_and(|v| v == "1").then(|| std::cell::RefCell::new((std::time::Instant::now(), Vec::new()))),
             conv_state, rec_state, conv_hist,
             rec_hist, hist_rows, hist_cap, rope, sc, logits, max_logit_rows, argmax_out, fp4_ws,
@@ -2039,6 +2064,13 @@ impl Engine {
             parents: parents.iter().map(|p| p.map(|v| v.to_vec())).collect(),
         })?;
         ensure!(!hist || self.hist_rows > 0, "forward: no state history allocated");
+        if let Some(g) = self.group.as_ref() {
+            let next = segs.len() == 1 && segs[0].0 == g.slot && dec == 0 && !hist && parents.iter().all(|p| p.is_none())
+                && g.next < g.chunks.len() && segs[0].1 == g.chunks[g.next].as_slice()
+                && self.slot_len[g.slot] == g.pos + g.row0[g.next];
+            ensure!(next, "forward: slot {}'s prompt group is pending (chunk {} of {})", g.slot, g.next, g.chunks.len());
+            return self.group_step(segs, logit_rows);
+        }
         let pos: Vec<usize> = segs.iter().map(|s| self.slot_len[s.0]).collect();
         let mut p = self.prepare_tree(segs, &pos, logit_rows, None, parents, dec)?;
         ensure!(dec <= DEC_MAX || dec == p.rows, "forward: {dec} decode rows (max {DEC_MAX})");
@@ -2076,6 +2108,203 @@ impl Engine {
         self.run(&p, key, |e, p| e.enqueue(p, hist))?;
         for &(slot, toks) in segs {
             self.slot_len[slot] += toks.len();
+        }
+        Ok(())
+    }
+
+    /// Whether prompt groups pay here: the prompt weights are streamed from host memory a layer at a time
+    /// (FE_PROMPT_GROUP=0 turns groups off).
+    pub fn group_capable(&self) -> bool {
+        self.w.pstream.is_some() && self.feat.is_none() && self.tp.is_none()
+            && std::env::var("FE_PROMPT_GROUP").map(|v| v != "0").unwrap_or(true)
+    }
+
+    /// The slot whose prompt group is pending.
+    pub fn group_slot(&self) -> Option<usize> {
+        self.group.as_ref().map(|g| g.slot)
+    }
+
+    /// Drop a pending group. Its slot's K/V rows and GDN state are past the slot's length: reset the slot.
+    pub fn group_abort(&mut self) {
+        self.group = None;
+    }
+
+    /// The most rows a prompt group holds: FE_PROMPT_GROUP (a number above 1), else 65536.
+    pub fn group_rows(&self) -> usize {
+        std::env::var("FE_PROMPT_GROUP").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 1).unwrap_or(65536)
+    }
+
+    /// Whether the device has room for a group of `rows` rows in `chunks` chunks with `snaps` snapshot points
+    /// inside it, beside a reserve: the parked hidden states (2 x hidden bytes a row), a copy of each chunk's
+    /// metadata, and the GDN state at each point and at the group's end.
+    pub fn group_fits(&self, rows: usize, chunks: usize, snaps: usize) -> bool {
+        let (cb, rb) = self.gdn_state_bytes();
+        let need = rows * 2 * self.cfg.hidden + chunks * self.sc.meta.len() * 4
+            + if snaps > 0 { (snaps + 1) * self.conv_state.len() * (cb + rb) } else { 0 };
+        fe_cuda::mem_info().is_ok_and(|(free, _)| need + GROUP_RESERVE <= free)
+    }
+
+    /// Run the layers of `chunks` (consecutive prompt chunks of `slot` from its current length, each more than
+    /// X3_ROWS rows) layer by layer: every chunk through layer 0, then every chunk through layer 1, and so on. Each
+    /// (layer, chunk) is the launch sequence the chunk's own forward would enqueue, in the order of the chunks, so
+    /// the K/V cache and the GDN state end as after those forwards and every row's bits are the same; streamed
+    /// prompt weights are fetched once a layer for the group. The slot's length stays: the next chunks.len() calls
+    /// of forward must be these chunks in order (one segment each, no decode rows), and only add the head.
+    /// `cancel` is read after every layer: once set the group stops and false is returned. The slot's state is then
+    /// part way through the layers: group_slot still names it, and the caller resets it (group_abort, reset_slot).
+    /// `snaps[c]`: chunk c ends on a snapshot point. The GDN state after such a chunk is kept as each layer passes
+    /// it, and is the slot's state from that chunk's forward until the next one, so cache_save there stores what it
+    /// would have without the group.
+    pub fn group_prefill(&mut self, slot: usize, chunks: &[&[u32]], snaps: &[bool], cancel: &std::sync::atomic::AtomicBool)
+        -> Result<bool> {
+        ensure!(snaps.len() == chunks.len(), "group_prefill: {} snapshot flags", snaps.len());
+        ensure!(self.group.is_none(), "group_prefill: a group is pending");
+        ensure!(chunks.len() > 1 && chunks.iter().all(|c| c.len() > X3_ROWS), "group_prefill: {} chunks", chunks.len());
+        let t0 = std::time::Instant::now();
+        let h = self.cfg.hidden;
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let ml = self.sc.meta.len();
+        // no room for the parked rows after all: the chunks take their own forwards, as without groups
+        let (Ok(xs), Ok(metas)) = (DeviceBuffer::<u16>::alloc(total * h), DeviceBuffer::<u32>::alloc(chunks.len() * ml)) else {
+            return Ok(true);
+        };
+        let (cb, rb) = self.gdn_state_bytes();
+        let n_gdn = self.conv_state.len();
+        let mut stage: Vec<Option<DeviceBuffer<u8>>> = Vec::with_capacity(chunks.len());
+        for (c, &sn) in snaps.iter().enumerate() {
+            stage.push(if sn && c + 1 < chunks.len() {
+                let Ok(b) = DeviceBuffer::<u8>::alloc(n_gdn * (cb + rb)) else { return Ok(true) };
+                Some(b)
+            } else {
+                None
+            });
+        }
+        let hold = if stage.iter().any(|b| b.is_some()) {
+            let Ok(b) = DeviceBuffer::<u8>::alloc(n_gdn * (cb + rb)) else { return Ok(true) };
+            Some(b)
+        } else {
+            None
+        };
+        let (cd, rs) = (self.cfg.conv_dim(), self.cfg.lin_v_heads * self.cfg.lin_dk * self.cfg.lin_dv);
+        let start = self.slot_len[slot];
+        let (mut prs, mut row0) = (Vec::with_capacity(chunks.len()), Vec::with_capacity(chunks.len()));
+        let (mut pos, mut r0) = (start, 0);
+        for (c, toks) in chunks.iter().enumerate() {
+            let mut p = self.prepare_tree(&[(slot, toks)], &[pos], &[], None, &[], 0)?;
+            p.dec = 0;
+            p.lin_dec = 0;
+            unsafe {
+                let (tab, ids) = self.embed_src(&p);
+                self.stream.launch(&self.k.embed, p.rows as u32, 256, 0, (self.sc.x.ptr(), tab, ids, h as u32))?;
+            }
+            self.stream.memcpy_dtod(xs.at(r0 * h), self.sc.x.ptr(), p.rows * h * 2)?;
+            self.stream.memcpy_dtod(metas.at(c * ml), self.sc.meta.ptr(), ml * 4)?;
+            // the metadata and host embedding rows are staged in pinned buffers the next chunk reuses
+            self.stream.sync()?;
+            row0.push(r0);
+            r0 += p.rows;
+            pos += p.rows;
+            prs.push(p);
+        }
+        let mut stopped = false;
+        {
+            let s = &self.stream;
+            let ps = self.w.pstream.as_ref();
+            if let Some(ps) = ps {
+                ps.fetch(0, s)?;
+            }
+            for (li, layer) in self.w.layers.iter().enumerate() {
+                for (c, p) in prs.iter().enumerate() {
+                    let lc = LinCtx { k: &self.k, x3: self.w.x3.as_ref(), fp4: self.w.fp4.as_ref().zip(self.fp4_ws.as_ref()), s,
+                        tmp: self.sc.tmp.ptr(), dec: p.lin_dec };
+                    s.memcpy_dtod(self.sc.meta.ptr(), metas.at(c * ml), ml * 4)?;
+                    s.memcpy_dtod(self.sc.x.ptr(), xs.at(row0[c] * h), p.rows * h * 2)?;
+                    self.enqueue_layer(layer, p, &lc, false)?;
+                    s.memcpy_dtod(xs.at(row0[c] * h), self.sc.x.ptr(), p.rows * h * 2)?;
+                    if let (Mixer::Gdn { idx, .. }, Some(st)) = (&layer.mixer, &stage[c]) {
+                        s.memcpy_dtod(st.at(idx * (cb + rb)), self.conv_state[*idx].at(slot * 3 * cd), cb)?;
+                        s.memcpy_dtod(st.at(idx * (cb + rb) + cb), self.rec_state[*idx].at(slot * rs), rb)?;
+                    }
+                }
+                if let Some(ps) = ps {
+                    ps.release(li, s)?;
+                    // the next layer's upload starts before the wait below, so it runs beside this layer's launches
+                    if li + 1 < self.w.layers.len() {
+                        ps.fetch(li + 1, s)?;
+                    }
+                }
+                s.sync()?;
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        if stopped {
+            self.group = Some(Group { slot, pos: start, chunks: Vec::new(), row0: Vec::new(), x: xs, next: 0, stage: Vec::new(),
+                hold: None, swapped: false });
+            return Ok(false);
+        }
+        if std::env::var("FE_GROUP_TRACE").is_ok_and(|v| v == "1") {
+            eprintln!("ferrite: prompt group: slot {slot} from {start}, {} chunks, {total} rows, {:.2} s", chunks.len(),
+                t0.elapsed().as_secs_f64());
+        }
+        self.group = Some(Group { slot, pos: start, chunks: chunks.iter().map(|c| c.to_vec()).collect(), row0, x: xs, next: 0,
+            stage, hold, swapped: false });
+        Ok(true)
+    }
+
+    /// Bytes of one GDN layer's state of a slot: (conv window, recurrent state).
+    fn gdn_state_bytes(&self) -> (usize, usize) {
+        (3 * self.cfg.conv_dim() * 2, self.cfg.lin_v_heads * self.cfg.lin_dk * self.cfg.lin_dv * 4)
+    }
+
+    /// Slot `slot`'s GDN state of every layer into `buf` (`save`) or from it.
+    fn gdn_state_copy(&self, slot: usize, buf: &DeviceBuffer<u8>, save: bool) -> Result<()> {
+        let (cb, rb) = self.gdn_state_bytes();
+        let (cd, rs) = (self.cfg.conv_dim(), self.cfg.lin_v_heads * self.cfg.lin_dk * self.cfg.lin_dv);
+        for idx in 0..self.conv_state.len() {
+            let (c, r) = (self.conv_state[idx].at(slot * 3 * cd), self.rec_state[idx].at(slot * rs));
+            let (bc, br) = (buf.at(idx * (cb + rb)), buf.at(idx * (cb + rb) + cb));
+            if save {
+                self.stream.memcpy_dtod(bc, c, cb)?;
+                self.stream.memcpy_dtod(br, r, rb)?;
+            } else {
+                self.stream.memcpy_dtod(c, bc, cb)?;
+                self.stream.memcpy_dtod(r, br, rb)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The forward of a pending group's next chunk: its metadata, its hidden states after the last layer, the head.
+    fn group_step(&mut self, segs: &[(usize, &[u32])], logit_rows: &[usize]) -> Result<()> {
+        let slot = segs[0].0;
+        let pos = [self.slot_len[slot]];
+        let mut p = self.prepare_tree(segs, &pos, logit_rows, None, &[], 0)?;
+        p.dec = 0;
+        p.lin_dec = 0;
+        let h = self.cfg.hidden;
+        let g = self.group.as_ref().unwrap();
+        // the last chunk ended on a snapshot point and left its state in place: back to the group's end
+        if g.swapped {
+            self.gdn_state_copy(slot, g.hold.as_ref().unwrap(), false)?;
+        }
+        self.stream.memcpy_dtod(self.sc.x.ptr(), g.x.at(g.row0[g.next] * h), p.rows * h * 2)?;
+        self.enqueue_head(&p)?;
+        // this chunk ends on a snapshot point: its state is the slot's until the next chunk's forward
+        let swap = g.stage[g.next].is_some();
+        if let Some(st) = &g.stage[g.next] {
+            self.gdn_state_copy(slot, g.hold.as_ref().unwrap(), true)?;
+            self.gdn_state_copy(slot, st, false)?;
+        }
+        self.stream.sync()?;
+        self.slot_len[slot] += p.rows;
+        let g = self.group.as_mut().unwrap();
+        g.swapped = swap;
+        g.next += 1;
+        if g.next == g.chunks.len() {
+            self.group = None;
         }
         Ok(())
     }
@@ -2444,7 +2673,7 @@ impl Engine {
         let lc = LinCtx { k, x3: self.w.x3.as_ref(), fp4: self.w.fp4.as_ref().zip(self.fp4_ws.as_ref()), s,
             tmp: self.sc.tmp.ptr(), dec: pr.lin_dec };
         let h = cfg.hidden as u32;
-        let (x, taps) = (self.sc.x.ptr(), self.sc.taps.ptr());
+        let x = self.sc.x.ptr();
         unsafe {
             let (tab, ids) = self.embed_src(pr);
             s.launch(&k.embed, pr.rows as u32, 256, 0, (x, tab, ids, h))?;
@@ -2470,7 +2699,19 @@ impl Engine {
                 }
             }
         }
-        // final norm over every row (the MTP head reads these), then lm_head on the logit rows
+        self.enqueue_head(pr)
+    }
+
+    /// The end of a target forward: the final norm of every row into `taps` (the MTP head reads these), then lm_head
+    /// on the logit rows.
+    fn enqueue_head(&self, pr: &Prepared) -> Result<()> {
+        let cfg = &self.cfg;
+        let s = &self.stream;
+        let k = &self.k;
+        let lc = LinCtx { k, x3: self.w.x3.as_ref(), fp4: self.w.fp4.as_ref().zip(self.fp4_ws.as_ref()), s,
+            tmp: self.sc.tmp.ptr(), dec: pr.lin_dec };
+        let h = cfg.hidden as u32;
+        let (x, taps) = (self.sc.x.ptr(), self.sc.taps.ptr());
         unsafe { s.launch(&k.rmsnorm, pr.rows as u32, 256, 0, (taps, x, self.w.norm.ptr(), h, cfg.eps, h, h))? };
         if pr.n_logits > 0 {
             let sel = self.sc.sel.ptr();

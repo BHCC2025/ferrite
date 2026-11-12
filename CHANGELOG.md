@@ -4,6 +4,25 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-12
+
+### Added
+
+- **Prompt groups on cards that stream their prompt weights** (the RTX 5080 preset, `tools/serve-5080.sh`). A long
+  prompt that is alone on the card runs its chunks layer by layer, so the 16.8 GB of NVFP4/FP8 prompt weights cross
+  the bus once a group instead of once a chunk. The replies are the same text as before, the prompt cache's
+  snapshots inside a group hold the state they would have without it, and a cancelled request stops it between
+  layers. `FE_PROMPT_GROUP=0` turns it
+  off. See [docs/rtx-5080.md](docs/rtx-5080.md).
+  - RTX 5060 Ti 16 GB (4-lane link, 128K context configured): prompt processing goes from about 790 to 1,780
+    tokens per second at 16K, 800 to 1,420 at 56K and 650 to 1,020 at 110K, in the memory that is free anyway. In
+    an agent-style soak the median time to first token of a turn went from 4.9 s to 2.6 s.
+  - RTX 5080: about 8% at 16K, within 1% on longer prompts (its link already keeps up with the computation).
+- **Four requests at once on the RTX 5060 Ti 16 GB** (`SLOTS=4`) checked: the lanes gate passes, 155 tokens per
+  second in total with a 2K shared prefix.
+
+The DGX Spark and Arc Pro B70 engines are unchanged.
+
 ## [0.4.3] - 2026-11-11
 
 ### Changed
@@ -125,6 +144,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.5.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.0
 [0.4.3]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.3
 [0.4.2]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.2
 [0.4.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.1
