@@ -79,3 +79,29 @@ pub fn maxf(a: f32, b: f32) -> f32 {
 pub fn minf(a: f32, b: f32) -> f32 {
     a.min(b)
 }
+
+/// exp(x) from IEEE mul / add / fma only (no MUFU approximation), so the CPU reproduces it bit for bit
+/// (fe-ggq `cpu::exp_det`): 2^t, t = x * log2(e), as 2^n * p(t - n) with Cephes' exp2f polynomial (rel err ~2e-7).
+#[inline(always)]
+pub fn exp_det(x: f32) -> f32 {
+    let t = x * LOG2E;
+    let t = if t > 128.0 { 128.0 } else if t < -150.0 { -150.0 } else { t };
+    let n = (t + 12582912.0) - 12582912.0;
+    let f = t - n;
+    let mut p = 1.535336188319500e-4f32;
+    p = fma(p, f, 1.339887440266574e-3);
+    p = fma(p, f, 9.618437357674640e-3);
+    p = fma(p, f, 5.550332471162809e-2);
+    p = fma(p, f, 2.402264791363012e-1);
+    p = fma(p, f, 6.931472028550421e-1);
+    let r = fma(f, p, 1.0);
+    let ni = n as i32;
+    let n1 = ni / 2;
+    let n2 = ni - n1;
+    r * f32::from_bits(((n1 + 127) as u32) << 23) * f32::from_bits(((n2 + 127) as u32) << 23)
+}
+/// x * sigmoid(x) = x / (1 + exp_det(-x)).
+#[inline(always)]
+pub fn silu_det(x: f32) -> f32 {
+    x / (1.0 + exp_det(-x))
+}

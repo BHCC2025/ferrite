@@ -101,7 +101,7 @@ async fn serve(args: Args) -> Result<()> {
             },
         ))
     } else {
-        if args.engine == "fake" { fake_engine(&args, &tok)? } else if args.engine == "xe" || args.engine == "xe-batch" { xe_engine(&args)? } else { real_engine(&args)? }
+        if args.engine == "fake" { fake_engine(&args, &tok)? } else if args.engine == "fnext" { fnext_engine(&args)? } else if args.engine == "xe" || args.engine == "xe-batch" { xe_engine(&args)? } else { real_engine(&args)? }
     };
     let info = engine.info();
     let cfg = ServerConfig {
@@ -203,6 +203,17 @@ fn xe_engine(args: &Args) -> Result<Arc<dyn Engine>> {
 #[cfg(not(feature = "xe"))]
 fn xe_engine(_: &Args) -> Result<Arc<dyn Engine>> {
     bail!("this fe-server was built without the B70 engine: build with --features xe")
+}
+
+/// `--engine fnext`: Qwen3.8-Flash-Next from GGUF (FNEXT_MODEL, FNEXT_COUNTS, FNEXT_THREADS, FNEXT_MTP ...).
+#[cfg(feature = "fnext")]
+fn fnext_engine(args: &Args) -> Result<Arc<dyn Engine>> {
+    Ok(Arc::new(fe_server::fnext::FnextEngine::start(args.max_model_len)?))
+}
+
+#[cfg(not(feature = "fnext"))]
+fn fnext_engine(_: &Args) -> Result<Arc<dyn Engine>> {
+    bail!("this fe-server was built without Flash-Next: build with --features fnext")
 }
 
 async fn shutdown() {

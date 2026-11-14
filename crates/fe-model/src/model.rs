@@ -1095,6 +1095,20 @@ struct Group {
     swapped: bool,
 }
 
+/// What a prompt group needs to compute a GDN layer's projection of the next chunk beside the current chunk
+/// (Engine::gdn_overlap): a second stream, its own norm output and activation workspace, two output buffers taken in
+/// turn (one is read by the chunk at work while the next chunk's is written), and the events that order the two
+/// streams.
+struct Overlap {
+    s2: Stream,
+    xn: DeviceBuffer<u16>,
+    big: [DeviceBuffer<u16>; 2],
+    ws: fe_fp4::Workspace,
+    /// per chunk: its projection is ready (second stream) / its recurrence is about to start (engine stream)
+    pre: Vec<fe_cuda::Event>,
+    mid: Vec<fe_cuda::Event>,
+}
+
 struct Prepared {
     rows: usize,
     nseg: usize,
@@ -2141,11 +2155,13 @@ impl Engine {
 
     /// Whether the device has room for a group of `rows` rows in `chunks` chunks with `snaps` snapshot points
     /// inside it, beside a reserve: the parked hidden states (2 x hidden bytes a row), a copy of each chunk's
-    /// metadata, and the GDN state at each point and at the group's end.
-    pub fn group_fits(&self, rows: usize, chunks: usize, snaps: usize) -> bool {
+    /// metadata, the GDN state at each point and at the group's end and, with `overlap` where the GDN overlap is
+    /// on, its buffers for chunks of up to `chunk` rows.
+    pub fn group_fits(&self, rows: usize, chunks: usize, snaps: usize, chunk: usize, overlap: bool) -> bool {
         let (cb, rb) = self.gdn_state_bytes();
         let need = rows * 2 * self.cfg.hidden + chunks * self.sc.meta.len() * 4
-            + if snaps > 0 { (snaps + 1) * self.conv_state.len() * (cb + rb) } else { 0 };
+            + if snaps > 0 { (snaps + 1) * self.conv_state.len() * (cb + rb) } else { 0 }
+            + if overlap && self.gdn_overlap_on() { self.gdn_overlap_bytes(chunk) } else { 0 };
         fe_cuda::mem_info().is_ok_and(|(free, _)| need + GROUP_RESERVE <= free)
     }
 
@@ -2212,6 +2228,7 @@ impl Engine {
             prs.push(p);
         }
         let mut stopped = false;
+        let ov = self.gdn_overlap(chunks.len(), chunks.iter().map(|c| c.len()).max().unwrap_or(0));
         {
             let s = &self.stream;
             let ps = self.w.pstream.as_ref();
@@ -2219,13 +2236,33 @@ impl Engine {
                 ps.fetch(0, s)?;
             }
             for (li, layer) in self.w.layers.iter().enumerate() {
+                // a GDN layer with the overlap: chunk c + 1's norm and projection run on the second stream while chunk
+                // c is at work (the chunked GDN kernel leaves SMs idle when its head blocks outnumber them), into a
+                // buffer chunk c + 1 then reads. The same kernels on the same inputs: the bits do not change.
+                let gov = match (&layer.mixer, &ov) {
+                    (Mixer::Gdn { proj, .. }, Some(o)) => Some((proj, o)),
+                    _ => None,
+                };
+                let mut pres: Vec<Option<Vec<(DevPtr, usize)>>> = vec![None; prs.len()];
                 for (c, p) in prs.iter().enumerate() {
                     let lc = LinCtx { k: &self.k, x3: self.w.x3.as_ref(), fp4: self.w.fp4.as_ref().zip(self.fp4_ws.as_ref()), s,
                         tmp: self.sc.tmp.ptr(), dec: p.lin_dec };
                     s.memcpy_dtod(self.sc.meta.ptr(), metas.at(c * ml), ml * 4)?;
                     s.memcpy_dtod(self.sc.x.ptr(), xs.at(row0[c] * h), p.rows * h * 2)?;
-                    self.enqueue_layer(layer, p, &lc, false)?;
+                    if let (Some((_, o)), true) = (gov, pres[c].is_some()) {
+                        s.wait(&o.pre[c])?;
+                    }
+                    let more = gov.filter(|_| c + 1 < prs.len());
+                    self.enqueue_layer(layer, p, &lc, false, pres[c].as_deref(), more.map(|(_, o)| &o.mid[c]))?;
                     s.memcpy_dtod(xs.at(row0[c] * h), self.sc.x.ptr(), p.rows * h * 2)?;
+                    if let Some((proj, o)) = more {
+                        // chunk c + 1's projection starts as chunk c's recurrence does (its head blocks are then
+                        // dispatched first and the projection takes the SMs they leave), into the buffer chunk c
+                        // does not read
+                        o.s2.wait(&o.mid[c])?;
+                        pres[c + 1] = Some(self.gdn_pre(layer, proj, prs[c + 1].rows, o, c + 1, xs.at(row0[c + 1] * h))?);
+                        o.s2.record(&o.pre[c + 1])?;
+                    }
                     if let (Mixer::Gdn { idx, .. }, Some(st)) = (&layer.mixer, &stage[c]) {
                         s.memcpy_dtod(st.at(idx * (cb + rb)), self.conv_state[*idx].at(slot * 3 * cd), cb)?;
                         s.memcpy_dtod(st.at(idx * (cb + rb) + cb), self.rec_state[*idx].at(slot * rs), rb)?;
@@ -2257,6 +2294,55 @@ impl Engine {
         self.group = Some(Group { slot, pos: start, chunks: chunks.iter().map(|c| c.to_vec()).collect(), row0, x: xs, next: 0,
             stage, hold, swapped: false });
         Ok(true)
+    }
+
+    /// The second stream and buffers of a prompt group's GDN overlap, when it pays and fits: the chunked GDN kernel
+    /// launches one block a value head, so with fewer SMs than heads its last wave leaves SMs idle (48 heads on 36
+    /// SMs: a second wave of 12 blocks). FE_GDN_OVERLAP=0 turns it off, =1 forces it.
+    fn gdn_overlap_on(&self) -> bool {
+        let on = match std::env::var("FE_GDN_OVERLAP").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => self.w.sm_count < self.cfg.lin_v_heads as u32,
+        };
+        on && self.w.fp4.is_some() && self.gdn.is_some() && self.tp.is_none()
+    }
+
+    /// The fused GDN projection's row in bf16 values: qkv | z | a | b, padded to the GEMM's tile.
+    fn gdn_proj_cols(&self) -> usize {
+        let cfg = &self.cfg;
+        (cfg.conv_dim() + cfg.lin_v_heads * cfg.lin_dv + 2 * cfg.lin_v_heads).next_multiple_of(256) + 256
+    }
+
+    /// Device bytes of the overlap's buffers for chunks of up to `rows` rows.
+    fn gdn_overlap_bytes(&self, rows: usize) -> usize {
+        let h = self.cfg.hidden;
+        let rp = rows.next_multiple_of(128);
+        rows * h * 2 + 2 * rows * self.gdn_proj_cols() * 2 + rp * h + rp * h / 16
+    }
+
+    fn gdn_overlap(&self, chunks: usize, rows: usize) -> Option<Overlap> {
+        if !self.gdn_overlap_on() || chunks < 2 {
+            return None;
+        }
+        let h = self.cfg.hidden;
+        let cols = self.gdn_proj_cols();
+        let big = || DeviceBuffer::<u16>::alloc(rows * cols).ok();
+        let ev = |n: usize| (0..n).map(|_| fe_cuda::Event::new().ok()).collect::<Option<Vec<_>>>();
+        Some(Overlap { s2: Stream::new().ok()?, xn: DeviceBuffer::<u16>::alloc(rows * h).ok()?, big: [big()?, big()?],
+            ws: fe_fp4::Workspace::new(rows, h).ok()?, pre: ev(chunks)?, mid: ev(chunks)? })
+    }
+
+    /// A GDN layer's input norm and projection of `rows` rows at `x`, on the overlap's stream into its buffer
+    /// `which` (mod 2). Returns the projection's parts for enqueue_layer.
+    fn gdn_pre(&self, layer: &Layer, proj: &Proj, rows: usize, o: &Overlap, which: usize, x: DevPtr) -> Result<Vec<(DevPtr, usize)>> {
+        let (h, h32) = (self.cfg.hidden, self.cfg.hidden as u32);
+        let lc = LinCtx { k: &self.k, x3: self.w.x3.as_ref(), fp4: self.w.fp4.as_ref().zip(Some(&o.ws)), s: &o.s2,
+            tmp: self.sc.tmp.ptr(), dec: 0 };
+        unsafe {
+            o.s2.launch(&self.k.rmsnorm, rows as u32, 256, 0, (o.xn.ptr(), x, layer.in_norm.ptr(), h32, self.cfg.eps, h32, h32))?;
+        }
+        proj.forward(&lc, o.big[which % 2].ptr(), o.xn.ptr(), h, rows)
     }
 
     /// Bytes of one GDN layer's state of a slot: (conv window, recurrent state).
@@ -2690,7 +2776,7 @@ impl Engine {
             if let Some(ps) = ps {
                 ps.fetch(li, s)?;
             }
-            self.enqueue_layer(layer, pr, &lc, hist)?;
+            self.enqueue_layer(layer, pr, &lc, hist, None, None)?;
             if let Some(ps) = ps {
                 ps.release(li, s)?;
             }
@@ -2756,7 +2842,7 @@ impl Engine {
             s.launch(&k.rmsnorm, r32, 256, 0, (cat.add::<u16>(h as usize), xn, m.pre_h.ptr(), h, cfg.eps, h, 2 * h))?;
         }
         m.fc.forward(&lc, x, h as usize, cat, 2 * h as usize, pr.rows, None)?;
-        self.enqueue_layer(&m.layer, pr, &lc, false)?;
+        self.enqueue_layer(&m.layer, pr, &lc, false, None, None)?;
         unsafe { s.launch(&k.rmsnorm, r32, 256, 0, (out, x, m.norm.ptr(), h, cfg.eps, h, h))? };
         if pr.n_logits > 0 {
             let sel = self.sc.sel.ptr();
@@ -2771,7 +2857,11 @@ impl Engine {
     }
 
     /// One decoder layer on the residual stream `x` (pre-norm mixer + residual, pre-norm SwiGLU + residual).
-    fn enqueue_layer(&self, layer: &Layer, pr: &Prepared, lc: &LinCtx, hist: bool) -> Result<()> {
+    /// `pre`: a GDN layer's projection parts when they were computed ahead (Engine::gdn_pre): the input norm and
+    /// the projection are then skipped.
+    /// `mid`: an event recorded right before a GDN layer's recurrence is launched (the overlap starts there).
+    fn enqueue_layer(&self, layer: &Layer, pr: &Prepared, lc: &LinCtx, hist: bool, pre: Option<&[(DevPtr, usize)]>,
+        mid: Option<&fe_cuda::Event>) -> Result<()> {
         let cfg = &self.cfg;
         let rows = pr.rows;
         let nseg = pr.nseg;
@@ -2796,11 +2886,16 @@ impl Engine {
         let attn_smem = 4 * (6 * 256 + 12) * 4;
         let flash_threads = if self.kvq > 0 && flash_prod() { 256u32 } else { 128 };
         let h32 = h as u32;
-        unsafe { s.launch(&k.rmsnorm, r32, 256, 0, (xn, x, layer.in_norm.ptr(), h32, eps, h32, h32))? };
+        if pre.is_none() {
+            unsafe { s.launch(&k.rmsnorm, r32, 256, 0, (xn, x, layer.in_norm.ptr(), h32, eps, h32, h32))? };
+        }
         self.mark("norm");
         match &layer.mixer {
             Mixer::Gdn { proj, conv_w, a_log, dt_bias, norm_w, out, idx } => {
-                let p = proj.forward(lc, big, xn, h, rows)?;
+                let p = match pre {
+                    Some(p) => p.to_vec(),
+                    None => proj.forward(lc, big, xn, h, rows)?,
+                };
                 self.mark("gdn proj");
                 let ((qkv, ldqkv), (z, ldz), (a, lda), (b, ldb)) = (p[0], p[1], p[2], p[3]);
                 ensure!(lda == ldb, "GDN a/b strides differ");
@@ -2841,6 +2936,9 @@ impl Engine {
                     // inside the leading dec rows) take the recurrence (state history / replay, trees), prompt segments
                     // the chunked tensor-core kernel when it is loaded (prompts are never rolled back)
                     let o = self.sc.q.ptr();
+                    if let Some(e) = mid {
+                        s.record(e)?;
+                    }
                     let nd = if self.gdn.is_some() { pr.segs.iter().take_while(|sg| (sg.1 as usize) < pr.dec).count() } else { nseg };
                     if nd > 0 {
                         s.launch(&k.gdn_rec2, (4 * cfg.lin_v_heads as u32, nd as u32), 512, 0,

@@ -1,0 +1,20 @@
+[package]
+name = "fe-fnext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3.8-Flash-Next (qwen4exp MoE, GGUF) on one 16 GB card: placement, forward, check"
+
+[dependencies]
+fe-cuda.workspace = true
+fe-gguf = { path = "../fe-gguf" }
+fe-ggq = { path = "../fe-ggq" }
+anyhow.workspace = true
+memmap2.workspace = true
+serde_json.workspace = true
+rayon = "1"
+libc = "0.2"
+tokenizers.workspace = true
+
+[build-dependencies]
+fe-kbuild.workspace = true

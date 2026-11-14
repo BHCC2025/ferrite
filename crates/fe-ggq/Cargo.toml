@@ -1,0 +1,15 @@
+[package]
+name = "fe-ggq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGUF/ggml quant types: host reference dequant, GPU dequant / GEMV / grouped-expert GEMV / GEMM, AVX2 CPU expert kernels"
+
+[dependencies]
+fe-cuda.workspace = true
+fe-gguf = { path = "../fe-gguf" }
+anyhow.workspace = true
+libc = "0.2"
+
+[build-dependencies]
+fe-kbuild.workspace = true

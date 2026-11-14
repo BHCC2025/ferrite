@@ -12,6 +12,8 @@ An experimental second target serves the same model on one **Intel Arc Pro B70**
 SPIR-V and loaded through Level Zero: see [Intel Arc Pro B70](#intel-arc-pro-b70).
 The same CUDA engine also runs on one **RTX 5080** (16 GB) with a quantized K/V cache and the prompt weights
 streamed from host memory: see [docs/rtx-5080.md](docs/rtx-5080.md).
+A second, experimental engine serves **Qwen3.8-Flash-Next** (the ISTA-DASLab IQ1_M GGUF) on one or two
+**RTX 5060 Ti 16 GB** with the experts mostly in host memory: see [docs/flash-next.md](docs/flash-next.md).
 
 > **Status: experimental.** One model (Qwen3.8-27B), one GPU (GB10 / `sm_121a`). At most 4 requests run at once
 > with DFlash2 drafting; more wait in a queue. It works, but expect rough edges. Issues and measurements from other
@@ -25,6 +27,7 @@ streamed from host memory: see [docs/rtx-5080.md](docs/rtx-5080.md).
 |---|---|---|---|---|
 | NVIDIA DGX Spark, one or two | DGX OS (Ubuntu 24.04) | aarch64 | GB10, NVIDIA driver 580+, CUDA 13 | Prebuilt package, or from source |
 | NVIDIA RTX 5080 (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 595, CUDA 13 toolkit | From source: [docs/rtx-5080.md](docs/rtx-5080.md) |
+| Qwen3.8-Flash-Next on RTX 5060 Ti, one or two (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 595, CUDA 13 toolkit; 32 GB of memory | From source: [docs/flash-next.md](docs/flash-next.md) |
 | Intel Arc Pro B70 (experimental) | Linux with the `xe` kernel driver; tested on Arch Linux | x86_64 | 32 GB, Level Zero loader 1.32+ | From source: [docs/arc-b70.md](docs/arc-b70.md) |
 
 ## Why Ferrite exists

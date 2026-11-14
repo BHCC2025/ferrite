@@ -1,0 +1,10 @@
+[package]
+name = "fe-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGUF reader: header, metadata, tensor infos, multi-shard, mmap'd tensor data"
+
+[dependencies]
+anyhow.workspace = true
+memmap2.workspace = true

@@ -4,6 +4,39 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-14
+
+### Added
+
+- **Qwen3.8-Flash-Next on one or two RTX 5060 Ti 16 GB** (experimental): a second engine in the same server,
+  `fe-server --engine fnext` (build with `--features fnext`), for Qwen's 48-block hybrid MoE in the ISTA-DASLab
+  GSQ-RCO Coder IQ1_M GGUF (58.4 GB), with Rust kernels for its GGUF quant types. The always-used weights, the K/V
+  cache and the GDN state are on the card; the routed experts stay in the memory-mapped GGUF and fill LRU slots on
+  the card, the ones that miss are computed on the CPU; the PLE n-gram table is read a few rows a token. Two cards
+  run in tensor parallel (half the heads and half the experts each). Lossless MTP drafting, several requests at once
+  (up to 8 slots), the prompt cache, 128K context. See [docs/flash-next.md](docs/flash-next.md).
+  - Two cards (EPYC 7313 host, 128K context configured, greedy, 256 tokens): code 135 tok/s and prose 110 with MTP
+    drafting, 75 without; prompt processing 1,434 tok/s at 2K and 2,467 at 16K; four requests at once 194-201 tok/s
+    total on code.
+  - One card inside a 28 GiB memory limit (standing in for a 32 GB machine): code 84-85 tok/s and prose 67 with MTP drafting, 45-46 without; prompt processing 1,340 tok/s at 2K and
+    1,880 at 16K.
+- **`scripts/fetch-flashnext.sh`** downloads the ISTA-DASLab IQ1_M files exactly as published, the MTP draft file
+  and the tokenizer files, checks every size and sha256, and lays them out for **`tools/serve-fnext.sh`**, which
+  picks the one-card or the two-card preset from the visible cards and the request slots from the host memory.
+- **The MTP draft file** (`BHCC2025/Qwen3.8-Flash-Next-MTP-GGUF`, 1.5 GB): Qwen's MTP head, read from the official
+  checkpoint and converted with llama.cpp's converter, as one small GGUF beside the ISTA files (which carry no MTP
+  block). Without it Flash-Next runs without speculative decoding. `FNEXT_DRAFT=<path>` names another one,
+  `FNEXT_DRAFT=none` skips it.
+
+### Changed
+
+- **GDN overlap in prompt groups on the RTX 5060 Ti 16 GB.** The chunked GDN kernel launches one block a value
+  head: 48 blocks, which on 36 SMs is a full wave and a second one of 12. In a prompt group the next chunk's input
+  norm and GDN projection now start on a second stream as the recurrence is launched and take the SMs that wave
+  leaves idle. The same kernels on the same inputs, so the replies are the same text. Prompt processing goes from
+  about 1,890 to 1,940 tokens per second at 16K (128K context configured), 1,470 to 1,510 at 56K and 1,040 to
+  1,070 at 110K. `FE_GDN_OVERLAP=0` turns it off. Cards with 48 SMs or more are unchanged.
+
 ## [0.5.1] - 2026-11-12
 
 ### Changed
@@ -153,6 +186,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.5.2]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.2
 [0.5.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.1
 [0.5.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.0
 [0.4.3]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.3

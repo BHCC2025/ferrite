@@ -6,6 +6,8 @@
 pub mod api;
 pub mod batch;
 pub mod engine;
+#[cfg(feature = "fnext")]
+pub mod fnext;
 #[cfg(feature = "ferrite")]
 pub mod ferrite;
 pub mod mock;

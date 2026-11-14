@@ -98,6 +98,15 @@ impl Context {
     pub fn synchronize(&self) -> Result<()> {
         cu!(cuCtxSynchronize())
     }
+    /// The device ordinal (under CUDA_VISIBLE_DEVICES) this context belongs to.
+    pub fn ordinal(&self) -> i32 {
+        self.dev
+    }
+    /// Copy `bytes` from `src` (memory of context `src_ctx`) to `dst` (memory of this context), ordered on `s`
+    /// (a stream of either context). Without peer access the driver stages through host memory.
+    pub fn copy_peer(&self, dst: DevPtr, src_ctx: &Context, src: DevPtr, bytes: usize, s: &Stream) -> Result<()> {
+        cu!(cuMemcpyPeerAsync(dst.0, self.ctx, src.0, src_ctx.ctx, bytes, s.raw()))
+    }
 }
 impl Drop for Context {
     fn drop(&mut self) {
@@ -306,6 +315,111 @@ pub fn mem_info() -> Result<(usize, usize)> {
     Ok((f, t))
 }
 
+/// A device buffer with a fixed virtual range whose physical memory is mapped on demand ([`VmBuffer::grow`]): the
+/// address never changes (CUDA graphs keep working) while memory is only committed for what is used.
+pub struct VmBuffer {
+    base: CUdeviceptr,
+    reserved: usize,
+    mapped: usize,
+    gran: usize,
+    dev: i32,
+    handles: Vec<(u64, usize)>,
+}
+unsafe impl Send for VmBuffer {}
+unsafe impl Sync for VmBuffer {}
+impl VmBuffer {
+    fn prop(dev: i32) -> CUmemAllocationProp {
+        CUmemAllocationProp {
+            type_: CU_MEM_ALLOCATION_TYPE_PINNED,
+            requested_handle_types: 0,
+            location: CUmemLocation { type_: CU_MEM_LOCATION_TYPE_DEVICE, id: dev },
+            win32_handle_meta_data: std::ptr::null_mut(),
+            compression_type: 0,
+            gpu_direct_rdma_capable: 0,
+            usage: 0,
+            reserved: [0; 4],
+        }
+    }
+    /// Reserve `bytes` of address space (nothing committed).
+    pub fn reserve(bytes: usize, dev: i32) -> Result<VmBuffer> {
+        let prop = Self::prop(dev);
+        let mut gran = 0usize;
+        cu!(cuMemGetAllocationGranularity(&mut gran, &prop, 0))?;
+        let size = bytes.max(1).next_multiple_of(gran);
+        let mut base = 0;
+        cu!(cuMemAddressReserve(&mut base, size, 0, 0, 0))?;
+        Ok(VmBuffer { base, reserved: size, mapped: 0, gran, dev, handles: vec![] })
+    }
+    pub fn ptr(&self) -> DevPtr {
+        DevPtr(self.base)
+    }
+    pub fn mapped(&self) -> usize {
+        self.mapped
+    }
+    pub fn reserved(&self) -> usize {
+        self.reserved
+    }
+    /// Commit (zeroed) memory so that at least `bytes` from the base are backed. Returns the bytes newly mapped.
+    pub fn grow(&mut self, bytes: usize) -> Result<usize> {
+        let want = bytes.min(self.reserved).next_multiple_of(self.gran);
+        if want <= self.mapped {
+            return Ok(0);
+        }
+        let n = want - self.mapped;
+        let prop = Self::prop(self.dev);
+        let mut h = 0u64;
+        cu!(cuMemCreate(&mut h, n, &prop, 0))?;
+        let at = self.base + self.mapped as u64;
+        if let Err(e) = cu!(cuMemMap(at, n, 0, h, 0)) {
+            unsafe { cuMemRelease(h) };
+            return Err(e);
+        }
+        let desc = CUmemAccessDesc {
+            location: CUmemLocation { type_: CU_MEM_LOCATION_TYPE_DEVICE, id: self.dev },
+            flags: CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+        };
+        cu!(cuMemSetAccess(at, n, &desc, 1))?;
+        cu!(cuMemsetD8Async(at, 0, n, std::ptr::null_mut()))?;
+        cu!(cuCtxSynchronize())?;
+        self.handles.push((h, n));
+        self.mapped = want;
+        Ok(n)
+    }
+}
+impl VmBuffer {
+    /// Unmap and release the committed chunks past `bytes` (whole chunks from the end; the device is synced first).
+    /// Returns the bytes released.
+    pub fn shrink(&mut self, bytes: usize) -> Result<usize> {
+        cu!(cuCtxSynchronize())?;
+        let mut freed = 0;
+        while let Some(&(h, n)) = self.handles.last() {
+            if self.mapped - n < bytes {
+                break;
+            }
+            let at = self.base + (self.mapped - n) as u64;
+            cu!(cuMemUnmap(at, n))?;
+            cu!(cuMemRelease(h))?;
+            self.handles.pop();
+            self.mapped -= n;
+            freed += n;
+        }
+        Ok(freed)
+    }
+}
+impl Drop for VmBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let mut off = 0u64;
+            for &(h, n) in &self.handles {
+                cuMemUnmap(self.base + off, n);
+                cuMemRelease(h);
+                off += n as u64;
+            }
+            cuMemAddressFree(self.base, self.reserved);
+        }
+    }
+}
+
 /// Page-locked host memory (cuMemAllocHost), for staging uploads and async readback.
 pub struct HostBuffer<T> {
     ptr: *mut T,
@@ -315,7 +429,16 @@ unsafe impl<T> Send for HostBuffer<T> {}
 impl<T: Copy> HostBuffer<T> {
     pub fn alloc(len: usize) -> Result<Self> {
         let mut p = std::ptr::null_mut();
-        cu!(cuMemAllocHost_v2(&mut p, len.max(1) * std::mem::size_of::<T>()))?;
+        // portable + mapped: one pinned buffer serves every context of the process (FNEXT_GPUS=2 shares the CPU
+        // hand-off buffers between two cards; under unified addressing the device pointer is the host pointer)
+        cu!(cuMemHostAlloc(&mut p, len.max(1) * std::mem::size_of::<T>(), 0x01 | 0x02))?;
+        Ok(HostBuffer { ptr: p as *mut T, len })
+    }
+    /// Portable + mapped + write-combined pinned memory (fast for the device to write and read across PCIe, slow
+    /// for the CPU to read).
+    pub fn alloc_wc(len: usize) -> Result<Self> {
+        let mut p = std::ptr::null_mut();
+        cu!(cuMemHostAlloc(&mut p, len.max(1) * std::mem::size_of::<T>(), 0x01 | 0x02 | 0x04))?;
         Ok(HostBuffer { ptr: p as *mut T, len })
     }
     pub fn as_slice(&self) -> &[T] {
@@ -325,6 +448,13 @@ impl<T: Copy> HostBuffer<T> {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
     pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+    /// The same memory as a device address (pinned memory is mapped under unified addressing).
+    pub fn dev(&self) -> DevPtr {
+        DevPtr(self.ptr as u64)
+    }
+    pub fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr
     }
     pub fn len(&self) -> usize {
@@ -532,6 +662,15 @@ impl Stream {
     pub fn memset_d32(&self, dst: DevPtr, v: u32, n: usize) -> Result<()> {
         cu!(cuMemsetD32Async(dst.0, v, n, self.s))
     }
+    /// Block the stream until the 32-bit word at `addr` (device-visible: device memory or mapped pinned host
+    /// memory) equals `value` (`eq`) or is >= it. Graph-capturable.
+    pub fn wait_value32(&self, addr: DevPtr, value: u32, eq: bool) -> Result<()> {
+        cu!(cuStreamWaitValue32_v2(self.s, addr.0, value, if eq { CU_STREAM_WAIT_VALUE_EQ } else { CU_STREAM_WAIT_VALUE_GEQ }))
+    }
+    /// Write `value` to the 32-bit word at `addr` once the preceding work of the stream is done. Graph-capturable.
+    pub fn write_value32(&self, addr: DevPtr, value: u32) -> Result<()> {
+        cu!(cuStreamWriteValue32_v2(self.s, addr.0, value, 0))
+    }
     pub fn record(&self, e: &Event) -> Result<()> {
         cu!(cuEventRecord(e.e, self.s))
     }
@@ -575,6 +714,12 @@ impl Event {
     pub fn new() -> Result<Event> {
         let mut e = std::ptr::null_mut();
         cu!(cuEventCreate(&mut e, CU_EVENT_DEFAULT))?;
+        Ok(Event { e })
+    }
+    /// An event whose sync blocks the thread (no driver-side spin), without timing.
+    pub fn new_blocking() -> Result<Event> {
+        let mut e = std::ptr::null_mut();
+        cu!(cuEventCreate(&mut e, CU_EVENT_DISABLE_TIMING | CU_EVENT_BLOCKING_SYNC))?;
         Ok(Event { e })
     }
     pub fn new_no_timing() -> Result<Event> {

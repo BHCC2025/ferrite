@@ -24,6 +24,7 @@ fe-model = { workspace = true, optional = true }
 fe-dflash = { path = "../fe-dflash", optional = true }
 fe-xe = { path = "../fe-xe", optional = true }
 fe-xdf = { path = "../fe-xdf", optional = true }
+fe-fnext = { path = "../fe-fnext", optional = true }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = "0.1.19"
 tracing = "0.1.44"
@@ -36,6 +37,8 @@ ferrite = ["dep:fe-cuda", "dep:fe-model", "dep:fe-dflash"]
 # --features xe: the Intel Arc B70 engine (crates/fe-xe) as --engine xe; xe-ref adds arc-engine reference kernels (test only)
 xe = ["dep:fe-xe", "dep:fe-xdf"]
 xe-ref = ["xe", "fe-xe/ref-spv"]
+# --features fnext: Qwen3.8-Flash-Next (GGUF) through crates/fe-fnext as --engine fnext
+fnext = ["dep:fe-fnext"]
 
 [dev-dependencies]
 http-body-util = "0.1"

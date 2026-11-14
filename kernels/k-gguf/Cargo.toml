@@ -1,0 +1,15 @@
+[package]
+name = "k-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ggml quant kernels (GGUF models): dequant, decode GEMV, grouped-expert GEMV, prompt GEMM"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kcommon = { path = "../kcommon" }
+
+[lints]
+workspace = true

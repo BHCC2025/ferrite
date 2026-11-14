@@ -31,11 +31,44 @@ pub const CU_STREAM_DEFAULT: c_uint = 0;
 pub const CU_STREAM_NON_BLOCKING: c_uint = 1;
 pub const CU_EVENT_DEFAULT: c_uint = 0;
 pub const CU_EVENT_DISABLE_TIMING: c_uint = 2;
+pub const CU_EVENT_BLOCKING_SYNC: c_uint = 1;
 pub const CU_STREAM_CAPTURE_MODE_GLOBAL: c_int = 0;
 pub const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
 pub const CU_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
+pub const CU_STREAM_WAIT_VALUE_GEQ: c_uint = 0;
+pub const CU_STREAM_WAIT_VALUE_EQ: c_uint = 1;
 pub const CU_MEMHOSTREGISTER_PORTABLE: c_uint = 1;
 pub const CU_MEMHOSTREGISTER_READ_ONLY: c_uint = 8;
+
+/// CUmemLocation
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CUmemLocation {
+    pub type_: c_int,
+    pub id: c_int,
+}
+/// CUmemAllocationProp (allocFlags flattened: compressionType, gpuDirectRDMACapable, usage, reserved[4])
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CUmemAllocationProp {
+    pub type_: c_int,
+    pub requested_handle_types: c_int,
+    pub location: CUmemLocation,
+    pub win32_handle_meta_data: *mut c_void,
+    pub compression_type: u8,
+    pub gpu_direct_rdma_capable: u8,
+    pub usage: u16,
+    pub reserved: [u8; 4],
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CUmemAccessDesc {
+    pub location: CUmemLocation,
+    pub flags: c_int,
+}
+pub const CU_MEM_ALLOCATION_TYPE_PINNED: c_int = 1;
+pub const CU_MEM_LOCATION_TYPE_DEVICE: c_int = 1;
+pub const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: c_int = 3;
 
 #[link(name = "cuda")]
 unsafe extern "C" {
@@ -56,6 +89,9 @@ unsafe extern "C" {
     pub fn cuMemAlloc_v2(p: *mut CUdeviceptr, bytes: usize) -> CUresult;
     pub fn cuMemFree_v2(p: CUdeviceptr) -> CUresult;
     pub fn cuMemAllocHost_v2(p: *mut *mut c_void, bytes: usize) -> CUresult;
+    pub fn cuMemHostAlloc(p: *mut *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
+    pub fn cuMemcpyPeerAsync(dst: CUdeviceptr, dst_ctx: CUcontext, src: CUdeviceptr, src_ctx: CUcontext, bytes: usize,
+        s: CUstream) -> CUresult;
     pub fn cuMemFreeHost(p: *mut c_void) -> CUresult;
     pub fn cuMemHostRegister_v2(p: *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
     pub fn cuMemHostUnregister(p: *mut c_void) -> CUresult;
@@ -88,6 +124,18 @@ unsafe extern "C" {
     pub fn cuEventSynchronize(e: CUevent) -> CUresult;
     pub fn cuEventQuery(e: CUevent) -> CUresult;
     pub fn cuEventElapsedTime_v2(ms: *mut f32, start: CUevent, end: CUevent) -> CUresult;
+
+    pub fn cuMemAddressReserve(ptr: *mut CUdeviceptr, size: usize, alignment: usize, addr: CUdeviceptr, flags: u64) -> CUresult;
+    pub fn cuMemAddressFree(ptr: CUdeviceptr, size: usize) -> CUresult;
+    pub fn cuMemCreate(handle: *mut u64, size: usize, prop: *const CUmemAllocationProp, flags: u64) -> CUresult;
+    pub fn cuMemRelease(handle: u64) -> CUresult;
+    pub fn cuMemMap(ptr: CUdeviceptr, size: usize, offset: usize, handle: u64, flags: u64) -> CUresult;
+    pub fn cuMemUnmap(ptr: CUdeviceptr, size: usize) -> CUresult;
+    pub fn cuMemSetAccess(ptr: CUdeviceptr, size: usize, desc: *const CUmemAccessDesc, count: usize) -> CUresult;
+    pub fn cuMemGetAllocationGranularity(g: *mut usize, prop: *const CUmemAllocationProp, option: c_int) -> CUresult;
+
+    pub fn cuStreamWaitValue32_v2(s: CUstream, addr: CUdeviceptr, value: c_uint, flags: c_uint) -> CUresult;
+    pub fn cuStreamWriteValue32_v2(s: CUstream, addr: CUdeviceptr, value: c_uint, flags: c_uint) -> CUresult;
 
     pub fn cuGraphInstantiateWithFlags(e: *mut CUgraphExec, g: CUgraph, flags: u64) -> CUresult;
     pub fn cuGraphLaunch(e: CUgraphExec, s: CUstream) -> CUresult;

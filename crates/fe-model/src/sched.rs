@@ -1115,8 +1115,16 @@ impl Worker {
                 }
                 // what fits the device beside its reserve (the parked rows, the state at snapshot points inside)
                 let inside = |ends: &[usize]| ends[..ends.len() - 1].iter().filter(|e| self.cache && a.cuts.binary_search(e).is_ok()).count();
-                while ends.len() > 1 && !self.e.group_fits(ends[ends.len() - 1] - a.fed, ends.len(), inside(&ends)) {
-                    ends.pop();
+                // (with the GDN overlap's buffers where it is on; without them when not even two chunks fit beside)
+                let all = ends.clone();
+                for overlap in [true, false] {
+                    ends = all.clone();
+                    while ends.len() > 1 && !self.e.group_fits(ends[ends.len() - 1] - a.fed, ends.len(), inside(&ends), lim, overlap) {
+                        ends.pop();
+                    }
+                    if ends.len() > 1 {
+                        break;
+                    }
                 }
                 if ends.len() > 1 {
                     let mut from = a.fed;
