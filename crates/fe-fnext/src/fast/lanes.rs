@@ -9,8 +9,74 @@ const K_STEP: usize = 0;
 const K_VERIFY: usize = 1;
 const K_MTP: usize = 2;
 const K_COMMIT: usize = 3;
-/// Batched graphs kept per device before the map is cleared (they are recaptured on demand).
-const MAX_LANE_GRAPHS: usize = 768;
+/// Batched step graphs kept per device (FNEXT_LANE_GRAPHS, default 160): past it the least recently used are
+/// destroyed down to three quarters and recaptured when used again. Every captured graph holds host memory inside
+/// the CUDA driver (~9.7 MiB a graph measured on an RTX 5080 with 4 lanes), and the commit graphs alone have one shape per lane,
+/// row offset and length, so an uncapped cache grew the process by gigabytes over hours of mixed traffic.
+fn max_lane_graphs() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FNEXT_LANE_GRAPHS").ok().and_then(|v| v.parse().ok()).unwrap_or(160).max(16))
+}
+
+/// The batched step graphs of one device by shape key, with a use stamp for LRU eviction.
+#[derive(Default)]
+pub(crate) struct GraphCache {
+    map: std::collections::HashMap<Vec<usize>, (Graph, std::cell::Cell<u64>)>,
+    tick: std::cell::Cell<u64>,
+}
+
+// SAFETY: like Graph (Send + Sync); the stamps are only touched by the engine thread that owns the Fast
+unsafe impl Sync for GraphCache {}
+
+impl GraphCache {
+    pub(crate) fn contains_key(&self, k: &[usize]) -> bool {
+        self.map.contains_key(k)
+    }
+    pub(crate) fn insert(&mut self, k: Vec<usize>, g: Graph) {
+        let t = self.tick.get() + 1;
+        self.tick.set(t);
+        self.map.insert(k, (g, std::cell::Cell::new(t)));
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+    }
+    /// Destroy the least recently used graphs until `keep` are left.
+    pub(crate) fn evict_to(&mut self, keep: usize) {
+        if self.map.len() <= keep {
+            return;
+        }
+        let mut stamps: Vec<(u64, Vec<usize>)> = self.map.iter().map(|(k, v)| (v.1.get(), k.clone())).collect();
+        stamps.sort_unstable();
+        let n = self.map.len() - keep;
+        for (_, k) in stamps.into_iter().take(n) {
+            self.map.remove(&k);
+        }
+    }
+    fn get(&self, k: &[usize]) -> &Graph {
+        let e = self.map.get(k).expect("lane graph captured before use");
+        let t = self.tick.get() + 1;
+        self.tick.set(t);
+        e.1.set(t);
+        &e.0
+    }
+}
+
+impl std::ops::Index<&[usize]> for GraphCache {
+    type Output = Graph;
+    fn index(&self, k: &[usize]) -> &Graph {
+        self.get(k)
+    }
+}
+
+impl std::ops::Index<&Vec<usize>> for GraphCache {
+    type Output = Graph;
+    fn index(&self, k: &Vec<usize>) -> &Graph {
+        self.get(k)
+    }
+}
 
 /// A lane's KV / pooled keys / indexer ring of one attention layer, as raw pointers for a batched step.
 #[derive(Clone, Copy)]
@@ -546,6 +612,17 @@ impl Fast {
         self.lanes.len()
     }
 
+    /// Captured batched-step graphs held, on every device (bounded by MAX_LANE_GRAPHS a device).
+    pub fn n_lane_graphs(&self) -> usize {
+        self.lane_graphs.len() + self.other.as_ref().map_or(0, |o| o.lane_graphs.len())
+    }
+
+    /// Host bytes of lane `i`'s prompt-cache snapshots.
+    pub fn lane_snap_bytes(&self, i: usize) -> usize {
+        let v = if i == self.cur_lane { &self.snaps } else { match self.lanes.get(i) { Some(Some(l)) => &l.snaps, _ => return 0 } };
+        v.iter().map(|s| s.bytes()).sum()
+    }
+
     /// The lane the single-sequence calls (prefill, step, spec_step, snapshots) act on.
     pub fn lane(&self) -> usize {
         self.cur_lane
@@ -634,6 +711,11 @@ pub struct Parked {
 }
 
 impl Parked {
+    /// Host bytes of its KV rows (ordinary heap memory; the snapshots are pinned buffers).
+    pub fn kv_bytes(&self) -> usize {
+        self.kv.len()
+    }
+
     /// Host bytes it holds (KV rows + snapshots).
     pub fn bytes(&self) -> usize {
         self.kv.len() + self.snaps.len() * self.snaps.first().map_or(0, |s| s.bytes())
@@ -697,12 +779,14 @@ impl Fast {
         Ok(made)
     }
 
-    /// Drop the batched graphs of every device once there are many (recaptured when used again).
+    /// Keep at most max_lane_graphs() batched graphs a device: past it the least recently used go (after the
+    /// devices are idle), down to three quarters, so eviction runs rarely; they are recaptured when used again.
     fn bound_lane_graphs(&mut self) -> Result<()> {
-        if self.lane_graphs.len() > MAX_LANE_GRAPHS || self.other.as_ref().is_some_and(|o| o.lane_graphs.len() > MAX_LANE_GRAPHS) {
+        let cap = max_lane_graphs();
+        if self.lane_graphs.len() >= cap || self.other.as_ref().is_some_and(|o| o.lane_graphs.len() >= cap) {
             self.sync_all()?;
             self.each_dev(|f| {
-                f.lane_graphs.clear();
+                f.lane_graphs.evict_to(cap * 3 / 4);
                 Ok(())
             })?;
         }

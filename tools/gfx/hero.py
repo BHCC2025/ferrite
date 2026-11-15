@@ -186,12 +186,12 @@ add('<g filter="url(#glow)">' + "".join(t[1] for t in verts) + "</g>")
 add('<g transform="translate(92,72)">'
     '<circle cx="22" cy="22" r="18" fill="none" stroke="url(#moltenH)" stroke-width="7" filter="url(#glow)"/>'
     '<circle cx="22" cy="22" r="6" fill="#ffd27a" opacity="0.9"/>'
-    '<text x="56" y="38" font-family="Avenir Next" font-weight="800" font-size="46" fill="#fff4ea" letter-spacing="1">ferrite</text>'
+    '<text x="56" y="38" font-family="Inter" font-weight="800" font-size="46" fill="#fff4ea" letter-spacing="1">ferrite</text>'
     '</g>')
 
 
 # ---- headline + hero number (left column) ----
-def glossy(x, y, txt, size, family="Avenir Next", weight=900, anchor="middle", spacing=0):
+def glossy(x, y, txt, size, family="Inter", weight=900, anchor="middle", spacing=0):
     a = (f'x="{x}" y="{y}" font-family="{family}" font-weight="{weight}" font-size="{size}" '
          f'text-anchor="{anchor}" letter-spacing="{spacing}"')
     return (f'<text {a} fill="#ff6a1a" opacity="0.85" filter="url(#blur24)">{txt}</text>'
@@ -201,12 +201,12 @@ def glossy(x, y, txt, size, family="Avenir Next", weight=900, anchor="middle", s
 
 
 LX = 640
-add(f'<text x="{LX}" y="520" font-family="Avenir Next" font-weight="900" font-size="74" text-anchor="middle" '
+add(f'<text x="{LX}" y="520" font-family="Inter" font-weight="900" font-size="74" text-anchor="middle" '
     f'fill="#ffffff" letter-spacing="2" filter="url(#glow)">RUST ALL THE WAY DOWN.</text>')
-add(f'<text x="{LX}" y="574" font-family="Avenir Next" font-weight="700" font-size="30" text-anchor="middle" '
+add(f'<text x="{LX}" y="574" font-family="Inter" font-weight="700" font-size="30" text-anchor="middle" '
     f'fill="#ffd9b8" letter-spacing="6">HOST CODE  ·  GPU KERNELS  ·  SERVER</text>')
-add(glossy(LX + 10, 790, "473 tok/s", 196, family="Avenir Next Condensed", weight=900, spacing=2))
-add(f'<text x="{LX}" y="866" font-family="Avenir Next" font-weight="800" font-size="40" text-anchor="middle" '
+add(glossy(LX + 10, 790, "467 tok/s", 196, family="Inter Display", weight=900, spacing=2))
+add(f'<text x="{LX}" y="866" font-family="Inter" font-weight="800" font-size="40" text-anchor="middle" '
     f'fill="#ffffff" letter-spacing="3">QWEN3.8-27B  ·  4 STREAMS  ·  TWO DGX SPARKS</text>')
 
 # molten pedestal
@@ -217,7 +217,7 @@ add(f'<rect x="{px + 70}" y="{py + 14}" width="{pw - 140}" height="{ph - 28}" rx
 add(f'<rect x="{px + 300}" y="{py + 17}" width="{pw - 600}" height="{ph - 34}" rx="6" fill="#fff4d6" opacity="0.85" filter="url(#blur4)"/>')
 add(f'<rect x="{px}" y="{py + ph + 6}" width="{pw}" height="90" fill="url(#floor)" opacity="0.6"/>')
 
-add(f'<text x="96" y="1032" font-family="Avenir Next" font-weight="800" font-size="34" fill="#ffffff" letter-spacing="1">'
+add(f'<text x="96" y="1032" font-family="Inter" font-weight="800" font-size="34" fill="#ffffff" letter-spacing="1">'
     f'AN OPEN INFERENCE ENGINE FOR NVIDIA DGX SPARK.</text>')
 
 # ---- right: glass benchmark card with neon rust frame ----
@@ -227,37 +227,37 @@ add(f'<rect x="{cx0 - 14}" y="{cy0 - 14}" width="{cw + 28}" height="{ch + 28}" r
 add(f'<rect x="{cx0}" y="{cy0}" width="{cw}" height="{ch}" rx="56" fill="none" stroke="url(#frame)" stroke-width="10" opacity="0.8" filter="url(#blur10)"/>')
 add(f'<rect x="{cx0}" y="{cy0}" width="{cw}" height="{ch}" rx="56" fill="#140907" stroke="url(#frame)" stroke-width="6"/>')
 add(f'<rect x="{cx0 + 18}" y="{cy0 + 18}" width="{cw - 36}" height="{ch - 36}" rx="42" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>')
-add(f'<text x="{cx0 + 52}" y="{cy0 + 92}" font-family="Avenir Next" font-weight="800" font-size="34" fill="#fff4ea">Live on two DGX Sparks</text>')
+add(f'<text x="{cx0 + 52}" y="{cy0 + 92}" font-family="Inter" font-weight="800" font-size="34" fill="#fff4ea">Live on two DGX Sparks</text>')
 add(f'<text x="{cx0 + 52}" y="{cy0 + 132}" font-family="Menlo" font-size="21" fill="#ffb98a">Qwen3.8-27B  EXL3 3.0 bpw  128K ctx</text>')
 add(f'<line x1="{cx0 + 52}" y1="{cy0 + 162}" x2="{cx0 + cw - 52}" y2="{cy0 + 162}" stroke="#ffffff" stroke-opacity="0.12" stroke-width="2"/>')
 
 rows = [
-    ("Code edits, 1 stream", "582", "tok/s", 582),
-    ("Code, 4 streams", "473", "tok/s", 473),
-    ("Code, 1 stream", "273", "tok/s", 273),
-    ("Code, 1 stream @32K", "238", "tok/s", 238),
+    ("Code edits, 1 stream", "564", "tok/s", 564),
+    ("Code, 4 streams", "467", "tok/s", 467),
+    ("Code, 1 stream", "267", "tok/s", 267),
+    ("Code, 1 stream @32K", "230", "tok/s", 230),
     ("Prefill @2K", "3,550", "tok/s", None),
 ]
 y = cy0 + 225
 for label, val, unit, v in rows:
-    add(f'<text x="{cx0 + 52}" y="{y}" font-family="Avenir Next" font-weight="600" font-size="27" fill="#e9d6cc">{label}</text>')
-    add(f'<text x="{cx0 + cw - 52}" y="{y}" font-family="Avenir Next Condensed" font-weight="800" font-size="40" fill="#ffd27a" '
-        f'text-anchor="end">{val}<tspan font-size="22" fill="#ff9a3c" font-family="Avenir Next" font-weight="600"> {unit}</tspan></text>')
+    add(f'<text x="{cx0 + 52}" y="{y}" font-family="Inter" font-weight="600" font-size="27" fill="#e9d6cc">{label}</text>')
+    add(f'<text x="{cx0 + cw - 52}" y="{y}" font-family="Inter Display" font-weight="800" font-size="40" fill="#ffd27a" '
+        f'text-anchor="end">{val}<tspan font-size="22" fill="#ff9a3c" font-family="Inter" font-weight="600"> {unit}</tspan></text>')
     if v is not None:
-        bw = (cw - 104) * v / 582
+        bw = (cw - 104) * v / 564
         add(f'<rect x="{cx0 + 52}" y="{y + 18}" width="{cw - 104}" height="10" rx="5" fill="#ffffff" opacity="0.07"/>')
         add(f'<rect x="{cx0 + 52}" y="{y + 18}" width="{bw:.0f}" height="10" rx="5" fill="url(#bar)" filter="url(#glow)"/>')
     y += 96
 
 add(f'<line x1="{cx0 + 52}" y1="{y - 40}" x2="{cx0 + cw - 52}" y2="{y - 40}" stroke="#ffffff" stroke-opacity="0.12" stroke-width="2"/>')
-add(f'<text x="{cx0 + 52}" y="{y + 18}" font-family="Avenir Next" font-weight="600" font-size="27" fill="#e9d6cc">KL vs BF16 (code)</text>')
-add(f'<text x="{cx0 + cw - 52}" y="{y + 18}" font-family="Avenir Next Condensed" font-weight="800" font-size="40" fill="#ffd27a" text-anchor="end">0.021</text>')
-add(f'<text x="{cx0 + 52}" y="{y + 70}" font-family="Avenir Next" font-weight="600" font-size="27" fill="#e9d6cc">Lossless speculation</text>')
-add(f'<text x="{cx0 + cw - 52}" y="{y + 70}" font-family="Avenir Next" font-weight="800" font-size="27" fill="#ffd27a" text-anchor="end">DFlash2 + copy</text>')
+add(f'<text x="{cx0 + 52}" y="{y + 18}" font-family="Inter" font-weight="600" font-size="27" fill="#e9d6cc">KL vs BF16 (code)</text>')
+add(f'<text x="{cx0 + cw - 52}" y="{y + 18}" font-family="Inter Display" font-weight="800" font-size="40" fill="#ffd27a" text-anchor="end">0.021</text>')
+add(f'<text x="{cx0 + 52}" y="{y + 70}" font-family="Inter" font-weight="600" font-size="27" fill="#e9d6cc">Lossless speculation</text>')
+add(f'<text x="{cx0 + cw - 52}" y="{y + 70}" font-family="Inter" font-weight="800" font-size="27" fill="#ffd27a" text-anchor="end">DFlash2 + copy</text>')
 add(f'<text x="{cx0 + cw / 2}" y="{cy0 + ch - 44}" font-family="Menlo" font-size="18" fill="#a98b80" text-anchor="middle">'
     f'greedy decoding · medians of 3-5 runs · Nov 2026</text>')
 
-add(f'<text x="1840" y="1040" font-family="Avenir Next" font-weight="600" font-size="22" fill="#cdb2a6" text-anchor="end">'
+add(f'<text x="1840" y="1040" font-family="Inter" font-weight="600" font-size="22" fill="#cdb2a6" text-anchor="end">'
     f'built on exllamav3 \u00b7 TensorFold \u00b7 DFlash2 \u00b7 Qwen3.8</text>')
 add('</svg>')
 from gfxlib import finish

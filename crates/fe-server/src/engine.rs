@@ -239,4 +239,16 @@ pub trait Engine: Send + Sync + 'static {
     /// Start generating for `req`; must return quickly (do the work on engine threads).
     /// Results go to `sink`: zero or more `send_tokens`, then exactly one `finish`.
     fn submit(&self, req: GenRequest, sink: TokenSink);
+
+    /// Some(reason) once the engine can no longer serve (its thread panicked, a TP2 peer is gone): `/health` then
+    /// fails with the reason and the server exits non-zero, so a supervisor restarts it.
+    fn dead(&self) -> Option<String> {
+        None
+    }
+
+    /// Positions of the context a prompt may not use (the engine keeps them for its own rows): a prompt of
+    /// `max_context - prompt_reserve()` tokens or more is rejected up front with a 400.
+    fn prompt_reserve(&self) -> usize {
+        0
+    }
 }

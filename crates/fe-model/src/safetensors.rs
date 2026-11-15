@@ -34,6 +34,9 @@ pub struct SafeTensors {
 
 const STAGE: usize = 64 << 20;
 
+/// What to do about a missing or short checkpoint file.
+const DAMAGED: &str = "the model folder is incomplete or damaged: check it with scripts/fetch-models.sh --verify-only";
+
 impl SafeTensors {
     pub fn open_dir(dir: &Path) -> Result<SafeTensors> {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -48,10 +51,10 @@ impl SafeTensors {
         for (fi, p) in paths.into_iter().enumerate() {
             let f = File::open(&p).with_context(|| format!("open {p:?}"))?;
             let mut n8 = [0u8; 8];
-            f.read_exact_at(&mut n8, 0)?;
+            f.read_exact_at(&mut n8, 0).with_context(|| format!("reading {p:?}: {DAMAGED}"))?;
             let n = u64::from_le_bytes(n8) as usize;
             let mut hb = vec![0u8; n];
-            f.read_exact_at(&mut hb, 8)?;
+            f.read_exact_at(&mut hb, 8).with_context(|| format!("reading {p:?}: {DAMAGED}"))?;
             let h: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&hb)?;
             for (k, v) in h {
                 if k == "__metadata__" {
@@ -84,7 +87,8 @@ impl SafeTensors {
         while done < t.bytes {
             let n = (t.bytes - done).min(STAGE);
             let buf = &mut self.staging.as_mut_slice()[..n];
-            f.read_exact_at(buf, t.offset + done as u64).with_context(|| format!("reading {name}"))?;
+            f.read_exact_at(buf, t.offset + done as u64)
+                .with_context(|| format!("reading {name} from {:?}: {DAMAGED}", self.files[t.file].0))?;
             memcpy_htod(dst.byte_add(done), &buf[..n])?;
             done += n;
         }
@@ -96,7 +100,8 @@ impl SafeTensors {
     pub fn read_host(&self, name: &str) -> Result<Vec<u8>> {
         let t = self.get(name)?;
         let mut v = vec![0u8; t.bytes];
-        self.files[t.file].1.read_exact_at(&mut v, t.offset)?;
+        self.files[t.file].1.read_exact_at(&mut v, t.offset)
+            .with_context(|| format!("reading {name} from {:?}: {DAMAGED}", self.files[t.file].0))?;
         Ok(v)
     }
 

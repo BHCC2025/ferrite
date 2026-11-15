@@ -86,7 +86,6 @@ fn cmd_generate_spec(model: &Path, prompt: &str, max_new: usize, depth: usize) -
         let draw: Vec<usize> = if last { vec![rows.len() - 1] } else { vec![] };
         let d = e.mtp_forward(&rows, &draw)?;
         if last {
-            done = end;
             let pf = t0.elapsed().as_secs_f64();
             eprintln!("prompt {n} tokens, prefill + absorb {pf:.2}s");
             let t = Instant::now();
@@ -924,6 +923,10 @@ fn cmd_gemm_bench() -> Result<()> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V" | "version")) {
+        println!("ferrite {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("selftest") {
         let ctx = Context::new(0)?;
         let (maj, min) = ctx.compute_capability()?;

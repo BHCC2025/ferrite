@@ -1210,6 +1210,8 @@ pub struct MtpRow {
 
 /// device memory below which the captured graphs are dropped before another is captured
 const GRAPH_MIN_FREE: usize = 192 << 20;
+/// captured graphs kept by default (FE_GRAPH_MAX)
+const GRAPH_MAX: usize = 128;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct GraphKey {
@@ -1302,8 +1304,13 @@ pub struct Engine {
     park: Option<ParkMem>,
     /// prompt cache block layout on rank 0 (cache_pool): (state blocks, bytes a state block, KV blocks)
     park_layout: Option<(usize, usize, usize)>,
-    /// captured graphs for batches made only of short segments (FE_GRAPHS=0 disables)
-    graphs: std::collections::HashMap<GraphKey, fe_cuda::Graph>,
+    /// captured graphs for batches made only of short segments (FE_GRAPHS=0 disables), with their last use
+    graphs: std::collections::HashMap<GraphKey, (fe_cuda::Graph, u64)>,
+    graph_tick: u64,
+    /// FE_GRAPH_MAX: graphs kept (least recently used dropped first). Mixed traffic makes new batch shapes without
+    /// end (segment lengths x attention splits x trees); on a device with plenty of free memory nothing else bounds
+    /// them, and each instantiated graph holds host memory (the server's RSS grew by GBs an hour)
+    graph_max: usize,
     pub use_graphs: bool,
     /// tensor parallel state (crate::tp), attached after construction
     pub tp: Option<crate::tp::Tp>,
@@ -1465,7 +1472,8 @@ impl Engine {
             conv_state, rec_state, conv_hist,
             rec_hist, hist_rows, hist_cap, rope, sc, logits, max_logit_rows, argmax_out, fp4_ws,
             tree_path_host: fe_cuda::HostBuffer::alloc(32)?, tree_path: DeviceBuffer::alloc(32)?,
-            gather_host: fe_cuda::HostBuffer::alloc(2 * GATHER_MAX)?, gather_tab: DeviceBuffer::alloc(2 * GATHER_MAX)?, fp4_act, gdn, replay, feat: None, mid: None, park: None, park_layout: None, graphs: Default::default(),
+            gather_host: fe_cuda::HostBuffer::alloc(2 * GATHER_MAX)?, gather_tab: DeviceBuffer::alloc(2 * GATHER_MAX)?, fp4_act, gdn, replay, feat: None, mid: None, park: None, park_layout: None, graphs: Default::default(), graph_tick: 0,
+            graph_max: std::env::var("FE_GRAPH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(GRAPH_MAX).max(1),
             use_graphs: std::env::var("FE_GRAPHS").map(|v| v != "0").unwrap_or(true), tp: None })
     }
 
@@ -2543,12 +2551,16 @@ impl Engine {
                 if !self.graphs.is_empty() && fe_cuda::mem_info().is_ok_and(|(free, _)| free < GRAPH_MIN_FREE) {
                     self.graphs.clear();
                 }
+                while self.graphs.len() >= self.graph_max {
+                    let Some(old) = self.graphs.iter().min_by_key(|(_, g)| g.1).map(|(k, _)| k.clone()) else { break };
+                    self.graphs.remove(&old);
+                }
                 self.stream.begin_capture()?;
                 let r = f(self, p);
                 let g = self.stream.end_capture();
                 r?;
                 match g {
-                    Ok(g) => { self.graphs.insert(key.clone(), g); }
+                    Ok(g) => { self.graphs.insert(key.clone(), (g, 0)); }
                     Err(_) => {
                         self.graphs.clear();
                         f(self, p)?;
@@ -2557,7 +2569,10 @@ impl Engine {
                     }
                 }
             }
-            self.graphs[&key].launch(&self.stream)?;
+            self.graph_tick += 1;
+            let g = self.graphs.get_mut(&key).expect("captured above");
+            g.1 = self.graph_tick;
+            g.0.launch(&self.stream)?;
         } else {
             f(self, p)?;
         }
@@ -3099,9 +3114,15 @@ impl Engine {
 
     /// Copy logits rows [0, n) to host as bf16 bits.
     pub fn logits_host(&self, n: usize, dst: &mut [u16]) -> Result<()> {
+        self.logits_host_rows(0, n, dst)
+    }
+
+    /// Copy logits rows [first, first + n) to the start of `dst` as bf16 bits.
+    pub fn logits_host_rows(&self, first: usize, n: usize, dst: &mut [u16]) -> Result<()> {
         let v = self.cfg.vocab;
-        assert!(dst.len() >= n * v);
-        fe_cuda::memcpy_dtoh(&mut dst[..n * v], self.logits.ptr())?;
+        ensure!(dst.len() >= n * v, "logits_host: {n} rows do not fit a {}-row host buffer", dst.len() / v);
+        ensure!((first + n) * v <= self.logits.len(), "logits_host: rows {first}..{} past the logits buffer", first + n);
+        fe_cuda::memcpy_dtoh(&mut dst[..n * v], self.logits.ptr().add::<u16>(first * v))?;
         Ok(())
     }
 }

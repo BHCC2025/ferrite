@@ -15,9 +15,9 @@ streamed from host memory: see [docs/rtx-5080.md](docs/rtx-5080.md).
 A second, experimental engine serves **Qwen3.8-Flash-Next** (the ISTA-DASLab IQ1_M GGUF) on one or two
 **RTX 5060 Ti 16 GB** with the experts mostly in host memory: see [docs/flash-next.md](docs/flash-next.md).
 
-> **Status: experimental.** One model (Qwen3.8-27B), one GPU (GB10 / `sm_121a`). At most 4 requests run at once
-> with DFlash2 drafting; more wait in a queue. It works, but expect rough edges. Issues and measurements from other
-> Sparks are welcome.
+> **Status: experimental.** Qwen3.8-27B on DGX Spark (the main target), RTX 5080 / 5060 Ti and Arc B70, and
+> Qwen3.8-Flash-Next on RTX 5060 Ti. At most 4 requests run at once; more wait in a queue. It works, but expect rough
+> edges. Issues and measurements from other machines are welcome.
 
 ## Supported systems
 
@@ -26,8 +26,8 @@ A second, experimental engine serves **Qwen3.8-Flash-Next** (the ISTA-DASLab IQ1
 | Target | Operating system | CPU | GPU and driver | How you get it |
 |---|---|---|---|---|
 | NVIDIA DGX Spark, one or two | DGX OS (Ubuntu 24.04) | aarch64 | GB10, NVIDIA driver 580+, CUDA 13 | Prebuilt package, or from source |
-| NVIDIA RTX 5080 (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 595, CUDA 13 toolkit | From source: [docs/rtx-5080.md](docs/rtx-5080.md) |
-| Qwen3.8-Flash-Next on RTX 5060 Ti, one or two (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 595, CUDA 13 toolkit; 32 GB of memory | From source: [docs/flash-next.md](docs/flash-next.md) |
+| NVIDIA RTX 5080 or RTX 5060 Ti 16 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas` and cuBLASLt | From source: [docs/rtx-5080.md](docs/rtx-5080.md) |
+| Qwen3.8-Flash-Next on RTX 5060 Ti, one or two (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas`; 32 GB of memory | From source: [docs/flash-next.md](docs/flash-next.md) |
 | Intel Arc Pro B70 (experimental) | Linux with the `xe` kernel driver; tested on Arch Linux | x86_64 | 32 GB, Level Zero loader 1.32+ | From source: [docs/arc-b70.md](docs/arc-b70.md) |
 
 ## Why Ferrite exists
@@ -39,24 +39,27 @@ engine that serves many models, use TensorFold. Ferrite is a focused, single-mod
 
 ## Results
 
-Two DGX Sparks connected over RoCE, Qwen3.8-27B, greedy decoding, fixed prompts. Medians of 3-5 runs, in tokens per
-second. Generation figures are tokens per second while generating; prompt processing is listed separately. End-to-end
+Two DGX Sparks connected over RoCE, Qwen3.8-27B, `tools/serve-tp2.sh` defaults, greedy decoding, fixed prompts.
+Medians of 3-5 runs, in tokens per second (measured 2026-11-15, Ferrite 0.6.1). Generation figures are tokens per second while generating; prompt processing is listed separately. End-to-end
 figures that include the time to the first token are in [docs/benchmarks.md](docs/benchmarks.md#results).
 
 | | Ferrite |
 |---|---|
-| Code, 4 requests (aggregate) | 473 |
-| Code, 1 request | 273 |
-| Code, 1 request, 32K context | 238 |
-| Code edits, 1 request (rewrite a file it was shown) | 582 |
-| Code edits, 4 requests (aggregate) | 481 |
-| Prose, 1 request | 76 |
+| Code, 4 requests (aggregate) | 467 |
+| Code, 1 request | 267 |
+| Code, 1 request, 32K context | 230 |
+| Code edits, 1 request (rewrite a file it was shown) | 564 |
+| Code edits, 4 requests (aggregate) | 472 |
+| Prose, 1 request | 74 |
 | Prompt processing, 2K / 32K context | ~3,550 / ~2,800 |
 | KL divergence vs BF16 (code / text / 16K context), lower is better | 0.021 / 0.040 / 0.024 |
 
 <p align="center"><img src="docs/assets/ferrite-bench.png" alt="Ferrite speed by context length" width="100%"></p>
 
-How these were measured, and what they leave out, is in [docs/benchmarks.md](docs/benchmarks.md). In short:
+How these were measured, and what they leave out, is in [docs/benchmarks.md](docs/benchmarks.md). To reproduce the
+table on your own two Sparks, start the server (`tools/serve-tp2.sh`) and run
+`python3 tools/bench/sweep.py --url http://127.0.0.1:8000/v1 --out sweep` (about 20 minutes); `tools/bench/sweep.sh`
+does both. In short:
 - Speculative decoding speed depends on the text. Code and edits are faster than prose.
 - The prose figure counts only replies that don't fall into echoing the prompt, which the standard benchmark prose
   prompt tends to cause.
@@ -70,18 +73,18 @@ reply is the same, token for token, as one computed in full. The cache is on by 
 Its pool is 12 GB on one Spark and 24 GB on each of two (`FERRITE_PARK_GB` overrides), and it shrinks if needed to keep
 20 GB of memory available.
 
-Four agents at once on two Sparks, sharing a ~13K-token system prompt (`tools/bench/agents.py`, 2-3 turns each),
-with the cache on instead of off:
-- prompt tokens computed: 74% fewer (86% fewer with thinking on);
-- time to the first token on the first turn: 16.4 s to 5.1 s; on later turns about 0.4-0.6 s;
-- combined output over the run: 46.5 to 92 tok/s (thinking on: 36.9 to 108 tok/s).
+Four agents at once on two Sparks, sharing a ~13K-token system prompt (`tools/bench/agents.py --agents 4`, 2-3 turns
+each), with the cache on instead of off (`FERRITE_CACHE=0`):
+- prompt tokens computed: 84% fewer (86% fewer with thinking on);
+- time to the first token on the first turn: 14.7 s to 5.0 s; on later turns about 0.4-1.0 s instead of 10 s;
+- combined output over the run: 33.8 to 101 tok/s (thinking on: 41.1 to 113 tok/s).
 
 How it works and its limits: [docs/prompt-cache.md](docs/prompt-cache.md).
 
 ## Quick start
 
-Requirements: a DGX Spark (GB10) with DGX OS, NVIDIA driver 580+, at least 95 GB of available memory and 38 GB of
-disk.
+Requirements: a DGX Spark (GB10) with DGX OS, NVIDIA driver 580+, at least 95 GB of available memory and 45 GB of
+free disk (about 38 GB of it for the models).
 
 **One command**, from a fresh Spark to a running server. It checks the machine first, needs no `sudo`, and can be run
 again (finished steps are skipped):
@@ -90,9 +93,14 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It installs Ferrite into `~/ferrite` (`FERRITE_HOME`) and the models into `/var/tmp/models` (`FERRITE_MODELS`), starts
-the server in the background (log `~/ferrite/logs/server.log`, stop with `kill -- -$(cat ~/ferrite/logs/server.pid)`) and sends it a test
-request. `--no-serve` stops after the models, `--source` builds from source.
+It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.6.0` pins one) and the models into
+`/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
+stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the
+models, and `--source` builds from source. Run again over an older release, the same command upgrades it.
+
+> **Network access.** Every Ferrite launcher listens on all interfaces (`0.0.0.0`) by default, so other machines on
+> your local network (a laptop running a coding agent, say) can use the server. There is no API key: use it on a
+> trusted network or firewall the port. `FERRITE_HOST=127.0.0.1` keeps a server on its own machine.
 
 > **Install with your AI agent.** Paste this into your coding agent on the Spark:
 >
@@ -109,10 +117,12 @@ scripts/check-deps.sh
 export FERRITE_MODELS=$HOME/models
 scripts/fetch-models.sh
 
-# 3. serve an OpenAI-compatible API on :8000 (model id "qwen3.8-27b")
-scripts/serve.sh
+# 3. serve an OpenAI-compatible API on :8000 (model id "qwen3.8-27b"), in the foreground (Ctrl-C stops it)
+scripts/serve.sh                      # or in the background: scripts/ferritectl.sh start | status | log | stop
 curl -s localhost:8000/v1/models
 ```
+
+The release tarball holds the binaries, every launcher, the benchmark clients (`tools/bench`) and all of `docs/`.
 
 Point any OpenAI-compatible client at `http://<spark>:8000/v1`: Open WebUI, Continue, Cline and other coding agents.
 Details, the two-Spark setup and troubleshooting are in [docs/quickstart.md](docs/quickstart.md) and [TP2.md](TP2.md).
@@ -138,7 +148,10 @@ Everything has a default; set only what differs on your machines. `tools/site.sh
 | `FERRITE_MODELS` | `/var/tmp/models` | Folder holding the three model folders |
 | `FERRITE_EXL3_DIR` / `FERRITE_NVFP4_DIR` / `FERRITE_DRAFT_DIR` | under `$FERRITE_MODELS` | Each model folder, if stored elsewhere |
 | `FERRITE_MODEL_ID` | `qwen3.8-27b` | Model id the API reports |
+| `FERRITE_HOST` | `0.0.0.0` | Listen address of every launcher; `127.0.0.1` keeps the server on its machine (there is no API key) |
 | `FERRITE_PORT`, `FERRITE_CTX`, `FERRITE_SLOTS` | `8000`, `131072`, `4` | Port, context per request, requests at once (at most 4 with DFlash2) |
+| `FERRITE_GPU_LOCK` | `/var/tmp/ferrite-gpu.lock` | The node's GPU lock: a server holds it shared, plus its own card's lock (`ferrite-gpu.<card UUID>.lock`) exclusively, so servers on different cards run side by side |
+| `FERRITE_LOCK_WAIT`, `FERRITE_FORCE` | `0`, `0` | `1`: wait for a held GPU lock instead of stopping; start despite a failed memory or model-file check |
 | `FERRITE_STATE_DIR` | `/var/tmp/ferrite` | Logs, run files and locks |
 | `FERRITE_PEER` | none | Second Spark's ssh host (required in two-node mode) |
 | `FERRITE_FABRIC` | unset | `auto` detects the RoCE devices, interface and GID shared with the peer; the two-node scripts do this whenever `FERRITE_TP_HOST` is unset |
@@ -152,14 +165,17 @@ Ferrite also runs on a single Intel Arc Pro B70 (32 GB): the same model and serv
 
 | | Ferrite on one Arc Pro B70 |
 |---|---|
-| Code, 2K / 32K context | 124 / 111 |
-| Prose | 79 |
-| Code edits | 201-244 |
-| Prompt processing, 2K / 32K / ~120K context | ~2,090 / ~2,060 / ~1,490 |
-| KL divergence vs BF16 (code / prose / 16K context) | 0.006 / 0.011 / 0.006 |
+| Code, 2K / 32K context | 170 / 136 |
+| Prose, 2K context (clean replies) | 66 |
+| Code edits | 176-257 |
+| Prompt processing, 2K / 32K / ~120K context | ~2,130 / ~2,030 / ~1,490 |
+| KL divergence vs BF16 (code / prose / 16K context) | 0.0061 / 0.0114 / 0.0055 |
+
+How each row is measured and how to reproduce it: [docs/arc-b70.md](docs/arc-b70.md#results).
 
 ```bash
 cargo build --release --features xe -p fe-server
+export FERRITE_MODELS=$HOME/models        # a disk with 36 GB free: the default /var/tmp/models is often the root disk
 scripts/fetch-models.sh xq draft && scripts/serve-xe.sh
 ```
 
@@ -174,10 +190,13 @@ MTP head with copy rows. It is experimental and built from source:
 
 ```bash
 FE_KARCH=sm_120a cargo build --release -p fe-server --features ferrite -p fe-cli
+export FERRITE_MODELS=$HOME/models
 scripts/fetch-models.sh quant prompt && tools/serve-5080.sh
 ```
 
-Requirements, settings, results and how it fits: [docs/rtx-5080.md](docs/rtx-5080.md).
+The context is sized to the card's free memory when the server starts: 128K on an otherwise empty card, less (it
+says how much) when a desktop holds part of it. An RTX 5060 Ti 16 GB runs the same build and launcher. Requirements,
+settings, results and how it fits: [docs/rtx-5080.md](docs/rtx-5080.md).
 
 ## How it gets its speed
 
@@ -206,10 +225,12 @@ device compiler and the Level Zero loader. The full ledger, with reasons and rep
 ## Building from source
 
 Needs stable Rust 1.99+, the kernels' pinned nightly (`nightly-2026-11-04`, in `kernels/rust-toolchain.toml`) with
-`rust-src`, `llvm-tools` and `llvm-bitcode-linker` for the `nvptx64-nvidia-cuda` target, and CUDA 13's `ptxas`.
-`scripts/check-deps.sh --build --install` checks them and installs the Rust toolchains; then
-`cargo build --release -p fe-server --features ferrite -p fe-cli`. See
-[docs/quickstart.md](docs/quickstart.md#build-from-source). The Intel Arc build needs neither CUDA nor `ptxas`; its
+`rust-src`, `llvm-tools` and `llvm-bitcode-linker` for the `nvptx64-nvidia-cuda` target, CUDA 13's `ptxas` and, for
+the 27B engine, cuBLASLt. A clean Ubuntu also needs `curl ca-certificates git build-essential python3 python3-venv`;
+[docs/quickstart.md](docs/quickstart.md#clean-machine) has the commands, including NVIDIA's repository for `ptxas`
+(`cuda-nvcc-13-x`, no full toolkit) and the `FE_KARCH` of each card. `scripts/check-deps.sh --build --install`
+checks them and installs the Rust toolchains; then `cargo build --release -p fe-server --features ferrite -p fe-cli`.
+See [docs/quickstart.md](docs/quickstart.md#build-from-source). The Intel Arc build needs neither CUDA nor `ptxas`; its
 tools are listed in [docs/arc-b70.md](docs/arc-b70.md#requirements).
 
 ## Credits

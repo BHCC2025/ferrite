@@ -11,6 +11,18 @@ pub mod plan;
 
 pub static K_FNEXT_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/k_fnext.cubin"));
 
+/// The GPU architecture this crate's kernels (k-fnext, and k-gguf through fe-ggq) were built for (`FE_KARCH`).
+pub const KARCH: &str = env!("FE_KARCH_BUILT");
+
+/// The CUDA driver error type (its `code` 2 is CUDA_ERROR_OUT_OF_MEMORY), for callers without a fe-cuda dependency.
+pub use fe_cuda::CuError;
+
+/// Fail fast (before any weight is read) when the first two visible cards cannot run this build's kernels; the
+/// message names the rebuild command.
+pub fn check_arch() -> Result<(), String> {
+    fe_cuda::check_arch(KARCH, Some(2), "cargo build --release -p fe-server --features fnext")
+}
+
 /// Open the model: the trunk GGUF (any shard of a split; the ISTA-DASLab IQ1_M files as published) plus the MTP draft
 /// head when there is one. The draft is a separate single-file GGUF (`blk.<n_layer>.*`, `nextn_predict_layers` >= 1):
 /// FNEXT_DRAFT=<path>, or found next to the model (the only `*.gguf` in its folder that is not one of its shards and

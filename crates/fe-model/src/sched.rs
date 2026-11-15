@@ -201,15 +201,28 @@ pub struct Scheduler {
     max_batch: usize,
     max_ctx: usize,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// why the engine thread stopped serving (a panic, a TP2 peer lost, repeated step failures); None while it serves
+    dead: Arc<std::sync::Mutex<Option<String>>>,
+    step_t0: Arc<std::sync::atomic::AtomicU64>,
+    step_timeout: u64,
+    /// speculative depth: a prompt needs len + 1 + spec <= the context (admit)
+    spec: usize,
 }
+
+/// Consecutive failed steps after which the engine counts as broken (a sticky CUDA error fails every step).
+const STEP_FAILS_FATAL: usize = 3;
 
 impl Scheduler {
     /// Load the model on a new engine thread; returns once it is ready.
     pub fn start(model_dir: &Path, opts: SchedOptions) -> Result<Scheduler> {
         let (tx, rx) = mpsc::channel::<Cmd>();
-        let (rtx, rrx) = mpsc::channel::<Result<usize>>();
+        let (rtx, rrx) = mpsc::channel::<Result<(usize, usize)>>();
         let dir: PathBuf = model_dir.to_path_buf();
         let o = opts.clone();
+        let dead = Arc::new(std::sync::Mutex::new(None::<String>));
+        let dead_t = dead.clone();
+        let step_t0 = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let step_t0_w = step_t0.clone();
         let thread = std::thread::Builder::new().name("ferrite-engine".into()).spawn(move || {
             let built = (|| -> Result<(Arc<fe_cuda::Context>, Engine)> {
                 // whole model, or TP rank 0 (FE_TP_*: rank 1 runs `ferrite <model> follow`)
@@ -234,6 +247,7 @@ impl Scheduler {
                         None => None,
                     };
                     let mut w = Worker::new(e, o);
+                    w.step_t0 = step_t0_w;
                     w.df = df;
                     if let Err(err) = w.cache_init() {
                         let _ = rtx.send(Err(err));
@@ -242,16 +256,44 @@ impl Scheduler {
                     // requests it decodes at once: every slot, but with the block drafter alone (no MTP head to fall
                     // back on) one draft pass serves DF_PASS_STREAMS streams
                     let batch = if w.df.is_some() && !w.e.has_mtp() { w.o.n_slots.min(DF_PASS_STREAMS) } else { w.o.n_slots };
-                    let _ = rtx.send(Ok(batch));
-                    w.run(rx);
+                    let _ = rtx.send(Ok((batch, w.spec)));
+                    // a panic must not leave a server that accepts requests for an engine that is gone: record why
+                    // (Scheduler::dead), so the server can report it and exit
+                    let why = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || w.run(rx))) {
+                        Ok(why) => why,
+                        Err(p) => Some(format!("engine thread panicked: {}", p.downcast_ref::<&str>().map(|s| s.to_string())
+                            .or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into()))),
+                    };
+                    if let Some(why) = why {
+                        eprintln!("ferrite: the engine stopped: {why}");
+                        *dead_t.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+                    }
                 }
                 Err(err) => {
                     let _ = rtx.send(Err(err));
                 }
             }
         })?;
-        let max_batch = rrx.recv()??;
-        Ok(Scheduler { tx, max_batch, max_ctx: opts.pool_ctx(), thread: Some(thread) })
+        let (max_batch, spec) = rrx.recv()??;
+        Ok(Scheduler { tx, max_batch, max_ctx: opts.pool_ctx(), thread: Some(thread), dead, spec, step_t0, step_timeout: step_timeout_ms() })
+    }
+    /// Some(reason) once the engine thread has stopped serving for good (it then fails every request): the server
+    /// reports it on /health and exits so that a supervisor can restart it.
+    /// Positions of the context a prompt may not use: a prompt of max_context - prompt_reserve() tokens or more is
+    /// refused (the first reply token and a full verify segment must fit after it).
+    pub fn prompt_reserve(&self) -> usize {
+        self.spec
+    }
+    pub fn dead(&self) -> Option<String> {
+        if let Some(why) = self.dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Some(why);
+        }
+        let t0 = self.step_t0.load(Ordering::Relaxed);
+        if t0 > 0 && now_ms().saturating_sub(t0) > self.step_timeout {
+            return Some(format!("an engine step has run for {} s (FE_STEP_TIMEOUT {} s): the engine is hung",
+                (now_ms() - t0) / 1000, self.step_timeout / 1000));
+        }
+        self.thread.as_ref().is_some_and(|t| t.is_finished()).then(|| "the engine thread exited".to_string())
     }
     /// (max_batch, max_context): the requests the loaded engine decodes at once (the slots; at most
     /// DF_PASS_STREAMS when DFlash2 is the only drafter) and the tokens a request may hold
@@ -312,7 +354,22 @@ struct Active {
     ttft: Option<f64>,
 }
 
+/// Milliseconds since the Unix epoch (the step watchdog's clock).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// FE_STEP_TIMEOUT (seconds, default 120; the longest step, a 2K-row prompt chunk at 128K, takes a few seconds): a step that runs longer counts as a hung engine (a TP2 collective whose
+/// peer is gone never returns); Scheduler::dead then reports it and the server exits.
+fn step_timeout_ms() -> u64 {
+    std::env::var("FE_STEP_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(120).max(10) * 1000
+}
+
 struct Worker {
+    steps_run: u64,
+    test_panic_step: Option<u64>,
+    /// when the running step started (now_ms), 0 between steps (Scheduler::dead's hang check)
+    step_t0: Arc<std::sync::atomic::AtomicU64>,
     e: Engine,
     o: SchedOptions,
     spec: usize,
@@ -514,6 +571,42 @@ pub fn lead_points(points: &[usize], min: usize, chunk: usize) -> Vec<usize> {
     out
 }
 
+/// The snapshot points every request is cut and saved at (in every mode): each point moves back to the end of the
+/// last whole grid step before it, counted from the point before it (0 for the first) and leaving more than
+/// DECODE_ROWS rows up to it; the step is the prompt chunk for points at or past `min` (FE_CACHE_LEAD_MIN, when on)
+/// and PROMPT_ALIGN (32 rows) for the others. A turn's generation-prompt point (within DECODE_ROWS of its prompt
+/// end, where nothing could be cut) thus lands at most 48 rows back, where the next turn resumes; and since the
+/// points are a function of the points alone, the next turn cuts at the same place: a resumed reply is the full
+/// computation's (tools/bench/agentturns.py, cache on vs off).
+pub fn turn_points(points: &[usize], min: usize, chunk: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::with_capacity(points.len());
+    for &p in points {
+        let base = out.last().copied().unwrap_or(0);
+        let step = if min > 0 && p >= min && chunk > 0 { chunk } else { PROMPT_ALIGN };
+        let q = base + p.saturating_sub(DECODE_ROWS + 1).saturating_sub(base) / step * step;
+        if q > base {
+            out.push(q);
+        }
+    }
+    out
+}
+
+/// Host rows for the sampled segments of a step: segment i owns logit rows lr_first[i]..lr_first[i + 1] (the last
+/// up to `nl`); each sampled segment with logit rows gets the next free host rows, the others usize::MAX.
+/// Returns (first host row per segment, host rows needed).
+fn sampled_host_rows(lr_first: &[usize], nl: usize, sampled: &[bool]) -> (Vec<usize>, usize) {
+    let mut out = vec![usize::MAX; lr_first.len()];
+    let mut hr = 0;
+    for i in 0..lr_first.len() {
+        let k = lr_first.get(i + 1).copied().unwrap_or(nl) - lr_first[i];
+        if k > 0 && sampled[i] {
+            out[i] = hr;
+            hr += k;
+        }
+    }
+    (out, hr)
+}
+
 /// FE_VERIFY_ROWS (default 48: one g6 GEMV pass; 4-stream code TP2 286 vs 264 at 32, TP1 208 vs 183; 64 gains
 /// nothing, its 49-64 rows run as two 32-row passes), kept within the engine's decode-row limit.
 fn verify_rows(n_slots: usize) -> usize {
@@ -528,15 +621,14 @@ impl Worker {
         // the engine may keep more history rows than the drafter's depth (copy rows)
         let spec = o.spec_depth.min(e.hist_rows);
         let copy = if spec > 0 && e.hist_rows >= copy_hist_min(o.drafter.is_some(), o.spec_depth) { copy_rows().min(e.hist_rows - 1) } else { 0 };
-        // prompt cache: DFlash2 / plain; with the MTP head loaded only when FE_CACHE_MTP=1 (default on small-memory
-        // devices, crate::lowmem, where the MTP head is the drafter): the head's KV rows are parked and restored with
-        // the target's, and the one row a resume leaves it without only costs a draft
+        // prompt cache: DFlash2 / MTP / plain (FE_CACHE_MTP=0 turns it off with the MTP head loaded): the head's KV
+        // rows are parked and restored with the target's, and the one row a resume leaves it without only costs a draft
         let want_cache = std::env::var("FE_CACHE").is_ok_and(|v| v == "1");
-        let cache = want_cache && (!e.has_mtp() || crate::lowmem::flag("FE_CACHE_MTP"));
+        let cache = want_cache && (!e.has_mtp() || std::env::var("FE_CACHE_MTP").map(|v| v != "0").unwrap_or(true));
         if want_cache && !cache {
-            eprintln!("ferrite: FE_CACHE off with the MTP head loaded (DRAFT=mtp / auto): exact-slot prompt reuse only");
+            eprintln!("ferrite: FE_CACHE off with the MTP head loaded (FE_CACHE_MTP=0): no prompt reuse");
         }
-        Worker { e, spec, slot_tokens: vec![Vec::new(); n], slot_busy: vec![false; n], slot_used: vec![0; n], tick: 0,
+        Worker { steps_run: 0, test_panic_step: std::env::var("FE_TEST_PANIC_STEP").ok().and_then(|v| v.parse().ok()), step_t0: Arc::new(std::sync::atomic::AtomicU64::new(0)), e, spec, slot_tokens: vec![Vec::new(); n], slot_busy: vec![false; n], slot_used: vec![0; n], tick: 0,
             waiting: VecDeque::new(), active: Vec::new(), host: vec![0; verify_rows(n).max(DECODE_ROWS).max(n) * v], df: None,
             t_pre: 0.0, t_dec: 0.0,
             decode_share: std::env::var("FE_DECODE_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3f64).clamp(0.0, 0.95),
@@ -563,14 +655,16 @@ impl Worker {
             o }
     }
 
-    fn run(mut self, rx: mpsc::Receiver<Cmd>) {
+    /// Serve until Shutdown (None) or until the engine is broken (Some(reason)).
+    fn run(mut self, rx: mpsc::Receiver<Cmd>) -> Option<String> {
+        let mut fails = 0;
         loop {
             // intake
             let mut cmds = Vec::new();
             if self.active.is_empty() && self.waiting.is_empty() {
                 match rx.recv() {
                     Ok(c) => cmds.push(c),
-                    Err(_) => return,
+                    Err(_) => return None,
                 }
                 // woken from idle: give the requests sent together a moment to arrive (one prefill forward)
                 let cap = Instant::now() + 4 * self.arrival;
@@ -588,27 +682,47 @@ impl Worker {
             for c in cmds {
                 match c {
                     Cmd::Submit(mut r, s) => {
-                        if self.cache && self.lead_min > 0 {
-                            r.snapshots = lead_points(&r.snapshots, self.lead_min, self.o.prefill_chunk);
-                        }
+                        // the cut points are a function of the prompt alone, whatever the cache setting (greedy text
+                        // must not depend on it)
+                        r.snapshots = turn_points(&r.snapshots, self.lead_min, self.o.prefill_chunk);
                         self.waiting.push_back((r, s))
                     }
-                    Cmd::Shutdown => return,
+                    Cmd::Shutdown => return None,
                 }
             }
             self.admit();
             if self.active.is_empty() {
                 continue;
             }
-            if let Err(err) = self.step() {
-                let msg = format!("{err:#}");
-                eprintln!("ferrite: step failed: {msg}");
-                for mut a in self.active.drain(..) {
-                    (a.sink)(Event::Finished { reason: Finish::Error(msg.clone()), cached_prompt_tokens: a.cached });
-                    self.slot_busy[a.slot] = false;
-                    self.slot_tokens[a.slot].clear();
-                    let b: Vec<usize> = self.slot_snaps[a.slot].drain(..).map(|x| x.blk).collect();
-                    self.blocks.release(b);
+            self.step_t0.store(now_ms(), Ordering::Relaxed);
+            self.steps_run += 1;
+            // FE_TEST_PANIC_STEP=n: panic in step n (tests that a dead engine is reported and the server exits)
+            if self.test_panic_step == Some(self.steps_run) {
+                panic!("FE_TEST_PANIC_STEP {}", self.steps_run);
+            }
+            let r = self.step();
+            self.step_t0.store(0, Ordering::Relaxed);
+            match r {
+                Ok(()) => fails = 0,
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    eprintln!("ferrite: step failed: {msg}");
+                    fails += 1;
+                    // TP2: rank 1 may have run a call rank 0 did not finish (or be gone): the ranks no longer agree
+                    let fatal = self.e.tp_rank().is_some() || fails >= STEP_FAILS_FATAL;
+                    for mut a in self.active.drain(..) {
+                        (a.sink)(Event::Finished { reason: Finish::Error(msg.clone()), cached_prompt_tokens: a.cached });
+                        self.slot_busy[a.slot] = false;
+                        self.slot_tokens[a.slot].clear();
+                        let b: Vec<usize> = self.slot_snaps[a.slot].drain(..).map(|x| x.blk).collect();
+                        self.blocks.release(b);
+                    }
+                    if fatal {
+                        for (_, mut sink) in self.waiting.drain(..) {
+                            sink(Event::Finished { reason: Finish::Error(format!("engine stopped: {msg}")), cached_prompt_tokens: 0 });
+                        }
+                        return Some(format!("step failed: {msg}"));
+                    }
                 }
             }
         }
@@ -734,7 +848,9 @@ impl Worker {
                 return;
             }
             let mut best: Option<(usize, usize)> = None;
-            if !self.cache || self.cache_live {
+            // a slot's live history (FE_CACHE_LIVE=1) holds the previous reply's rows as decoded, not as a prompt
+            // computes them: resuming there changes the text, so it is opt-in (diagnostics), cache or not
+            if self.cache_live {
                 for &s in &free {
                     let c = &self.slot_tokens[s];
                     if !c.is_empty() && c.len() < p.len() && p[..c.len()] == c[..] && best.is_none_or(|b| c.len() > b.1) {
@@ -760,7 +876,18 @@ impl Worker {
             let resumed = if let Some((ei, x)) = from_park {
                 let s = *free.iter().min_by_key(|&&s| self.slot_used[s]).unwrap();
                 match self.park_restore(s, ei, x) {
-                    Ok(()) => Some((s, x.pos)),
+                    Ok(true) => Some((s, x.pos)),
+                    // the entry had to make room for the slot's own conversation: a cache miss, computed in full
+                    Ok(false) => match self.e.reset_slot(s) {
+                        Ok(()) => {
+                            self.slot_tokens[s].clear();
+                            Some((s, 0))
+                        }
+                        Err(err) => {
+                            sink(Event::Finished { reason: Finish::Error(format!("{err:#}")), cached_prompt_tokens: 0 });
+                            continue;
+                        }
+                    },
                     Err(err) => {
                         sink(Event::Finished { reason: Finish::Error(format!("{err:#}")), cached_prompt_tokens: 0 });
                         continue;
@@ -809,7 +936,9 @@ impl Worker {
             // share a verify tree)
             let copier = (self.copy > 0 && req.sampling.greedy() && ((self.tree && self.df.is_some()) || (self.df.is_none() && self.e.has_mtp())))
                 .then(|| crate::copy::Copier::new(COPY_LO, self.copy.max(COPY_LO)));
-            let cuts = if self.cache { cut_points(&req, self.tailcut) } else { Vec::new() };
+            // every mode cuts a prompt at its snapshot points (the cache only decides whether a state is saved there):
+            // the chunked GDN grid restarts at each cut, so a cut taken in one mode and not in another changes the bits
+            let cuts = cut_points(&req, self.tailcut);
             let cap = if wide { self.o.pool_ctx() } else { self.o.max_ctx };
             self.active.push(Active { req, sink, slot, cap, fed: cached, cached, cuts, share: Vec::new(), out: Vec::new(), pending: None,
                 drafts: Vec::new(), tree: None, copier, copied: (0, 0), out_idx: 0, depth, acc_ema: depth as f32, rounds: 0,
@@ -855,7 +984,10 @@ impl Worker {
             // its whole block, and one 32-row GEMV pass carries them), fewer keep 48 rows at gain 1. Total tokens/s
             // of 3 / 4 parallel code streams on one GB10: 145 / 168 against 133 / 149; one and two streams are
             // unchanged. The rows a stream verifies never change its tokens.
-            let many = ndec_now >= 3;
+            // One node only: on two nodes (TP2) the split policy measured 444 / 426 tok/s for 4 code / edit streams
+            // against 470 / 473 with 48 rows at gain 1 (each rank's half GEMV is cheap, the bigger trees pay), so TP2
+            // keeps the fixed policy.
+            let many = ndec_now >= 3 && self.e.tp_rank().is_none();
             let gain: f32 = std::env::var("FE_VERIFY_GAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if many { 8.0 } else { 1.0 });
             if !self.verify_fixed {
                 self.verify_rows = if many { 2 * DECODE_ROWS } else { 3 * DECODE_ROWS }.clamp(self.o.n_slots.max(2), crate::model::DEC_MAX);
@@ -1106,7 +1238,7 @@ impl Worker {
                 let cap = self.e.group_rows();
                 let (mut f, mut ends) = (a.fed, Vec::new());
                 while f < len {
-                    let n = if self.cache { prompt_cut_at(len, &a.cuts, f, lim) } else { prompt_cut(len, a.cached, f, lim) };
+                    let n = prompt_cut_at(len, &a.cuts, f, lim);
                     if n <= crate::model::X3_ROWS || f + n - a.fed > cap {
                         break;
                     }
@@ -1147,11 +1279,7 @@ impl Worker {
         for (ai, a) in self.active.iter().enumerate() {
             if a.pending.is_none() && a.fed < a.req.prompt_ids.len() && rows < budget {
                 let lim = self.o.prefill_chunk.min(budget - rows);
-                let mut n = if self.cache {
-                    prompt_cut_at(a.req.prompt_ids.len(), &a.cuts, a.fed, lim)
-                } else {
-                    prompt_cut(a.req.prompt_ids.len(), a.cached, a.fed, lim)
-                };
+                let mut n = prompt_cut_at(a.req.prompt_ids.len(), &a.cuts, a.fed, lim);
                 if n == 0 && self.o.prefill_chunk < 4 * PROMPT_ALIGN {
                     n = (a.req.prompt_ids.len() - a.fed).min(lim); // tiny test chunks: unaligned, as before
                 }
@@ -1197,8 +1325,24 @@ impl Worker {
         let nl = logit_rows.len();
         let greedy_all = owners.iter().all(|o| self.active[o.0].req.sampling.greedy());
         let am = if nl > 0 { self.e.argmax(nl)? } else { Vec::new() };
+        // host rows: only the logit rows of sampled sequences come to the host, packed in segment order (a step can
+        // carry more logit rows than any fixed buffer: every verify row plus the last row of each ending prompt)
+        let mut host_row = vec![usize::MAX; segs.len()];
         if !greedy_all && nl > 0 {
-            self.e.logits_host(nl, &mut self.host)?;
+            let v = self.e.cfg.vocab;
+            let sampled: Vec<bool> = owners.iter().map(|o| !self.active[o.0].req.sampling.greedy()).collect();
+            let hr;
+            (host_row, hr) = sampled_host_rows(&lr_first, nl, &sampled);
+            if self.host.len() < hr * v {
+                self.host.resize(hr * v, 0);
+            }
+            for si in 0..segs.len() {
+                if host_row[si] != usize::MAX {
+                    let k = lr_first.get(si + 1).copied().unwrap_or(nl) - lr_first[si];
+                    let h0 = host_row[si] * v;
+                    self.e.logits_host_rows(lr_first[si], k, &mut self.host[h0..h0 + k * v])?;
+                }
+            }
         }
         lap(&mut self.prof, 1);
         let v = self.e.cfg.vocab;
@@ -1221,8 +1365,9 @@ impl Worker {
                 let mut first = None;
                 if complete {
                     let li = lr_first[si];
+                    let hi = host_row[si];
                     let t = if a.req.sampling.greedy() { am[li] } else {
-                        sample(&self.host[li * v..(li + 1) * v], &a.req.sampling, &a.req.prompt_ids, &a.out, &mut a.rng)
+                        sample(&self.host[hi * v..(hi + 1) * v], &a.req.sampling, &a.req.prompt_ids, &a.out, &mut a.rng)
                     };
                     first = Some(t);
                 }
@@ -1264,10 +1409,11 @@ impl Worker {
                 emitted.push(am[li + acc]);
             } else {
                 // speculative sampling with deterministic drafts: accept d with prob p(d), else sample p without d
+                let hi = host_row[si];
                 let mut hist_out = a.out.clone();
                 let mut bonus = None;
                 for (j, &d) in drafts.iter().enumerate() {
-                    let row = &self.host[(li + j) * v..(li + j + 1) * v];
+                    let row = &self.host[(hi + j) * v..(hi + j + 1) * v];
                     let (idx, pr) = dist(row, &a.req.sampling, &a.req.prompt_ids, &hist_out);
                     let pd = idx.iter().position(|&t| t == d).map_or(0.0, |k| pr[k]);
                     let u = (splitmix(&mut a.rng) >> 40) as f32 / (1u64 << 24) as f32;
@@ -1283,7 +1429,7 @@ impl Worker {
                 let b = match bonus {
                     Some(b) => b,
                     None => {
-                        let row = &self.host[(li + acc) * v..(li + acc + 1) * v];
+                        let row = &self.host[(hi + acc) * v..(hi + acc + 1) * v];
                         sample(row, &a.req.sampling, &a.req.prompt_ids, &hist_out, &mut a.rng)
                     }
                 };
@@ -1545,12 +1691,20 @@ impl Worker {
     }
 
     /// Restore park entry `ei` at its snapshot `x` into free slot `slot` (its own conversation parked first).
-    fn park_restore(&mut self, slot: usize, ei: usize, x: crate::pcache::Snap) -> Result<()> {
+    /// Ok(false): parking the slot's conversation needed the entry's blocks (the pool held nothing else to evict),
+    /// so there is nothing to restore: the caller treats it as a cache miss.
+    fn park_restore(&mut self, slot: usize, ei: usize, x: crate::pcache::Snap) -> Result<bool> {
+        // the entry about to be restored is the most recently used: parking evicts every other entry before it
+        self.tick += 1;
+        self.park.entries[ei].used = self.tick;
         self.park_slot(slot)?;
-        // parking may evict entries: find the entry again by its snapshot block
-        let Some(ei) = (0..self.park.entries.len()).find(|&i| self.park.entries[i].snaps.contains(&x)).or(
-            (ei < self.park.entries.len() && self.park.entries[ei].snaps.contains(&x)).then_some(ei)) else {
-            anyhow::bail!("prompt cache: park entry evicted while parking");
+        // parking may evict entries (swap_remove moves the others): find the entry again by its snapshot block (state
+        // blocks are not handed out while parking, so a freed block cannot reappear under another entry)
+        let Some(ei) = (0..self.park.entries.len()).find(|&i| self.park.entries[i].snaps.contains(&x)) else {
+            if self.cache_trace {
+                eprintln!("cache: park entry with snap blk {} evicted while parking slot {slot}: computed in full", x.blk);
+            }
+            return Ok(false);
         };
         self.e.reset_slot(slot)?;
         // the entry's blocks back with the rows they were written with (a block's layout depends on its row count:
@@ -1565,7 +1719,7 @@ impl Worker {
         let en = &mut self.park.entries[ei];
         en.used = self.tick;
         self.slot_tokens[slot] = en.tokens[..x.pos].to_vec();
-        Ok(())
+        Ok(true)
     }
 
     /// The first snapshot point of a request (the end of the shared system prompt) or one of its share points: keep
@@ -1866,6 +2020,19 @@ mod share_tests {
 mod prompt_cut_tests {
     use super::{prompt_cut, prompt_cut_at};
     #[test]
+    fn turn_points_sit_on_a_grid() {
+        use super::{turn_points, DECODE_ROWS, PROMPT_ALIGN};
+        // one node (lead off): every point on the 32-row grid of the point before, > DECODE_ROWS before it
+        let t = turn_points(&[6561, 7842], 0, 2048);
+        assert_eq!(t[0], (6561 - DECODE_ROWS - 1) / PROMPT_ALIGN * PROMPT_ALIGN);
+        assert!(7842 - t[1] > DECODE_ROWS && 7842 - t[1] <= DECODE_ROWS + PROMPT_ALIGN && (t[1] - t[0]) % PROMPT_ALIGN == 0);
+        // the same conversation one turn later cuts there again: a function of the points alone
+        assert_eq!(&turn_points(&[6561, 7842, 9000], 0, 2048)[..2], &t[..]);
+        // small-memory devices: points past FE_CACHE_LEAD_MIN on the chunk grid as lead_points
+        assert_eq!(turn_points(&[20000, 20300, 23000], 4096, 2240), [17920, 20160, 22400]);
+    }
+
+    #[test]
     fn lead_points_sit_on_the_chunk_grid() {
         // short prompts: untouched
         assert_eq!(super::lead_points(&[100, 3000], 4096, 2240), [100, 3000]);
@@ -1907,5 +2074,19 @@ mod prompt_cut_tests {
         assert_eq!(prompt_cut(1800, 0, 0, 20), 0); // < one step: wait
         assert_eq!(prompt_cut(1800, 100, 100, 248), 224); // cache hit at 100: cut at 324 = 100 + 7 * 32
         assert_eq!(prompt_cut(1800, 100, 324, 300), 288); // next cut 612 = 100 + 16 * 32
+    }
+
+    #[test]
+    fn sampled_rows_fit_any_step() {
+        // regression: 3 greedy 16-row verify segments + a sampled 16-row one + 2 ending prompts (1 sampled):
+        // 66 logit rows, more than the old fixed 48-row host buffer; only the 17 sampled rows go to the host
+        let lr_first = [0, 16, 32, 48, 64, 65];
+        let sampled = [false, true, false, false, true, false];
+        let (rows, n) = super::sampled_host_rows(&lr_first, 66, &sampled);
+        assert_eq!(n, 17);
+        assert_eq!(rows, vec![usize::MAX, 0, usize::MAX, usize::MAX, 16, usize::MAX]);
+        // segments without logit rows (mid-prompt chunks) get none, even when sampled
+        let (rows, n) = super::sampled_host_rows(&[0, 0, 1], 1, &[true, true, true]);
+        assert_eq!((rows, n), (vec![usize::MAX, 0, usize::MAX], 1));
     }
 }

@@ -4,6 +4,127 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-11-15
+
+### Fixed
+
+- **A crash under mixed traffic.** A request with `temperature` above 0 that arrived while other requests were
+  drafting (several greedy file edits at once, say) could crash the engine. The server then answered every request
+  with an error while `/health` still said ok. Sampled requests now copy only their own rows to the host, into a
+  buffer sized for the step.
+- **Greedy text no longer depends on the settings.** `FERRITE_CACHE=0` and every `FERRITE_DRAFT` mode (`dflash`,
+  `mtp`, `auto`, `off`) give the same text for every prompt, including prompts with a system message and thinking
+  turns. Before, a prompt was cut at its turn boundaries only with the cache on, which could change near ties.
+  `tools/bench/modes.py` checks it.
+- **Two Sparks with several requests are back to full speed.** Four code requests went from 444 to 467 tok/s and
+  four edits from 426 to 472: the verify-row split for three or more streams now applies to one node only.
+- **The server's memory levels off** under mixed traffic instead of growing by gigabytes an hour: captured GPU
+  graphs are capped (`FE_GRAPH_MAX`, 128), and on Flash-Next the step-graph cache too.
+- **The prompt cache no longer fails a request** when the conversation it needed had to leave the cache pool. The
+  prompt is computed in full instead.
+- **Clear errors instead of late or vague ones.**
+  - A taken port fails in a second, before the model loads.
+  - Kernels built for another card stop at start with the `FE_KARCH=... cargo build` command that fixes them, on
+    both CUDA engines.
+  - A missing or cut-off model file is named, and the launchers check the model folders before loading.
+  - A prompt in the last positions of the context gets a 400 that says how long a prompt may be, not a 500.
+  - `logprobs` / `top_logprobs` get a 400 (not supported) instead of a reply without them. An unknown message role
+    gets a 400 that names it. Request bodies above 32 MB get a 413.
+  - Flash-Next running out of card memory at load names the settings to lower.
+- **Flash-Next stops a dropped prompt.** When a client disconnects during its prompt, the prompt stops between
+  layers instead of running to the end. A dropped 100K-token prompt used to hold up the next request for about a
+  minute.
+- **The installer installs the latest release.** It used to ask for 0.5.2, which was never published, and fell
+  back to a source build without saying why. Run over an older install it now upgrades, keeping the old folder as
+  `~/ferrite-<version>`. It also no longer reports success when another program answers on the port.
+- **Downloads recover by themselves.**
+  - `scripts/fetch-models.sh` retries a failed transfer, fetches again any file whose size or sha256 is wrong, and
+    deletes the partial files an interruption leaves.
+  - It stops before downloading when the disk is too small, and follows symlinked model files.
+  - `scripts/fetch-flashnext.sh` downloads in parallel ranges that resume and retry, so a dropped connection no
+    longer ends the run.
+- **Builds without `FE_KARCH`** compile the kernels for the card `nvidia-smi` reports on the build machine, and say
+  so in a build warning. Before, they were built for the DGX Spark, and an RTX build failed only on the card.
+- **Fixes for the RTX 5080 / 5060 Ti preset.**
+  - `DRAFT=off` now turns drafting off.
+  - `FE_KVQ=0` picks a context that fits.
+  - A second launcher on a busy card stops with a message instead of waiting silently.
+  - `SLOTS=abc` and similar bad settings are refused.
+- **Smaller fixes.**
+  - The server log has no colour codes when it is written to a file.
+  - `fetch-models.sh` names the right launcher for the machine at the end.
+  - Source builds are free of compiler warnings.
+  - The release tarball's documentation links all resolve.
+
+### Changed
+
+- **Every launcher listens on `0.0.0.0` by default**, so other machines on your network can use the server:
+  `scripts/serve.sh`, `tools/serve-tp2.sh`, `tools/serve-5080.sh` (RTX 5080 and 5060 Ti), `tools/serve-fnext.sh`
+  and `scripts/serve-xe.sh`. There is no API key: use it on a trusted network or firewall the port.
+  `FERRITE_HOST=127.0.0.1` keeps a server on its own machine. Each launcher says so when it starts.
+- **The launchers behave the same way on every target.**
+  - Before the model loads, they check the port, the GPU lock, the model files and the memory.
+  - A busy card stops a second launcher at once and names the process holding it (`FERRITE_LOCK_WAIT=1` waits
+    instead).
+  - Locks are per card: the node lock is held shared, plus the card's own lock. A 27B server on one card and
+    Flash-Next on another run side by side, while whole-node jobs still exclude both.
+  - The launcher's process becomes the server, so Ctrl-C, `kill <pid>` or `kill $!` stop it and free the card.
+- **`scripts/serve.sh` refuses to start when memory is short**, as the installer does, instead of only warning
+  (`FERRITE_FORCE=1` overrides). On an RTX 50 card it starts the RTX preset by itself.
+- **The RTX preset sizes the context to the card's free memory**: 128K on an empty card, and less (with a message
+  saying so) when a desktop or another program holds part of it. A `FERRITE_CTX` that cannot fit is refused before
+  loading.
+- **When the engine stops**, after a crash or when the second node of a two-node server is gone, the server
+  reacts. `/health` and new requests answer 503 with the reason, and the process exits with status 70 so a
+  supervisor can restart it. On two nodes the other node's process exits too.
+- **The prompt cache also works with MTP drafting** (`FERRITE_DRAFT=mtp` / `auto`) on every device
+  (`FE_CACHE_MTP=0` turns that off).
+- **Follow-up turns resume closer to the end of the previous one.** Turn boundaries sit on a 32-row grid, so an
+  agent conversation recomputes only the last reply and the new message. On one Spark, 8 turns behind a
+  6.5K-token system prompt took 9.3 s of time to first token in total before and 7.2 s now, with the same text.
+  This moves where some prompts are cut, so greedy text can differ slightly from 0.6.0's. It is the same in every
+  cache and drafting mode.
+- **Flash-Next keeps its host memory flat over long runs**: fixed C-heap thresholds, on by default for Flash-Next
+  (`FERRITE_MALLOC=1` / `0` turns them on or off for any engine; on the 27B engine they cost about 1.6% of decode
+  speed). On Flash-Next they make fresh-prompt processing about 8-10% slower than the figures in
+  docs/flash-next.md, which were measured before; `FERRITE_MALLOC=0` restores those speeds, at the cost of slowly
+  growing host memory.
+- **`/health` reports the server version**, and `fe-server --version` names the release, the engines and the
+  kernels' GPU architecture.
+- **Documentation.**
+  - The speed tables were re-measured with the shipped `tools/bench` clients, each with the command that
+    reproduces it: two Sparks, one Spark, agents, RTX 5080, RTX 5060 Ti, Arc B70 and Flash-Next.
+  - A "Clean machine" section lists the system packages, how to get `ptxas` and cuBLASLt from NVIDIA's repository
+    (no full toolkit), and the `FE_KARCH` of every card. It was tested in clean Ubuntu 24.04 and 26.04 containers.
+  - Two Sparks need no sudo for NCCL: NVIDIA's `nvidia-nccl-cu13` wheel works (tested with NCCL 2.32.6).
+  - The Arc B70 page lists the power and clock settings its numbers were measured with, and notes that the first
+    request after a new build takes about 30 s.
+  - A cooling note covers several cards in adjacent slots.
+- **The release tarball carries every launcher, every doc page, `CHANGELOG.md` and the benchmark clients.**
+  `tools/bench/agents.py` and `mixed.py` quote a fixed copy of the repository files they need, so they run from
+  the tarball and their prompts do not change between releases.
+- **`tools/bench/quickbench.py --mode code|prose [--runs N]`** runs without the menu and prints the median. With
+  several requests it prints the decode aggregate the docs quote, next to the wall-clock rate.
+- **`tools/bench/edit.py`** uses CPython 3.12.3's sources whatever Python runs it. **`tools/bench/sweep.py`**
+  labels a run with the server's own `/health`.
+
+### Added
+
+- **`scripts/ferritectl.sh start|stop|restart|status|log [spark|tp2|rtx|fnext|b70]`** runs any target's server in
+  the background, with one log and pid file per port. The installer uses it.
+- **`tools/release-gate.sh TARGET SERVER|URL`** checks a server from another machine on the network: `/health`,
+  `/v1/models`, a request, a streamed request, a burst of sampled and greedy requests, and the mixed-load repro.
+  Given a host instead of a URL, it also starts and stops the server.
+- **`fe-server --version`** and **`ferrite --version`**.
+- **`FERRITE_PLAIN=1`** on `scripts/serve-xe.sh` serves plain decoding on the Arc B70.
+- **`scripts/check-deps.sh`** reads the kernels' architecture from the binary. With `--build` it names any
+  missing system packages in one apt line and checks for cuBLASLt. It also has an Arc B70 mode, and finds a
+  pip-installed NCCL.
+- **`tools/bench/modes.py`** checks that greedy text is the same across cache and drafting settings.
+  **`tools/bench/mixed.py`** sends sampled and greedy requests together, as a crash check and a soak with a fixed
+  greedy probe. **`tools/bench/agentturns.py`** measures time to first token turn by turn in a growing agent
+  conversation.
+
 ## [0.6.0] - 2026-11-14
 
 ### Added
@@ -186,7 +307,8 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
-[0.5.2]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.2
+[0.6.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.6.1
+[0.6.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.6.0
 [0.5.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.1
 [0.5.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.0
 [0.4.3]: https://github.com/BHCC2025/ferrite/releases/tag/v0.4.3

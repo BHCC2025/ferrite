@@ -29,7 +29,7 @@ exllamav3.
 | Bits | 5.0 bpw average over the linears including their scales (4 / 5 / 6 / 8-bit per tensor); output head 6-bit, not rotated |
 | Method | GPTQ on 128 x 2048 calibration tokens for 497 tensors, round-to-nearest for 8 |
 | Size | 30.3 GB on disk, of which 1.3 GB is the optional MTP draft head `dhead_q8.bin` |
-| Accuracy | KL vs BF16: code 0.0054, prose 0.0105, chat 0.0057, 16K context 0.0048, 120K context 0.0033 |
+| Accuracy | KL vs BF16 with Ferrite's default int8 prompt path: code 0.0061, prose 0.0114, chat 0.0065, 16K context 0.0055, 120K context 0.0037 (fp16 prompt path: 0.0054 / 0.0105 / 0.0057 / 0.0048 / 0.0033) |
 | Context | measured to 120K tokens (Ferrite serves 128K on the 32 GB card) |
 | Runs on | Ferrite on an Intel Arc Pro B70 |
 | License | Apache-2.0, inherited from the base model |
@@ -58,12 +58,15 @@ greedy decoding, tokens per second:
 
 | Workload | Result |
 |---|---|
-| code, 2K / 32K / 100K context | 124 / 111 / 79 |
-| prose, 2K context | 79 |
-| code edits (mostly copied from the prompt) | 201-244 |
+| code, 2K / 32K / 100K context | 170 / 136 / 102 |
+| prose, 2K context (replies that do not repeat the test prompt) | 66 |
+| code edits (mostly copied from the prompt) | 176-257 |
 | plain decoding, no speculation | 27.6 |
-| prompt processing at 2K / 8K / 32K / ~120K | ~2,090 / ~2,240 / ~2,060 / ~1,490 |
+| prompt processing at 2K / 8K / 32K / ~120K | ~2,130 / ~2,200 / ~2,030 / ~1,490 |
 | device memory at load, 128K context | 28.6 GB |
+
+Measured 2026-11-14 with Ferrite 0.6.0's `tools/bench` clients; the commands are in the
+[Arc B70 page](https://github.com/BHCC2025/ferrite/blob/main/docs/arc-b70.md#results).
 
 ## How to run
 
@@ -71,6 +74,7 @@ The full guide is Ferrite's [Arc B70 page](https://github.com/BHCC2025/ferrite/b
 
 ```bash
 git clone https://github.com/BHCC2025/ferrite && cd ferrite
+rustup default stable          # Arch's rustup starts with no default toolchain
 rustup toolchain install nightly-2026-11-04 --component rust-src --component llvm-tools
 cargo build --release --features xe -p fe-server
 export FERRITE_MODELS=$HOME/models                # ~36 GB free

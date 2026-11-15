@@ -7,6 +7,10 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
+use anyhow::Context as _;
+
+/// What to do about a missing or short checkpoint file.
+const DAMAGED: &str = "the model folder is incomplete or damaged: check it with scripts/fetch-models.sh --verify-only";
 
 #[derive(Clone, Debug)]
 pub struct TensorInfo {
@@ -21,6 +25,7 @@ pub struct TensorInfo {
 pub struct Checkpoint {
     pub dir: PathBuf,
     files: Vec<File>,
+    names: Vec<PathBuf>,
     pub tensors: HashMap<String, TensorInfo>,
 }
 
@@ -31,7 +36,8 @@ impl Checkpoint {
         let idx = dir.join("model.safetensors.index.json");
         let mut shard_names: Vec<String> = Vec::new();
         if idx.exists() {
-            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&idx)?)?;
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&idx).with_context(|| format!("reading {idx:?}"))?)
+                .with_context(|| format!("parsing {idx:?}: {DAMAGED}"))?;
             let map = v["weight_map"].as_object().ok_or_else(|| Error::msg("index without weight_map"))?;
             for f in map.values() {
                 let f = f.as_str().ok_or_else(|| Error::msg("weight_map value"))?.to_string();
@@ -44,15 +50,17 @@ impl Checkpoint {
             shard_names.push("model.safetensors".into());
         }
         let mut files = Vec::new();
+        let mut names = Vec::new();
         let mut tensors = HashMap::new();
         for (fi, name) in shard_names.iter().enumerate() {
-            let f = File::open(dir.join(name))?;
+            let path = dir.join(name);
+            let f = File::open(&path).with_context(|| format!("opening {path:?}: {DAMAGED}"))?;
             let mut n = [0u8; 8];
-            f.read_exact_at(&mut n, 0)?;
+            f.read_exact_at(&mut n, 0).with_context(|| format!("reading {path:?}: {DAMAGED}"))?;
             let hlen = u64::from_le_bytes(n);
             let mut h = vec![0u8; hlen as usize];
-            f.read_exact_at(&mut h, 8)?;
-            let v: serde_json::Value = serde_json::from_slice(&h)?;
+            f.read_exact_at(&mut h, 8).with_context(|| format!("reading {path:?}: {DAMAGED}"))?;
+            let v: serde_json::Value = serde_json::from_slice(&h).with_context(|| format!("parsing {path:?}: {DAMAGED}"))?;
             for (k, t) in v.as_object().ok_or_else(|| Error::msg("header"))? {
                 if k == "__metadata__" {
                     continue;
@@ -69,8 +77,9 @@ impl Checkpoint {
                 tensors.insert(k.clone(), TensorInfo { dtype, shape, file: fi, offset: 8 + hlen + a, len: b - a });
             }
             files.push(f);
+            names.push(path);
         }
-        Ok(Self { dir, files, tensors })
+        Ok(Self { dir, files, names, tensors })
     }
 
     pub fn info(&self, name: &str) -> Result<&TensorInfo> {
@@ -84,7 +93,8 @@ impl Checkpoint {
     pub fn read_bytes(&self, name: &str) -> Result<Vec<u8>> {
         let t = self.info(name)?;
         let mut v = vec![0u8; t.len as usize];
-        self.files[t.file].read_exact_at(&mut v, t.offset)?;
+        self.files[t.file].read_exact_at(&mut v, t.offset)
+            .with_context(|| format!("reading {name} from {:?}: {DAMAGED}", self.names[t.file]))?;
         Ok(v)
     }
 

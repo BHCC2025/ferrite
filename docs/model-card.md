@@ -18,7 +18,8 @@ tensor gets its own width (2, 3 or 4 bits) based on how sensitive it is. The res
 3.0 bpw on every test set while reading fewer bytes per token**.
 
 It was built as the decode model of [Ferrite](https://github.com/BHCC2025/ferrite), a Rust inference engine for
-Qwen3.8-27B on NVIDIA DGX Spark, and it also runs unchanged in exllamav3 and TabbyAPI.
+Qwen3.8-27B on NVIDIA DGX Spark and on a 16 GB RTX 5080 or RTX 5060 Ti, and it also runs unchanged in exllamav3 and
+TabbyAPI.
 
 ## At a glance
 
@@ -31,14 +32,14 @@ Qwen3.8-27B on NVIDIA DGX Spark, and it also runs unchanged in exllamav3 and Tab
 | Memory read per token | 9.98 GB (uniform 3.0 bpw: 10.14 GB) |
 | Accuracy | KL vs BF16 is 0.86-0.93x that of uniform 3.0 bpw on all five test sets |
 | Context | measured to 120K tokens (Ferrite serves 128K) |
-| Runs on | Ferrite (DGX Spark, one or two nodes), exllamav3, TabbyAPI |
+| Runs on | Ferrite (DGX Spark, one or two nodes; RTX 5080 / RTX 5060 Ti 16 GB), exllamav3, TabbyAPI |
 | License | Apache-2.0, inherited from the base model |
 
 ## Which engine to use
 
 | Engine | Hardware | Use it for |
 |---|---|---|
-| **[Ferrite](https://github.com/BHCC2025/ferrite)** | NVIDIA DGX Spark (GB10), one or two units | built for DGX Spark: Rust kernels, speculative decoding, a prompt cache for agents, an OpenAI-compatible server |
+| **[Ferrite](https://github.com/BHCC2025/ferrite)** | NVIDIA DGX Spark (GB10), one or two units; one RTX 5080 or RTX 5060 Ti 16 GB ([guide](https://github.com/BHCC2025/ferrite/blob/main/docs/rtx-5080.md)) | Rust kernels, speculative decoding, a prompt cache for agents, an OpenAI-compatible server, 128K context on a 16 GB card |
 | **exllamav3** | NVIDIA GPUs supported by exllamav3 (made and measured on a 16 GB RTX 5080) | Python use, scripts, MTP drafting |
 | **TabbyAPI** | same as exllamav3 | an OpenAI-compatible server on a regular GPU |
 
@@ -104,20 +105,25 @@ requests x 128K context; generation rates exclude prompt processing; medians of 
 
 | Workload | Result |
 |---|---|
-| code, 1 request (2K / 32K context) | 273 / 238 tok/s |
-| code, 4 requests combined | 473 tok/s |
-| code edits (mostly copied from the prompt), 1 / 4 requests | 582 / 481 tok/s |
-| prose, 1 request (replies that do not repeat the test prompt) | 76 tok/s |
-| prompt processing at 2K / 8K / 32K / 64K / 120K | 3,544 / 3,335 / 2,799 / 2,321 / 1,792 tok/s |
+| code, 1 request (2K / 32K context) | 267 / 230 tok/s |
+| code, 4 requests combined | 467 tok/s |
+| code edits (mostly copied from the prompt), 1 / 4 requests | 564 / 472 tok/s |
+| prose, 1 request (replies that do not repeat the test prompt) | 74 tok/s |
+| prompt processing at 2K / 8K / 32K / 64K / 120K | 3,569 / 3,338 / 2,806 / 2,325 / 1,784 tok/s |
+
+Measured 2026-11-15 with Ferrite 0.6.1 (`tools/bench/sweep.sh` on two Sparks; the method is Ferrite's
+[docs/benchmarks.md](https://github.com/BHCC2025/ferrite/blob/main/docs/benchmarks.md)).
 
 **Ferrite with 4 agents** (shared ~13K-token system prompt, multi-turn, cold start; prompt cache off -> on):
 
 | | Thinking off | Thinking on |
 |---|---|---|
-| prompt tokens processed | -74% | -86% |
-| time to first token, first turn | 16.4 -> 5.1 s | 16.4 -> ~5.9 s |
-| time to first token, later turns | 2.5-2.7 -> ~0.5 s | 5.6-10.5 -> ~0.35 s |
-| combined output | 46.5 -> 92 tok/s | 36.9 -> 108 tok/s |
+| prompt tokens processed | -84% | -86% |
+| time to first token, first turn | 14.7 -> 5.0 s | 14.3 -> 4.6 s |
+| time to first token, later turns | 9.6-10.2 -> 0.4-1.0 s | 7.4-11.2 -> ~0.4 s |
+| combined output | 33.8 -> 101 tok/s | 41.1 -> 113 tok/s |
+
+(`tools/bench/agents.py --agents 4` on two Sparks, 2026-11-14.)
 
 ## How to run
 

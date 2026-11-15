@@ -17,11 +17,45 @@ use std::process::Command;
 /// the same name, in their own target directory.
 pub const ARCH: &str = "sm_121a";
 
-/// The kernel architecture of this build: `FE_KARCH`, else [`ARCH`].
+/// The kernel architecture of this build: `FE_KARCH`; else the GPU in this machine when `nvidia-smi` reports one
+/// kind of supported card (compute capability 12.0 -> `sm_120a`, 12.1 -> `sm_121a`); else [`ARCH`]. Set
+/// `FE_KARCH` to build for a card that is not in the build machine.
 pub fn arch() -> String {
-    match std::env::var("FE_KARCH") {
-        Ok(a) if !a.trim().is_empty() => a.trim().to_string(),
-        _ => ARCH.to_string(),
+    if let Ok(a) = std::env::var("FE_KARCH") {
+        if !a.trim().is_empty() {
+            return a.trim().to_string();
+        }
+    }
+    match detect_arch() {
+        Ok(a) => {
+            println!("cargo:warning=FE_KARCH not set: building the GPU kernels for {a}, the card nvidia-smi reports here");
+            a
+        }
+        Err(why) => {
+            println!("cargo:warning=FE_KARCH not set and {why}: building the GPU kernels for {ARCH} (DGX Spark); \
+                set FE_KARCH=sm_120a for an RTX 50-series card");
+            ARCH.to_string()
+        }
+    }
+}
+
+/// The architecture of the GPUs `nvidia-smi` lists (all visible to the build, one kind, compute capability 12.x).
+fn detect_arch() -> Result<String, String> {
+    let out = Command::new("nvidia-smi").args(["--query-gpu=compute_cap", "--format=csv,noheader"]).output()
+        .map_err(|_| "nvidia-smi is not available".to_string())?;
+    if !out.status.success() {
+        return Err("nvidia-smi found no GPU".into());
+    }
+    let mut caps: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty()).collect();
+    caps.sort();
+    caps.dedup();
+    match caps.as_slice() {
+        [c] if c == "12.0" => Ok("sm_120a".into()),
+        [c] if c == "12.1" => Ok("sm_121a".into()),
+        [c] => Err(format!("nvidia-smi reports compute capability {c} (only 12.0 and 12.1 are supported)")),
+        [] => Err("nvidia-smi found no GPU".into()),
+        _ => Err(format!("this machine has cards of several kinds ({})", caps.join(", "))),
     }
 }
 

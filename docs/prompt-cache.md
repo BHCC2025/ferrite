@@ -7,16 +7,18 @@ turns it off) and works with DFlash2 drafting, the default.
 
 ## Results
 
-Four agents at once on two Sparks (`tools/bench/agents.py`: a shared ~13K-token system prompt, then 2-3 turns each
-of code, edit and tool-call tasks, greedy), cache off against cache on:
+Four agents at once on two Sparks (`tools/bench/agents.py --agents 4 --seed 1`, and `--think`: a shared ~13K-token
+system prompt, then 2-3 turns each of code, edit and tool-call tasks, greedy), against `tools/serve-tp2.sh` with
+`FERRITE_CACHE=0` and with the default cache on (measured 2026-11-15, Ferrite 0.6.1):
 
 | | Cache off | Cache on |
 |---|---|---|
-| Prompt tokens computed | all | 74% fewer (thinking on: 86% fewer) |
-| Time to first token, first turn | 16.4 s | 5.1 s |
-| Time to first token, later turns | the whole history is computed again | about 0.4-0.6 s |
-| Combined output over the run, thinking off | 46.5 tok/s | 92 tok/s |
-| Combined output over the run, thinking on | 36.9 tok/s | 108 tok/s |
+| Prompt tokens computed, thinking off | 141,067 of 141,067 | 22,088 of 141,067 (84% fewer) |
+| Prompt tokens computed, thinking on | 139,054 of 139,054 | 19,695 of 139,054 (86% fewer) |
+| Time to first token, first turn (median) | 14.7 s | 5.0 s |
+| Time to first token, later turns (median) | 9.6 s and 10.2 s (thinking on: 11.2 s and 7.4 s) | 0.3-1.0 s |
+| Combined output over the run, thinking off | 33.8 tok/s | 101 tok/s |
+| Combined output over the run, thinking on | 41.1 tok/s | 113 tok/s |
 
 The first turn gains because the shared system prompt is computed once for all four agents. Later turns resume from
 the previous turn instead of computing the whole history again. `tools/bench/agsum.py` turns the `--json` outputs of
@@ -102,9 +104,8 @@ Turning the cache off changes where long prompts are cut, which can move a late 
 
 - **4 requests at once.** Ferrite runs at most 4 requests at a time with DFlash2 drafting. More requests wait in a
   first-in, first-out queue. A waiting agent's conversation is parked and restored when it gets a slot.
-- **DFlash2 only.** With the model's MTP head loaded (`FERRITE_DRAFT=mtp` or `auto`), there are no snapshots,
-  parking or shared prefixes: the server only reuses an identical prefix in the same slot, and says so once in its
-  log.
+- **Every drafting mode.** The cache works with DFlash2 and with the model's MTP head (`FERRITE_DRAFT=mtp` or
+  `auto`; the MTP head's K/V rows are parked with the model's). `FE_CACHE_MTP=0` turns it off for MTP drafting only.
 - **Memory.** The park pool comes on top of the model and the KV cache. Measured under agent load: one Spark with
   4 x 128K slots and the 12 GB pool keeps about 34 GB available (a 24 GB pool would go down to about 20 GB); two
   Sparks with 24 GB pools keep 55-58 GB available per node.

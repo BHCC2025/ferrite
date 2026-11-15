@@ -23,6 +23,16 @@ mod lanes;
 mod tp;
 pub use lanes::{DraftTuner, Parked};
 
+/// A prompt stopped early because its request was cancelled ([`Fast::cancel`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("prompt cancelled")
+    }
+}
+impl std::error::Error for Cancelled {}
+
 /// Dynamic shared memory of fx_pattn (kernels/k-fnext/src/pattn.rs PATTN_SMEM).
 const PATTN_SMEM: u32 = 512 * 16 + 4 * 2 * 512 * 16 + 2 * 4 * 16 * 4;
 
@@ -493,6 +503,10 @@ pub struct Fast {
     done_ev: Event,
     /// copy the last row's logits to the host each step (sampling); greedy only needs the token
     pub want_logits: bool,
+    /// the running request's cancel flag (set by the server when its client goes away): a prompt stops between
+    /// groups and between a group's layers with [`Cancelled`]; the lane's state is then incomplete (restore a
+    /// snapshot or reset it)
+    pub cancel: Option<Arc<AtomicBool>>,
     /// experts uploaded into dynamic slots so far
     pub uploads: u64,
     mtp: Option<Mtp>,
@@ -530,7 +544,7 @@ pub struct Fast {
     /// the step's (lane, first row, rows) segments for enqueue (empty: the current lane alone)
     plan: Vec<(usize, usize, usize)>,
     /// batched multi-lane step graphs by lane set
-    lane_graphs: std::collections::HashMap<Vec<usize>, Graph>,
+    lane_graphs: lanes::GraphCache,
     /// most cells the current lane may map (the lane budget; the whole pool when it runs alone)
     pub ctx_cap: usize,
     /// PLE table rows of the current step
@@ -593,7 +607,7 @@ struct DevSet {
     s2: Stream,
     w: Work,
     graphs: Vec<Option<Graph>>,
-    lane_graphs: std::collections::HashMap<Vec<usize>, Graph>,
+    lane_graphs: lanes::GraphCache,
     dynp: Option<DynCache>,
     arena: Vec<DeviceBuffer<u8>>,
     done_ev: Event,
@@ -1107,7 +1121,7 @@ impl Fast {
             missed: Arc::new(std::sync::Mutex::new(vec![])), step_no: Arc::new(AtomicU64::new(1)), dynp, cu,
             tabs_h, _arena: arena, expert_bytes_on_card: on_card, n_resident: n_res, cpu: None,
             stop: Arc::new(AtomicBool::new(false)), cur_rows: Arc::new(AtomicU32::new(1)), counts: counts_a,
-            stats: Arc::new(std::sync::Mutex::new(Stats::default())), done_ev, want_logits: true, uploads: 0, mtp, pw: None, pcfg, hm: hostmem::HostMem::new(&g), ctx_mapped: 8192.min(ctx), s2,
+            stats: Arc::new(std::sync::Mutex::new(Stats::default())), done_ev, want_logits: true, cancel: None, uploads: 0, mtp, pw: None, pcfg, hm: hostmem::HostMem::new(&g), ctx_mapped: 8192.min(ctx), s2,
             ev_fork, ev_join, mtp_graphs: (0..=MAX_ROWS).map(|_| None).collect(),
             spec_stats: (0, 0), draft_p: 1.0, acc_ema: 0.9, spec_ms: [0.0; 5], mtp_ms: [0.0; 3], mtp_counts: vec![], ple_idx: vec![], snaps: vec![], lanes, cur_lane: 0, plan: vec![], lane_graphs: Default::default(), ctx_cap: ctx, pcpu: None, ycpu: None, ple_flag: HostBuffer::alloc(1)?, pw_need: Default::default(),
             p_min: std::env::var("FNEXT_PMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7), dump: vec![],
@@ -1961,6 +1975,10 @@ impl Fast {
         let mut t = 0;
         let mut r = Ok(());
         for ch in toks.chunks(gmax) {
+            if self.cancelled() {
+                r = Err(Cancelled.into());
+                break;
+            }
             match if ch.len() > MAX_ROWS { self.prefill_group(ch) } else { self.prefill_small(ch) } {
                 Ok(v) => t = v,
                 Err(e) => {
@@ -1976,6 +1994,28 @@ impl Fast {
                 (t2 - t1) * 1e3, (t0.elapsed().as_secs_f64() - t2) * 1e3);
         }
         r.map(|_| t)
+    }
+
+    /// The running request was cancelled.
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Acquire))
+    }
+
+    /// Wait for the work queued on every device (a prompt group stopped between layers), then [`Cancelled`].
+    pub(crate) fn stop_cancelled(&self) -> anyhow::Error {
+        let r = (|| -> Result<()> {
+            if let Some(o) = &self.other {
+                o.cu.bind()?;
+                o.cu.synchronize()?;
+            }
+            self.cu.bind()?;
+            self.cu.synchronize()?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => Cancelled.into(),
+            Err(e) => e.context("waiting for the GPUs after a cancelled prompt"),
+        }
     }
 
     /// Prompts this long take the GEMM path (FNEXT_PREFILL_MIN, default 64 tokens); shorter ones run as decode steps.
@@ -3229,6 +3269,9 @@ impl Fast {
         let gmax = self.pw.as_ref().unwrap().gmax;
         let mut t = 0;
         for grp in toks.chunks(gmax) {
+            if self.cancelled() {
+                return Err(Cancelled.into());
+            }
             let base = self.tokens.len();
             t = self.prefill_group(grp)?;
             if std::env::var("FNEXT_MTP_PROMPT").as_deref() != Ok("rows") {
@@ -3449,6 +3492,12 @@ static SNAP_POOL: std::sync::Mutex<Vec<HostBuffer<u8>>> = std::sync::Mutex::new(
 static PREFILL_BUSY: AtomicBool = AtomicBool::new(false);
 static SNAP_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
 static SNAP_REFILL: std::sync::Mutex<Option<std::sync::mpsc::Sender<usize>>> = std::sync::Mutex::new(None);
+
+/// (buffers, bytes) of free snapshot buffers in the pool (memory reporting).
+pub fn snap_pool_bytes() -> (usize, usize) {
+    let p = SNAP_POOL.lock().unwrap();
+    (p.len(), p.iter().map(|b| b.len()).sum())
+}
 
 fn snap_take(n: usize) -> Result<HostBuffer<u8>> {
     let mut p = SNAP_POOL.lock().unwrap();

@@ -48,6 +48,19 @@ impl FnextEngine {
                     m
                 }
                 Err(e) => {
+                    // a raw CUDA OOM says nothing about what to change: on the card (out of memory), or pinned host
+                    // buffers past the memory limit (cuMemHostAlloc fails, often as CUDA_ERROR_UNKNOWN)
+                    let cu = e.chain().find_map(|c| c.downcast_ref::<fe_fnext::CuError>()).cloned();
+                    let slots = envu("FNEXT_SLOTS", 1);
+                    let e = match cu {
+                        Some(c) if c.call.contains("HostAlloc") || c.call.contains("HostRegister") => e.context(format!(
+                            "pinned host memory ran out while loading Flash-Next ({ctx}-token context, {slots} request \
+                            slots): lower FERRITE_CTX or FERRITE_SLOTS, or give the server more memory")),
+                        Some(c) if c.code == 2 => e.context(format!("the card ran out of memory while loading Flash-Next \
+                            ({ctx}-token context, {slots} request slots): lower FERRITE_CTX or FERRITE_SLOTS, or stop \
+                            what else uses the card (nvidia-smi)")),
+                        _ => e,
+                    };
                     let _ = ready_tx.send(Err(e));
                     return;
                 }
@@ -90,10 +103,13 @@ fn warmup(m: &mut Fast) -> Result<()> {
     let n = m.n_lanes();
     if n > 1 && std::env::var("FNEXT_WARM_LANES").map_or(true, |v| v != "0") {
         let t = Instant::now();
+        let a0 = rss_anon_mib();
         let sets: Vec<Vec<usize>> = (1u32..(1 << n)).filter(|b| b.count_ones() >= 2)
             .map(|b| (0..n).filter(|&i| b >> i & 1 == 1).collect()).collect();
         let made = m.warm_lanes(&sets, envu("FNEXT_DRAFTS", 4) + 1)?;
-        tracing::info!("fnext: {made} batched lane graphs for {} lane sets in {:.1} s", sets.len(), t.elapsed().as_secs_f32());
+        let da = rss_anon_mib().saturating_sub(a0);
+        tracing::info!("fnext: {made} batched lane graphs for {} lane sets in {:.1} s, +{da} MiB host memory ({:.1} MiB a graph)",
+            sets.len(), t.elapsed().as_secs_f32(), da as f64 / made.max(1) as f64);
     }
     if m.has_mtp() {
         m.reset()?;
@@ -187,6 +203,11 @@ fn done(m: &Fast, a: Active, reason: FinishReason) {
 fn start(m: &mut Fast, req: GenRequest, sink: TokenSink, alone: bool) -> Result<Option<Active>> {
     let t0 = Instant::now();
     let prompt = req.prompt_ids.clone();
+    if req.cancel.is_cancelled() {
+        // the client left while the request waited for a lane
+        sink.finish(Finish::new(FinishReason::Cancelled));
+        return Ok(None);
+    }
     if prompt.is_empty() {
         sink.finish(Finish::new(FinishReason::Error("empty prompt".into())));
         return Ok(None);
@@ -223,6 +244,8 @@ fn start(m: &mut Fast, req: GenRequest, sink: TokenSink, alone: bool) -> Result<
     m.want_logits = !greedy;
     let t_pre = Instant::now();
     let mut t_snap = 0f64;
+    // a client that goes away stops the prompt between layers (within ~0.2 s), see Fast::cancel
+    m.cancel = Some(req.cancel.flag());
     let res = m.prefill_cut(rest, &req.snapshots, spec, |m| {
         if cache_on {
             let ts = Instant::now();
@@ -242,8 +265,35 @@ fn start(m: &mut Fast, req: GenRequest, sink: TokenSink, alone: bool) -> Result<
         eprintln!("fnext: lane {} resume+restore {:.0} ms, prefill {} tokens {:.0} ms (of it snapshots {:.0} ms)", m.lane(),
             (t_pre - t0).as_secs_f64() * 1e3, rest.len(), t_pre.elapsed().as_secs_f64() * 1e3, t_snap * 1e3);
     }
+    m.cancel = None;
     let (first, d1) = match res {
         Ok(v) => v,
+        Err(e) if e.is::<fe_fnext::fast::Cancelled>() => {
+            // the lane holds a partly computed prompt: back to the latest snapshot this prefill (or an earlier
+            // request) left, so a retry of the same conversation resumes there; else an empty lane
+            let t_stop = t0.elapsed().as_secs_f64();
+            let restored = match m.snaps.iter().filter(|s| s.pos <= m.tokens.len()).map(|s| s.pos).max() {
+                Some(pos) => {
+                    let i = m.snaps.iter().position(|s| s.pos == pos).unwrap();
+                    let sn = m.snaps.remove(i);
+                    let r = m.snap_restore(&sn);
+                    m.snaps.insert(i, sn);
+                    m.snaps.retain(|s| s.pos <= pos);
+                    r.map(|_| pos)
+                }
+                None => m.reset().map(|_| 0),
+            };
+            match restored {
+                Ok(pos) => tracing::info!("fnext: lane {} prompt stopped after {:.2} s (client gone), lane kept at {pos} tokens",
+                    m.lane(), t_stop),
+                Err(e) => {
+                    tracing::warn!("fnext: lane {}: restore after a cancelled prompt: {e:#}", m.lane());
+                    let _ = m.reset();
+                }
+            }
+            sink.finish(Finish::new(FinishReason::Cancelled));
+            return Ok(None);
+        }
         Err(e) => {
             sink.finish(Finish::new(FinishReason::Error(format!("{e:#}"))));
             return Err(e);
@@ -286,7 +336,18 @@ fn schedule(m: &mut Fast, rx: mpsc::Receiver<(GenRequest, TokenSink)>) {
     // drafts per multi-lane speculative step, learned online (FNEXT_DRAFTS = the most, and a lone lane's count)
     let mut tuner = fe_fnext::fast::DraftTuner::new(envu("FNEXT_DRAFTS", 4));
     let mut tuner_log = Instant::now();
+    let mut mem_log = Instant::now();
     loop {
+        // host memory held by the prompt cache, every 10 minutes (parked conversations are capped by FNEXT_PARK_GB)
+        if mem_log.elapsed().as_secs() >= envu("FNEXT_MEM_LOG_S", 600) as u64 {
+            mem_log = Instant::now();
+            let (pn, pb) = fe_fnext::fast::snap_pool_bytes();
+            let lane_snaps: usize = (0..n).map(|i| m.lane_snap_bytes(i)).sum();
+            tracing::info!("fnext: host memory: {} parked conversations {} MiB (cap {} MiB; KV rows {} MiB), lane \
+                snapshots {} MiB, {pn} free snapshot buffers {} MiB, {} step graphs; RssAnon {} MiB (Rust heap {} MiB)", parked.len(),
+                parked.iter().map(|p| p.bytes()).sum::<usize>() >> 20, park_budget >> 20,
+                parked.iter().map(|p| p.kv_bytes()).sum::<usize>() >> 20, lane_snaps >> 20, pb >> 20, m.n_lane_graphs(), rss_anon_mib(), crate::rust_heap_bytes() >> 20);
+        }
         if act.iter().all(|a| a.is_none()) && queue.is_empty() {
             match rx.recv() {
                 Ok(x) => queue.push_back(x),
@@ -452,4 +513,10 @@ fn schedule(m: &mut Fast, rx: mpsc::Receiver<(GenRequest, TokenSink)>) {
             solo = false;
         }
     }
+}
+
+/// This process's resident anonymous memory (MiB), from /proc/self/status.
+fn rss_anon_mib() -> usize {
+    std::fs::read_to_string("/proc/self/status").ok().and_then(|t| t.lines().find(|l| l.starts_with("RssAnon:"))
+        .and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok())).map_or(0, |k| k >> 10)
 }

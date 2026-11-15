@@ -121,6 +121,14 @@ pub mod sched {
             EngineInfo { name: "ferrite".into(), max_batch, max_context }
         }
 
+        fn dead(&self) -> Option<String> {
+            self.0.dead()
+        }
+
+        fn prompt_reserve(&self) -> usize {
+            self.0.prompt_reserve()
+        }
+
         fn submit(&self, r: GenRequest, sink: TokenSink) {
             let mut sink = Some(sink);
             let req = Request { id: r.id, prompt_ids: r.prompt_ids, snapshots: r.snapshots, sampling: sampling(r.params),

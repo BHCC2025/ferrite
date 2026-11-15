@@ -16,7 +16,7 @@ TP_ENV="FE_PROMPT=fp4" tools/kl-tp2.sh $FERRITE_EXL3_DIR text
 TP_ENV="FE_MTP=1 FE_SPEC=4" tools/tp2.sh $FERRITE_EXL3_DIR generate "def fibonacci(n):" 256     # MTP speculative decode
 # serving: rank 0 runs the scheduler / server, rank 1 replays its engine calls (`ferrite <model> follow`)
 FOLLOW=$FERRITE_EXL3_DIR tools/tp2.sh target/release/ferrite $FERRITE_EXL3_DIR sched-test 6
-PROMPT=fp4 tools/serve-tp2.sh          # the OpenAI server (model "qwen3.8-27b") on node A :8000 as TP2
+tools/serve-tp2.sh                     # the OpenAI server (model "qwen3.8-27b") on node A :8000 as TP2
 TP2_DRY=1 tools/tp2.sh ...             # print what both ranks would run, run nothing
 # by hand: FE_TP_WORLD=2 FE_TP_RANK=0|1 FERRITE_TP_ADDR=<rank 0 fabric address>:<port> on both ranks, plus the
 #          NCCL_IB_GID_INDEX / NCCL_SOCKET_IFNAME / NCCL_IB_HCA and FERRITE_ROCE_* settings tools/site.sh prints
@@ -70,26 +70,17 @@ layer is split like the others, mtp.fc replicated, and the draft head is a repli
 ranks too (half the heads and MLP features of every draft layer and of the draft K/V cache on each; fc, the
 convolutions and norms replicated).
 
-## Results (2026-11-04)
+## Results
 
 ### Serving
 
-`PROMPT=fp4 SLOTS=4 CTX=131072 tools/serve-tp2.sh` (the defaults otherwise: DFlash2 drafter with best-first verify
-trees, block 16, up to 48 verify rows, copy rows 47), measured with an OpenAI-API client bench: 500 output tokens
-after a ~2K-token code or prose prompt (each prefixed with a random nonce), 1 and 4 streams, and one ~32K-token
-code prompt; greedy, thinking off; three runs, decode tok/s:
+The current serving figures (code, prose and edits at 1 and 4 requests, prompt processing from 2K to 120K) are the
+README's [Results](README.md#results) table. They were measured with `tools/bench/sweep.sh`, which starts
+`tools/serve-tp2.sh` with its defaults on a test port and runs `tools/bench/sweep.py` against it. To measure your own
+pair, run `FERRITE_PEER=<node B> tools/bench/sweep.sh` on node A (about 20 minutes).
 
-| | run 1 | run 2 | run 3 |
-|---|---|---|---|
-| 2K code, 1 stream | 249.7 | 263.5 | 270.0 |
-| 2K prose, 1 stream | 73.3 | 579.2 | 565.5 |
-| 2K code, 4 streams (aggregate) | 315.6 | 314.3 | 313.0 |
-| 2K prose, 4 streams (aggregate) | 166.9 | 168.4 | 170.7 |
-| 32K code, 1 stream | 232.5 | 232.1 | 229.1 |
-
-Prose swings with the nonce: when the model's reply repeats text it has already seen, copy rows verify long
-copies (runs 2 and 3); run 1 is ordinary prose. Time to first token: 0.56 s for a 2K prompt (~3.4K tok/s), all
-four 2K prompts by 2.09 s (~3.7K tok/s), 11.2 s for 32K (~2.8K tok/s).
+The sections below are development measurements of the engine paths: lockstep CLI runs and earlier builds, kept
+for the comparisons inside each table. Each one gives the command it was taken with.
 
 ### Accuracy
 
@@ -156,7 +147,7 @@ in the server takes prose 50.7 -> 78.0 and 4-stream code 183 -> 197.
 
 ### Long context and load
 
-Server at 4 x 128K (MTP depth 4, thinking off, temperature 0; per-request numbers from fe-server):
+Server at 4 x 128K (MTP depth 4, thinking off, temperature 0; per-request numbers from fe-server; a 2026-11-04 build):
 
 | load | first token | decode |
 |---|---|---|
@@ -173,15 +164,32 @@ scheduler fairness). Available memory with the model loaded (MTP, 4 x 128K): 74 
 ## Serving
 
 ```
-. tools/site.sh
-PROMPT=fp4 SLOTS=4 CTX=131072 tools/serve-tp2.sh          # on node A; ~40 s to load
+FERRITE_PEER=nodeb tools/serve-tp2.sh                    # on node A, in the foreground; ~40 s to load
+FERRITE_PEER=nodeb scripts/ferritectl.sh start tp2       # or in the background (stop / status / log)
 tools/serve-tp2.sh --help                                # the settings and the commands it would run
 until curl -sf localhost:8000/v1/models; do sleep 5; done
 ```
 
-The script holds the global TP2 lock and both nodes' GPU locks while the server is up. To stop it, stop rank 0
-(fe-server); the follower on node B exits when the link closes ("rank 0 stopped after N calls"). Rank 1 runs the
-binary at the same path on node B, so do not rebuild there while the server runs.
+The server listens on every interface of node A (`FERRITE_HOST=127.0.0.1` keeps it local), with no API key: use it
+on a trusted network or firewall the port. The script holds the global TP2 lock and both nodes' GPU locks while the
+server is up. A second start stops at once and names the holder. Stopping the script (Ctrl-C, `kill <pid>`, or
+`scripts/ferritectl.sh stop`) stops rank 0. The follower on node B then exits ("rank 0 stopped after N calls"), and
+both nodes' locks and memory are free again. Rank 1 runs the binary at the same path on node B, so do not rebuild
+there while the server runs.
+
+### NCCL
+
+Both nodes need NCCL 2.30 or newer for the prompt batches (decode-sized reductions take the RoCE path). DGX OS does
+not ship it. Without sudo, NVIDIA's wheel works (tested with NCCL 2.32.6):
+
+```bash
+python3 -m venv ~/.venvs/nccl && ~/.venvs/nccl/bin/pip install nvidia-nccl-cu13           # on both nodes
+export FERRITE_NCCL_LIB=$(ls ~/.venvs/nccl/lib/python3*/site-packages/nvidia/nccl/lib/libnccl.so.2)
+```
+
+`tools/serve-tp2.sh` passes `FERRITE_NCCL_LIB` to node B, so the path must be the same there. With sudo,
+`sudo apt install libnccl2` from NVIDIA's CUDA repository puts it on the loader path instead.
+`scripts/check-deps.sh --two-node` checks it.
 
 ## Open
 

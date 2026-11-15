@@ -7,26 +7,36 @@
 # nvidia-smi lists): two or more -> tensor parallel over the first two (FNEXT_TP=2, half the heads and half the
 # experts on each); one -> the single-card engine (experts that do not fit on the card run on the CPU). The host
 # memory picks the pinned pools inside the engine (below 40 GiB: one prompt-cache snapshot buffer, no prompt
-# stages); this script picks the request slots. It runs in the foreground; Ctrl-C stops it.
+# stages); this script picks the request slots. It runs in the foreground and its process becomes the server: Ctrl-C
+# or `kill <pid>` stops it. scripts/ferritectl.sh runs it in the background.
 #
-# Environment (defaults in brackets; FERRITE_MODELS / FERRITE_GPU_LOCK come from tools/site.sh):
+# Environment (defaults in brackets; FERRITE_MODELS / FERRITE_GPU_LOCK come from tools/site.sh; the server holds
+# FERRITE_GPU_LOCK shared and a lock of its own per card, so jobs on other cards are not blocked):
 #   FNEXT_DIR         folder from scripts/fetch-flashnext.sh [$FERRITE_MODELS/Qwen3.8-Flash-Next]
 #   FERRITE_GPUS      auto, 1 or 2 [auto]
-#   FERRITE_HOST      listen address [127.0.0.1; there is no API key, firewall it before using 0.0.0.0]
-#   FERRITE_PORT      [8000]
+#   FERRITE_HOST      listen address [0.0.0.0: every machine on your network can reach it, and there is no API key,
+#                     so use it on a trusted network or firewall the port; 127.0.0.1 keeps it on this machine]
+#   FERRITE_PORT      [8000]; checked before the model loads
+#   FERRITE_GPU_LOCK  the node's GPU lock, held shared, plus each used card's own lock (ferrite-gpu.<card UUID>.lock)
+#                     exclusively: a 27B server on the other card does not block this one; a second launcher on the
+#                     same card stops at once and names the holder (FERRITE_LOCK_WAIT=1 waits) [/var/tmp/ferrite-gpu.lock]
 #   FERRITE_MODEL_ID  model id reported by /v1/models [qwen3.8-flash-next]
 #   FERRITE_CTX       context length [131072]
 #   FERRITE_SLOTS     requests at once (1-8) [4 with two cards, or one card and >= 40 GiB of memory; 1 below]
 #   FERRITE_DRAFT     mtp (speculative decoding with the MTP draft file) or off [mtp when the draft file is there]
 #   FERRITE_BIN       fe-server built with --features fnext [bin/fe-server, else target/release/fe-server]
+#   FERRITE_GPU_WAIT  1: wait for a busy card instead of failing [0]
 #   FNEXT_*           passed through to the engine (e.g. FNEXT_COUNTS, FNEXT_CPU_POOL, FNEXT_RESERVE_MIB)
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-die() { echo "serve-fnext: $*" >&2; exit 1; }
+fl_name=serve-fnext
 case ${1:-} in -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;; esac
 # shellcheck source=site.sh
 . "$root/tools/site.sh"
+# shellcheck source=launch-lib.sh
+. "$root/tools/launch-lib.sh"
+die() { fl_die "$@"; }
 
 dir=${FNEXT_DIR:-$FERRITE_MODELS/Qwen3.8-Flash-Next}
 model=$(ls "$dir"/*-00001-of-0000[0-9].gguf 2>/dev/null | head -1 || true)
@@ -94,9 +104,9 @@ esac
 echo "serve-fnext: $model$([ "$dr" = mtp ] && echo " + $(basename "$draft")")"
 echo "serve-fnext: $([ "$gpus" = 2 ] && echo "two cards, tensor parallel" || echo "one card") ($ids), ${mem_gib} GiB host memory, \
 ctx $FNEXT_CTX x $slots slots, drafting $dr"
-echo "serve-fnext: http://${FERRITE_HOST:-127.0.0.1}:${FERRITE_PORT:-8000}/v1 as model '${FERRITE_MODEL_ID:-qwen3.8-flash-next}' (loading takes a minute or two)"
-mkdir -p "$(dirname "$FERRITE_GPU_LOCK")"
-flock -n "$FERRITE_GPU_LOCK" true || die "another Ferrite GPU job holds $FERRITE_GPU_LOCK"
-exec flock -n -E 75 "$FERRITE_GPU_LOCK" "$bin" --engine fnext --model-dir "$dir" \
-  --host "${FERRITE_HOST:-127.0.0.1}" --port "${FERRITE_PORT:-8000}" --served-model-name "${FERRITE_MODEL_ID:-qwen3.8-flash-next}" \
+fl_net
+fl_take_locks ${ids//,/ }
+fl_banner "${FERRITE_MODEL_ID:-qwen3.8-flash-next}" "loading takes a minute or two"
+exec "$bin" --engine fnext --model-dir "$dir" \
+  --host "$FERRITE_HOST" --port "$FERRITE_PORT" --served-model-name "${FERRITE_MODEL_ID:-qwen3.8-flash-next}" \
   --max-model-len "$FNEXT_CTX" "$@"

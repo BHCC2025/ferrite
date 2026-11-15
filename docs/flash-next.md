@@ -25,28 +25,53 @@ layer's experts, so twice the expert slots and almost no CPU work.
 ## Results
 
 Two RTX 5060 Ti 16 GB (PCIe 4.0 x8 each), AMD EPYC 7313 (16 cores), 128 GB DDR4, NVMe. Qwen3.8-Flash-Next
-GSQ-RCO IQ1_M, 128K context configured, greedy decoding, thinking off, a short chat prompt and 256 tokens out
-(`fnext-run bench` / `mtp`), three warm runs; prompt processing is the second pass over the same prompt length.
+GSQ-RCO IQ1_M, 128K context configured, `tools/serve-fnext.sh` with its defaults, thinking off, measured at the
+server with `tools/bench/quickbench.py` (commands below): ~2K-token prompts, 256 tokens out, three runs after a
+warm-up. Prompt speed is the prompt's tokens over the time to the first token of a fresh prompt.
 
 | | Two cards (tensor parallel) | One card, 28 GiB memory limit |
 |---|---|---|
-| Code, with MTP drafting | 135-136 tok/s | 84.0-85.3 tok/s |
-| Prose, with MTP drafting | 110-111 tok/s | 66.7-67.5 tok/s |
-| Plain decoding, code / prose | 74.5-74.8 / 74.8-75.3 tok/s | 45.8-46.5 / 44.8-45.2 tok/s |
-| Prompt processing, 2K / 16K tokens | 1,434 / 2,467 tok/s | 1,341-1,345 / 1,874-1,888 tok/s |
-| Prompt processing with the MTP pass, 2K / 16K | 1,336 / 2,414 tok/s | 1,207-1,215 / 1,864-1,883 tok/s |
-| Four requests at once, code, total (plain / MTP) | 177-179 / 194-201 tok/s | not measured under the limit |
+| Code, with MTP drafting | 131-146 tok/s | 93-99 tok/s |
+| Prose, with MTP drafting | 127-132 tok/s | 74-88 tok/s |
+| Plain decoding (`FERRITE_DRAFT=off`), code / prose | not measured at the server yet | 38-43 / 41-46 tok/s |
+| Prompt, 2K / 16K tokens | ~1,200 / 2,350-2,410 tok/s | ~710 / 1,820-1,860 tok/s |
+| Four requests at once, short prompts, total (code / prose) | 153-193 / 129-137 tok/s | one at a time (1 slot below 40 GiB) |
+| Four requests at once, fresh 2K prompts, total (code / prose) | 88 / 81-96 tok/s, all first tokens by ~6.5 s | |
 
-- Server, two cards, 4 slots (`fe-server`, no thinking): one code request decodes at 125-142 tok/s with the first
-  token in 0.19 s; four at once total 181 tok/s on code and 145 on prose.
+- The prompt rows were measured before Flash-Next started fixing the C heap's malloc thresholds by default, which
+  keeps a long-running server's host memory flat. With that default, processing a fresh prompt is about 8-10%
+  slower than the table shows. `FERRITE_MALLOC=0` gives the faster prompts back, at the cost of host memory that
+  grows slowly over a long run. Decoding speed is unchanged.
+- With fresh prompts, four requests at once total less than the short-prompt row: their prompts are processed one
+  after another, and the others' decoding waits meanwhile (see Limits). The short-prompt row is what chat
+  follow-ups and agent turns with a cached prefix see.
 - Speculative decoding is lossless: greedy output with the MTP draft is the same token stream as without it (four
   reference prompts of 39 to 20,000 tokens, 64 tokens each, every preset), and requests decoded together give the
   same tokens as alone. About 92-93% of the drafted tokens are accepted on code and 79% on prose.
-- A 10-minute soak with four clients (chat turns, growing agent transcripts, prompts up to ~10K tokens, sampled and
-  greedy): 260 requests, no errors.
-- The one-card column runs inside a 28 GiB memory limit (a cgroup, no swap) to stand in for a 32 GB machine; its CPU
-  is still the 16-core EPYC, which computes the experts that miss the card. A desktop CPU with fewer cores or less
-  memory bandwidth will be slower there.
+- A 75-minute soak with four clients on two cards (chat turns, growing agent transcripts, prompts up to ~30K
+  characters, sampled and greedy): 1,182 requests, no errors.
+- The one-card column runs inside a 28 GiB memory limit (a cgroup, no swap, page cache dropped first) to stand in
+  for a 32 GB machine; its CPU is still the 16-core EPYC, which computes the experts that miss the card. A desktop
+  CPU with fewer cores or less memory bandwidth will be slower there.
+
+To reproduce against a running server (`QB_SEED` fixes the prompts; each command prints the median of its runs):
+
+```bash
+export QB_SEED=1
+B="python3 tools/bench/quickbench.py --url http://localhost:8000/v1"
+$B --tokens 64 --context 2000 --mode code --runs 2              # warm-up
+$B --tokens 256 --context 2000 --mode code --runs 3             # and --mode prose
+$B --tokens 16 --context 16000 --mode code --runs 3             # 16K prompt
+$B --tokens 256 --context 0 --streams 4 --mode code --runs 3    # four at once, short prompts
+$B --tokens 256 --context 2000 --streams 4 --mode code --runs 3 # four at once, fresh 2K prompts
+```
+
+The one-card memory limit:
+
+```bash
+sudo sysctl vm.drop_caches=3   # else the page cache already read stays charged outside the limit
+sudo systemd-run --scope -p MemoryMax=28G -p MemorySwapMax=0 --uid=$USER env FERRITE_GPUS=1 tools/serve-fnext.sh
+```
 
 ## Requirements
 
@@ -58,14 +83,21 @@ GSQ-RCO IQ1_M, 128K context configured, greedy decoding, thinking off, a short c
 - About 60 GB of disk, on an NVMe drive: cold PLE rows and experts are read from it while generating.
 - NVIDIA driver 580 or later (tested with 595.99), Linux (tested on Ubuntu 24.04).
 - To build: stable Rust 1.99+, the kernels' pinned nightly (`kernels/rust-toolchain.toml`) with `rust-src`,
-  `llvm-tools`, `llvm-bitcode-linker` and the `nvptx64-nvidia-cuda` target, and `ptxas` from the CUDA 13 toolkit
-  (tested with 13.3), as in [docs/rtx-5080.md](rtx-5080.md).
+  `llvm-tools`, `llvm-bitcode-linker` and the `nvptx64-nvidia-cuda` target, `ptxas` from the CUDA 13 toolkit
+  (tested with 13.3; NVIDIA's `cuda-nvcc-13-x` package is enough for Flash-Next) and a C toolchain
+  (`build-essential`), as in [docs/rtx-5080.md](rtx-5080.md).
+- To download: `curl`, `sha256sum` and `python3` (standard library only); the Hugging Face CLI (`hf`) is used
+  when it is installed.
+- **Cooling.** Ferrite keeps a card at full load for as long as requests come in. Cards in adjacent slots heat each
+  other, so give a machine with two or more cards enough case airflow and watch their temperature under a long run
+  (`nvidia-smi --query-gpu=temperature.gpu --format=csv -l 5`). A card that overheats can crash the driver or keep
+  the machine from booting until it has cooled.
 
 ## Setup
 
 ```bash
-# build the server with the Flash-Next engine
-cargo build --release -p fe-server --features fnext
+# build the server (both engines: Flash-Next and the 27B); FE_KARCH=sm_120a compiles the kernels for RTX 50 cards
+FE_KARCH=sm_120a cargo build --release -p fe-server --features ferrite,fnext
 
 # download and verify the model files (~60 GB) into $FERRITE_MODELS/Qwen3.8-Flash-Next (default /var/tmp/models)
 scripts/fetch-flashnext.sh
@@ -75,7 +107,18 @@ tools/serve-fnext.sh
 curl -s localhost:8000/v1/models
 ```
 
-`scripts/fetch-flashnext.sh` downloads, resumes and checks (size and sha256):
+`FE_KARCH` names the GPU the kernels are compiled for. Without it the build asks `nvidia-smi` and uses the card it
+reports (a build warning says which); with no card to ask it falls back to `sm_121a`, the DGX Spark. A binary whose
+kernels do not match the card stops at once with the command to rebuild, before it loads anything. `--features fnext`
+alone builds only Flash-Next; building one engine alone later replaces the other's `target/release/fe-server`, so
+keep both features in one build. The packages a clean Ubuntu machine needs are in
+[docs/quickstart.md, "Clean machine"](quickstart.md#clean-machine).
+
+`scripts/fetch-flashnext.sh` downloads, resumes and checks (size and sha256). It uses the Hugging Face CLI when
+`hf` is installed, else curl with eight byte ranges of a file at once (`FNEXT_FETCH_PARTS`); each range resumes
+where it stopped and is retried with a growing pause (`FNEXT_FETCH_TRIES`, default 10), so a dropped or stalled
+connection does not end the download. A file of the right size whose sha256 differs is moved to `NAME.bad` and
+fetched again. `FNEXT_FETCH=curl` or `=hf` picks the downloader.
 
 | File | From | Notes |
 |---|---|---|
@@ -104,15 +147,20 @@ How it was made is in its model card.
 
 `FERRITE_GPUS=1` uses one card when two are visible. With more than two cards the first two are used.
 
+The server holds a lock for each card it uses (next to `FERRITE_GPU_LOCK`, by card UUID) and the node lock shared,
+so a 27B server on one card and Flash-Next on the other run side by side. It stops at once when a card is taken
+and names the process holding it (`FERRITE_LOCK_WAIT=1` waits for it instead). It also stops in a second, before loading, when the port is taken.
+
 | Setting | Default | |
 |---|---|---|
 | `FNEXT_DIR` | `$FERRITE_MODELS/Qwen3.8-Flash-Next` | the folder from `scripts/fetch-flashnext.sh` |
 | `FERRITE_GPUS` | `auto` | `1` or `2` |
-| `FERRITE_HOST`, `FERRITE_PORT` | `127.0.0.1`, `8000` | there is no API key: firewall the port before using `0.0.0.0` |
+| `FERRITE_HOST`, `FERRITE_PORT` | `0.0.0.0`, `8000` | every interface, so other machines on the network can use it; there is no API key, so use it on a trusted network or firewall the port. `127.0.0.1` keeps it on this machine |
 | `FERRITE_MODEL_ID` | `qwen3.8-flash-next` | the id `/v1/models` reports |
 | `FERRITE_CTX` | `131072` | context length |
 | `FERRITE_SLOTS` | see above | requests at once, 1-8 |
 | `FERRITE_DRAFT` | `mtp` when the draft file is there, else `off` | |
+| `FERRITE_LOCK_WAIT` | `0` | `1`: wait for a busy card instead of stopping |
 | `FNEXT_COUNTS` | `crates/fe-fnext/data/routing-mix.json` | expert routing counts that pick the experts loaded first |
 | `FNEXT_CPU_POOL` | the E-cores on a hybrid Intel CPU, else one thread per physical core not taken by the engine's 3 own threads | CPUs that compute the experts that miss the card |
 
@@ -125,7 +173,14 @@ How it was made is in its model card.
   very long one is ~20% slower for a while (its expert slots refill).
 - Requests that sample (temperature > 0) decode one token a step; greedy requests use MTP drafting. Several requests
   at once share a step either way.
-- Long prompts run alone: other requests wait while one prefills.
+- A prompt is processed while the other requests wait: their decoding pauses until it is done. Requests that
+  arrive together with fresh prompts therefore start one after another (four 2K-token prompts on two cards: the
+  last first token after ~6.5 s, 88 tok/s in total over the whole run, against ~190 with short or cached prompts).
+  Chat follow-ups and agent turns mostly hit the prompt cache, so their prompts are short. A request longer than a
+  slot's share of the context (32K tokens of the 128K with four slots) waits until the others are done and runs
+  alone.
+- A client that disconnects stops its request within a fraction of a second, also in the middle of a long prompt
+  (it stops between layers); the slot keeps the conversation up to its last prompt-cache point.
 - Same weights as published, never requantized: the IQ1_M files are loaded as they are.
 
 ## License

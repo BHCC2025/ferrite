@@ -452,6 +452,11 @@ impl Fast {
                 done: pf_ev[k0].clone() }).ok();
         }
         for l in lo..hi {
+            if self.cancelled() {
+                // the client went away: stop between layers (the lane's state is incomplete; the caller restores it)
+                drop(pf);
+                return Err(self.stop_cancelled());
+            }
             let ly = &self.layers[l];
             if let Some(p) = &pf {
                 if l + 1 < hi {
@@ -654,9 +659,9 @@ impl Fast {
                 let mut ids = vec![0i32; np_all];
                 s.memcpy_dtoh(&mut ids, pw.ids_n.ptr())?;
                 let cpu_rows: usize = std::env::var("FNEXT_CPU_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-                let mut hq8 = (vec![0i8; 0], vec![0f32; 0], vec![0f32; 0]);
+                let mut hq8 = Hq8::empty();
                 if cpu_rows > 0 {
-                    hq8 = (vec![0i8; n_all * d], vec![0f32; n_all * d / 32], vec![0f32; n_all * d / 32]);
+                    hq8 = Hq8::take(n_all * d, n_all * d / 32);
                     s.memcpy_dtoh(&mut hq8.0, pw.ea_n.q.ptr())?;
                     s.memcpy_dtoh(&mut hq8.1, pw.ea_n.d.ptr())?;
                     s.memcpy_dtoh(&mut hq8.2, pw.ea_n.s.ptr())?;
@@ -1465,6 +1470,11 @@ impl Fast {
         }
         let bfx = |pw: &PWork| pw.bfx.ptr();
         for l in 0..c.n_layer {
+            if self.cancelled() {
+                // the client went away: stop between layers on both cards (the caller restores the lane)
+                drop(pfs);
+                return Err(self.stop_cancelled());
+            }
             // ---- next layer's prefetch ----
             for r in 0..2 {
                 if let Some(p) = &pfs[r] {
@@ -1643,9 +1653,9 @@ impl Fast {
                 let mut ids = vec![0i32; np_all];
                 self.s.memcpy_dtoh(&mut ids, pws[0].ids_n.ptr())?;
                 let cpu_rows: usize = std::env::var("FNEXT_CPU_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-                let mut hq8 = (vec![0i8; 0], vec![0f32; 0], vec![0f32; 0]);
+                let mut hq8 = Hq8::empty();
                 if cpu_rows > 0 {
-                    hq8 = (vec![0i8; n_all * d], vec![0f32; n_all * d / 32], vec![0f32; n_all * d / 32]);
+                    hq8 = Hq8::take(n_all * d, n_all * d / 32);
                     self.s.memcpy_dtoh(&mut hq8.0, pws[0].ea_n.q.ptr())?;
                     self.s.memcpy_dtoh(&mut hq8.1, pws[0].ea_n.d.ptr())?;
                     self.s.memcpy_dtoh(&mut hq8.2, pws[0].ea_n.s.ptr())?;
@@ -1993,4 +2003,51 @@ pub(crate) fn prewarm_stages(c: &Config, g: &Gguf, group: usize, n: usize) -> Re
 static PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(crate) fn set_probe(on: bool) {
     PROBE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Host copies of a short prompt's q8 activation rows (for the experts the CPU computes), one set reused across
+/// layers and prompts: a fresh ~10 MB allocation in each of the 48 layers is a new mapping under the fixed malloc
+/// thresholds (fe-server), and its page faults cost ~10% of a 2K prompt.
+static HQ8_POOL: std::sync::Mutex<Option<(Vec<i8>, Vec<f32>, Vec<f32>)>> = std::sync::Mutex::new(None);
+
+struct Hq8 {
+    v: (Vec<i8>, Vec<f32>, Vec<f32>),
+}
+
+impl Hq8 {
+    fn empty() -> Hq8 {
+        Hq8 { v: (vec![], vec![], vec![]) }
+    }
+    /// Buffers of nq quants and ns scales (contents undefined: the caller overwrites them).
+    fn take(nq: usize, ns: usize) -> Hq8 {
+        let mut v = HQ8_POOL.lock().unwrap().take().unwrap_or_default();
+        v.0.resize(nq, 0);
+        v.1.resize(ns, 0.0);
+        v.2.resize(ns, 0.0);
+        Hq8 { v }
+    }
+}
+
+impl Drop for Hq8 {
+    fn drop(&mut self) {
+        if self.v.0.capacity() > 0 {
+            let mut p = HQ8_POOL.lock().unwrap();
+            if p.as_ref().is_none_or(|q| q.0.capacity() <= self.v.0.capacity()) {
+                *p = Some(std::mem::take(&mut self.v));
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for Hq8 {
+    type Target = (Vec<i8>, Vec<f32>, Vec<f32>);
+    fn deref(&self) -> &Self::Target {
+        &self.v
+    }
+}
+
+impl std::ops::DerefMut for Hq8 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.v
+    }
 }

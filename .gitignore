@@ -5,3 +5,5 @@ target/
 *.log
 /dist/
 /tools/site.local.sh
+/logs/
+__pycache__/

@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Quick streaming bench for the :8000 server: prefill and generation speed, code or prose.
 
-usage: quickbench.py [--url http://host:8000/v1] [--tokens 500] [--context 2000] [--streams 1]
-The menu changes the context size (c), tokens to generate (t) and concurrent streams (n); counts take 8k, 32000, ...
+usage: quickbench.py [--url http://host:8000/v1] [--tokens 500] [--context 2000] [--streams 1] [--mode code|prose] [--runs N]
+(--run / --repeat are the same options.)
+With --mode it runs that case --runs times (default 1) and exits: the form for scripts and for the docs' tables.
+Without it, a menu changes the context size (c), tokens to generate (t) and concurrent streams (n); counts take
+8k, 32000, ... Several streams report two rates: "decode" = the tokens generated while all of them were generating,
+over that time (what the docs' "N requests, aggregate" figures are), and "wall" = all tokens over the whole time
+including the prompt processing before the first tokens.
 """
 import argparse, json, random, sys, threading, time, urllib.request
 import os
@@ -80,6 +85,8 @@ def stream(url, mode, max_tokens, context_tokens, echo=True):
             if data == "[DONE]":
                 break
             ev = json.loads(data)
+            if ev.get("error"):
+                raise RuntimeError(f"the server reported an error: {ev['error']}")
             if ev.get("usage"):
                 usage = ev["usage"]
             for ch in ev.get("choices") or []:
@@ -109,6 +116,9 @@ def run(url, mode, max_tokens, context_tokens):
     ttft = t_first - t0
     gen_s = max(t_end - t_first, 1e-9)
     print("\n\n\033[1;33m--- results ---\033[0m")
+    if not gtoks:
+        print("no tokens came back: the request failed (see the server log)")
+        return None
     if ptoks:
         print(f"prompt   {ptoks:>6} tokens  (cached {cached})")
         print(f"prefill  {ttft:>9.2f} s to first token  ->  {ptoks / ttft:,.0f} tok/s")
@@ -117,6 +127,7 @@ def run(url, mode, max_tokens, context_tokens):
     print(f"generate {gtoks:>6} tokens in {gen_s:.2f} s  ->  \033[1;32m{(gtoks - 1) / gen_s:,.1f} tok/s\033[0m")
     print(f"reply    {s['kind']} (zlib {s['zlib']:.2f}, nonce {s['nonce']})")
     print(f"total    {t_end - t0:>9.2f} s")
+    return (gtoks - 1) / gen_s
 
 
 def concurrent(url, mode, max_tokens, context_tokens, n):
@@ -158,8 +169,13 @@ def concurrent(url, mode, max_tokens, context_tokens, n):
     print(f"\nstreams  {len(ok)} of {n} finished")
     if prompt:
         print(f"prefill  {prompt:>6} prompt tokens, all first tokens by {last_first:.2f} s  ->  {prompt / last_first:,.0f} tok/s")
-    print(f"generate {gen:>6} tokens in {wall:.2f} s wall  ->  \033[1;32m{gen / wall:,.1f} tok/s aggregate\033[0m"
+    f = max(r["first"] for r in ok)
+    e = max(r["end"] for r in ok)
+    dec = sum(r["gen"] * max(r["end"] - max(r["first"], f), 0) / max(r["end"] - r["first"], 1e-9) for r in ok) / max(e - f, 1e-9)
+    print(f"generate {gen:>6} tokens: \033[1;32m{dec:,.1f} tok/s decode aggregate\033[0m (while all {len(ok)} generate), "
+          f"{gen / wall:,.1f} tok/s wall (with the prompt processing)"
           f"  (per stream {min(per):.1f} to {max(per):.1f}, mean {sum(per) / len(per):.1f})")
+    return dec
 
 
 def count(text):
@@ -211,9 +227,24 @@ def main():
     ap.add_argument("--tokens", type=count, default=500, help="tokens to generate (500, 2k, ...)")
     ap.add_argument("--context", type=count, default=2000, help="approx. prompt tokens of filler context (2000, 32k, ...)")
     ap.add_argument("--streams", type=int, default=1, help="concurrent requests (1 = a single streamed reply)")
+    ap.add_argument("--mode", "--run", dest="mode", choices=["code", "prose"], help="run this case and exit (no menu)")
+    ap.add_argument("--runs", "--repeat", dest="runs", type=int, default=1, help="with --mode: runs (the median is printed at the end)")
     a = ap.parse_args()
     window = context_window(a.url)
     limit = batch_limit(a.url)
+    if a.mode:
+        m = {"code": "1", "prose": "2"}[a.mode]
+        rates = []
+        for _ in range(max(a.runs, 1)):
+            r = concurrent(a.url, m, a.tokens, a.context, a.streams) if a.streams > 1 else run(a.url, m, a.tokens, a.context)
+            if r:
+                rates.append(r)
+        if rates:
+            import statistics
+            what = "decode aggregate" if a.streams > 1 else "generation"
+            print(f"\n{a.mode}, {a.streams} stream(s), ~{a.context} context, {a.tokens} tokens: median {what} "
+                  f"{statistics.median(rates):,.1f} tok/s over {len(rates)} run(s) (min {min(rates):.1f}, max {max(rates):.1f})")
+        return
     while True:
         print("\n\033[1mQuick bench\033[0m  (" + a.url + f", {a.tokens} tokens, ~{a.context} ctx, {a.streams} stream"
               + ("s" if a.streams != 1 else "") + (f", model window {window}" if window else "")

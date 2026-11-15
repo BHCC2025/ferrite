@@ -9,11 +9,14 @@
 # name (ferrite-<version>-<describe>-dgx-spark-aarch64) for builds that are not a release; BUILD-INFO records the
 # commit either way. Unpacked, the release runs from its own folder (the same name without .tar.gz):
 #   bin/fe-server, bin/ferrite        the binaries (target/release is a link to bin/ for the tools/ scripts)
-#   scripts/                          install.sh, fetch-models.sh, serve.sh (one node), check-deps.sh, models.manifest
-#   tools/                            site.sh (site settings) + fabric-detect.sh, serve-tp2.sh + tp2.sh + tp2-exec.sh
-#                                     (two nodes), serve.sh, gate-serve-tp2.sh
-#   README.md, AGENTS.md, LICENSE, NOTICE, CREDITS.md, NON-RUST.md, TP2.md, BUILD-INFO, and docs/: quickstart.md,
-#   prompt-cache.md, benchmarks.md, model-card.md (the pages README.md and the quickstart link to)
+#   scripts/                          install.sh, ferritectl.sh, fetch-models.sh, serve.sh (one node), serve-xe.sh,
+#                                     check-deps.sh, fetch-flashnext.sh, models.manifest
+#   tools/                            site.sh (site settings), launch-lib.sh, fabric-detect.sh, serve-tp2.sh + tp2.sh +
+#                                     tp2-exec.sh (two nodes), serve.sh, serve-5080.sh, serve-fnext.sh,
+#                                     gate-serve-tp2.sh, release-gate.sh, kl.sh / kl-tp2.sh, bench/ (the benchmark clients
+#                                     the docs' tables are measured with)
+#   README.md, AGENTS.md, CHANGELOG.md, LICENSE, NOTICE, CREDITS.md, NON-RUST.md, TP2.md, BUILD-INFO, and every page of
+#   docs/ (with docs/assets), so each link in them resolves inside the tarball
 # Build requirements are in docs/quickstart.md ("Build from source"); the runtime libraries are checked with ldd.
 # The build remaps this machine's paths out of the binaries (panic locations, the cargo registry):
 # --remap-path-prefix $HOME=/home/user, $CARGO_HOME=/cargo, the repository=/ferrite (added to RUSTFLAGS), and the
@@ -71,15 +74,32 @@ d=$stage/$name
 mkdir -p "$d/bin" "$d/scripts" "$d/tools" "$d/docs" "$d/target"
 cp target/release/fe-server target/release/ferrite "$d/bin/"
 ln -s ../bin "$d/target/release"
-cp scripts/install.sh scripts/fetch-models.sh scripts/serve.sh scripts/check-deps.sh scripts/models.manifest "$d/scripts/"
-cp tools/site.sh tools/fabric-detect.sh tools/serve.sh tools/serve-tp2.sh tools/tp2.sh tools/tp2-exec.sh \
-  tools/gate-serve-tp2.sh "$d/tools/"
-for f in quickstart.md prompt-cache.md benchmarks.md model-card.md; do
-  if [ -f "docs/$f" ]; then cp "docs/$f" "$d/docs/"; else echo "package-release: warning: no docs/$f" >&2; fi
-done
-for f in README.md AGENTS.md LICENSE NOTICE CREDITS.md NON-RUST.md TP2.md; do
+cp scripts/install.sh scripts/ferritectl.sh scripts/fetch-models.sh scripts/fetch-flashnext.sh scripts/serve.sh \
+  scripts/serve-xe.sh scripts/check-deps.sh scripts/models.manifest "$d/scripts/"
+cp tools/site.sh tools/launch-lib.sh tools/fabric-detect.sh tools/serve.sh tools/serve-5080.sh tools/serve-fnext.sh \
+  tools/serve-tp2.sh tools/tp2.sh tools/tp2-exec.sh tools/gate-serve-tp2.sh tools/release-gate.sh tools/kl.sh \
+  tools/kl-tp2.sh tools/site.local.sh.example "$d/tools/"
+mkdir -p "$d/tools/bench"
+cp tools/bench/*.py tools/bench/*.sh tools/bench/README.md "$d/tools/bench/"
+[ -d tools/bench/data ] && cp -r tools/bench/data "$d/tools/bench/"
+cp docs/*.md "$d/docs/"
+[ -d docs/assets ] && cp -r docs/assets "$d/docs/"
+for f in README.md AGENTS.md CHANGELOG.md LICENSE NOTICE CREDITS.md NON-RUST.md TP2.md; do
   if [ -f "$f" ]; then cp "$f" "$d/"; else echo "package-release: warning: no $f in the repository root" >&2; fi
 done
+# every relative link of the packed Markdown must resolve inside the tarball (the README points at all the docs);
+# a link into the source tree (crates/..., kernels-xe/...) becomes a link to that file in the release's tag on GitHub
+links() { (cd "$d" && for md in *.md docs/*.md tools/bench/README.md; do
+  grep -o '](\([^)#]*\)[)#]' "$md" | sed 's/^](//; s/[)#]$//' | grep -v -E '^(https?:|mailto:)' | sort -u | while read -r l; do
+    [ -n "$l" ] && [ ! -e "$(dirname "$md")/$l" ] && echo "$md $l"
+  done; done) || true; }
+links | while read -r md l; do
+  rp=$(realpath -m --relative-to="$d" "$d/$(dirname "$md")/$l")
+  [ -e "$root/$rp" ] || continue
+  sed -i "s|]($l|](https://github.com/BHCC2025/ferrite/blob/v$ver/$rp|g" "$d/$md"
+done
+broken=$(links)
+[ -z "$broken" ] || { echo "$broken" >&2; die "links in the packed docs point at files that are not in the tarball (above)"; }
 {
   echo "ferrite $ver ($desc), built $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "commit $(git rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -87,6 +107,7 @@ done
   px=$(command -v ptxas || echo /usr/local/cuda/bin/ptxas)
   echo "ptxas $("$px" --version 2>/dev/null | awk -F', ' '/release/ { print $2 ", " $3 }')"
   echo "kernels: sm_121a cubins embedded in the binaries"
+  echo "fe-server --version: $(target/release/fe-server --version 2>/dev/null || echo unknown)"
   (cd "$d/bin" && sha256sum fe-server ferrite)
 } > "$d/BUILD-INFO"
 # nothing of this machine in the release: its home folder, user name in a path, host name (5+ characters, as a
@@ -99,7 +120,8 @@ leaks=$(cd "$stage" && find "$name" -type f | while read -r f; do
     [ ${#host} -ge 5 ] && strings -n 4 "$f" | grep -w -o -F -- "$host"; } | sort -u | sed "s|^|$f: |"; done) || true
 [ -z "$leaks" ] || { echo "$leaks" | head -n 20 >&2; die "the release contains this machine's paths, names or addresses (above); with --no-build, rebuild without it"; }
 mkdir -p "$out"
-tar -C "$stage" -czf "$out/$name.tar.gz" "$name"
+# no user or group names of this machine in the archive (tar records the owner of every file)
+tar -C "$stage" --owner=0 --group=0 --numeric-owner -czf "$out/$name.tar.gz" "$name"
 (cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 echo "package-release: $out/$name.tar.gz ($(du -h "$out/$name.tar.gz" | cut -f1))"
 cat "$d/BUILD-INFO"

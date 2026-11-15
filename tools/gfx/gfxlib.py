@@ -160,7 +160,7 @@ def toroid(CX, CY, R=210, r=78, SC=1.0, NU=64, NV=18, tilt=64, yaw=-18, flux=Tru
     return "".join(out)
 
 
-def glossy(x, y, txt, size, family="Avenir Next", weight=900, anchor="middle", spacing=0):
+def glossy(x, y, txt, size, family="Inter", weight=900, anchor="middle", spacing=0):
     a = (f'x="{x}" y="{y}" font-family="{family}" font-weight="{weight}" font-size="{size}" '
          f'text-anchor="{anchor}" letter-spacing="{spacing}"')
     return (f'<text {a} fill="#ff6a1a" opacity="0.85" filter="url(#blur24)">{txt}</text>'
@@ -174,7 +174,7 @@ def logo(x, y, size=46):
     return (f'<g transform="translate({x},{y}) scale({k:.3f})">'
             '<circle cx="22" cy="22" r="18" fill="none" stroke="url(#moltenH)" stroke-width="7" filter="url(#glow)"/>'
             '<circle cx="22" cy="22" r="6" fill="#ffd27a" opacity="0.9"/>'
-            '<text x="56" y="38" font-family="Avenir Next" font-weight="800" font-size="46" fill="#fff4ea" letter-spacing="1">ferrite</text>'
+            '<text x="56" y="38" font-family="Inter" font-weight="800" font-size="46" fill="#fff4ea" letter-spacing="1">ferrite</text>'
             '</g>')
 
 

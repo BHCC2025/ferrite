@@ -5,12 +5,15 @@
 # node, held for the whole job until rank 1 has also let go of its node), then rank 0's GPU lock, then rank 1 takes
 # the peer's. One TP2 job at a time, so two TP2 jobs can never hold one node each; TP1 jobs take only their own
 # node's GPU lock and just queue.
+# This script's process holds the locks (on file descriptors) and forwards Ctrl-C / SIGTERM to rank 0, so stopping
+# it (kill <pid>) stops both ranks and frees both nodes.
 # usage: tools/tp2.sh <ferrite args...>      e.g. tools/tp2.sh "$FERRITE_EXL3_DIR" bench 2048 128 4
 #        FOLLOW=<model dir> tools/tp2.sh <any rank-0 command...>: rank 1 runs `ferrite <model> follow` and replays
 #        rank 0's engine calls (rank 0 = the scheduler / server: e.g. `target/release/ferrite <model> sched-test`)
 # env: FE_BIN, FE_TP_PORT (29620), extra FE_* variables are passed to both ranks via TP_ENV, TP2_TIMEOUT (seconds,
-#      default 3600; 0 = none, e.g. a server), TP2_DRY=1 (print what would run, run nothing); the site settings
-#      (peer, fabric, locks, state dir) are tools/site.sh's FERRITE_* variables
+#      default 3600; 0 = none, e.g. a server), TP2_DRY=1 (print what would run, run nothing), TP2_NOWAIT=1 (stop at
+#      once, naming the holder, when a lock is taken; the default waits for it); the site settings (peer, fabric,
+#      locks, state dir) are tools/site.sh's FERRITE_* variables
 set -e
 . "$(dirname "$0")/site.sh"
 ferrite_two_node || exit 1
@@ -35,22 +38,45 @@ if [ "${TP2_DRY:-0}" = 1 ]; then
 fi
 mkdir -p $FERRITE_STATE_DIR
 LOG=$FERRITE_STATE_DIR/tp2-r1-$(date +%H%M%S).log
-RUN=$(mktemp $FERRITE_STATE_DIR/tp2-run.XXXX.sh)
 # both ranks must run the same build (the bootstrap hello and every collective assume it)
 [ "$(sha256sum < $BIN)" = "$(ssh -n $PEER "sha256sum < $BIN")" ] || { echo "tp2.sh: $BIN differs between $(hostname) and $PEER: rebuild both"; exit 1; }
-cat > $RUN <<EOS
-#!/bin/bash
-free -g | awk '/^Mem/ { if (\$7 < $FERRITE_MIN_FREE_GB) { print "$(hostname): only " \$7 " GB available"; exit 1 } }' || exit 1
-ssh -n $PEER "free -g" | awk '/^Mem/ { if (\$7 < $FERRITE_MIN_FREE_GB) { print "peer: only " \$7 " GB available"; exit 1 } }' || exit 1
+# the locks on this process's file descriptors (the TP2 lock first, then this node's GPU lock)
+take() { # lock-file name
+  local fd
+  mkdir -p "$(dirname "$1")"
+  exec {fd}>> "$1"
+  flock -n "$fd" && return 0
+  if [ "${TP2_NOWAIT:-0}" = 1 ]; then
+    local pid h=""
+    pid=$(lslocks -n -o PID,PATH 2> /dev/null | awk -v p="$(readlink -f "$1")" '$2 == p { print $1; exit }')
+    [ -n "$pid" ] && h="pid $pid: $(tr '\0' ' ' < /proc/$pid/cmdline 2> /dev/null | cut -c1-160)"
+    echo "tp2.sh: another Ferrite job holds the $2 ($1): ${h:-$(head -c 200 "$1" 2> /dev/null)}" >&2
+    echo "        stop it first (or start without TP2_NOWAIT=1 / with FERRITE_LOCK_WAIT=1 to wait for it)" >&2
+    exit 75
+  fi
+  echo "tp2.sh: waiting for the $2 ($1)" >&2
+  flock "$fd"
+}
+take "$FERRITE_TP2_LOCK" "TP2 lock"
+take "$FERRITE_GPU_LOCK" "GPU lock of $(hostname -s)"
+printf 'pid %s: tp2.sh (%s) since %s\n' "$$" "${*:1:3}" "$(date -u +%FT%TZ)" | tee "$FERRITE_TP2_LOCK" > "$FERRITE_GPU_LOCK" 2> /dev/null || true
+min=$FERRITE_MIN_FREE_GB
+here=$(free -g | awk '/^Mem/ { print $7 }')
+there=$(ssh -n $PEER "free -g" | awk '/^Mem/ { print $7 }')
+[ "${here:-0}" -ge "$min" ] || { echo "tp2.sh: $(hostname): only $here GB available, $min wanted (FERRITE_MIN_FREE_GB)"; exit 1; }
+[ "${there:-0}" -ge "$min" ] || { echo "tp2.sh: $PEER: only $there GB available, $min wanted (FERRITE_MIN_FREE_GB)"; exit 1; }
 ssh -n $PEER "mkdir -p $FERRITE_STATE_DIR && cd /tmp && setsid -f bash -c 'env $FAB FE_TP_RANK=1 timeout ${TP2_TIMEOUT:-3600} flock $FERRITE_GPU_LOCK $EXEC $BIN $B64_1 > $LOG 2>&1' < /dev/null > /dev/null 2>&1"
-env $FAB FE_TP_RANK=0 timeout ${TP2_TIMEOUT:-3600} $EXEC $BIN0 $B64_0
-rc=\$?
+# rank 0 in the background of this shell so a signal to this script reaches it (bash waits otherwise)
+env $FAB FE_TP_RANK=0 timeout ${TP2_TIMEOUT:-3600} $EXEC $BIN0 $B64_0 &
+r0=$!
+trap 'kill -TERM $r0 2> /dev/null' TERM INT HUP
+rc=0
+wait $r0 || rc=$?
+# a signal interrupts wait: wait again for rank 0's own shutdown
+while kill -0 $r0 2> /dev/null; do wait $r0 || rc=$?; done
+trap - TERM INT HUP
 # keep the TP2 lock until rank 1 has left the peer's GPU lock (it exits right after rank 0), so the next TP2
 # job's rank 1 does not queue behind this one
 ssh -n $PEER "flock -w 120 $FERRITE_GPU_LOCK true" || true
-exit \$rc
-EOS
-chmod +x $RUN
-flock $FERRITE_TP2_LOCK flock $FERRITE_GPU_LOCK $RUN
-rm -f $RUN
 echo "(rank 1 log: $PEER:$LOG)" >&2
+exit $rc

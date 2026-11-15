@@ -179,7 +179,8 @@ pub fn normalize_messages(messages: &[Json]) -> Result<Vec<Json>, String> {
             Some("developer") => {
                 obj.insert("role".into(), Json::String("system".into()));
             }
-            Some(_) => {}
+            Some("system" | "user" | "assistant" | "tool") => {}
+            Some(r) => return Err(format!("messages[{i}].role '{r}' is not one of system, developer, user, assistant, tool")),
         }
         if let Some(Json::Array(parts)) = obj.get_mut("content") {
             for p in parts.iter_mut() {

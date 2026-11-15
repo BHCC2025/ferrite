@@ -329,6 +329,10 @@ impl crate::engine::Engine for XeEngine {
     fn info(&self) -> EngineInfo {
         self.info.clone()
     }
+    /// XeEngine::serve: a prompt needs n + 32 < ctx
+    fn prompt_reserve(&self) -> usize {
+        32
+    }
     fn submit(&self, req: GenRequest, sink: TokenSink) {
         if let Err(mpsc::SendError(job)) = self.tx.send(XeJob { req, sink }) {
             job.sink.finish(Finish::new(FinishReason::Error("the xe engine has stopped".into())));

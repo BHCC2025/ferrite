@@ -78,6 +78,7 @@ unsafe extern "C" {
     pub fn cuDriverGetVersion(v: *mut c_int) -> CUresult;
 
     pub fn cuDeviceGet(d: *mut CUdevice, ordinal: c_int) -> CUresult;
+    pub fn cuDeviceGetCount(n: *mut c_int) -> CUresult;
     pub fn cuDeviceGetName(name: *mut c_char, len: c_int, d: CUdevice) -> CUresult;
     pub fn cuDeviceGetAttribute(v: *mut c_int, attr: c_int, d: CUdevice) -> CUresult;
     pub fn cuDevicePrimaryCtxRetain(ctx: *mut CUcontext, d: CUdevice) -> CUresult;

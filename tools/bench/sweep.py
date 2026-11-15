@@ -16,9 +16,11 @@ usage: sweep.py --url http://localhost:8000/v1 --out DIR [--quick] [--meta KEY=V
        sweep.py --summarize DIR        rebuild summary.json and bench-data.json from DIR/raw.jsonl
 Writes DIR/raw.jsonl (one line a request), DIR/summary.json (medians, min, max, counts) and DIR/bench-data.json (the
 input of tools/gfx/bench.py; no build ids). --meta values go into summary.json (date=, driver=, kl_code=, kl_text=,
-kl_long= for the KL line; title= / subtitle= for the chart); summary.json's "headline" holds the quoted figures.
+kl_long= for the KL line; setup= for the machine; title= / subtitle= for the chart); summary.json's "headline" holds
+the quoted figures. Without kl_* the KL fields are null ("not measured"); without setup= the setup is the server's
+/health (engine, model, slots, context).
 """
-import argparse, json, os, random, statistics, subprocess, sys, threading, time
+import argparse, json, os, random, statistics, subprocess, sys, threading, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -92,6 +94,13 @@ def measure(url, out, quick, meta):
     raw = open(os.path.join(out, "raw.jsonl"), "a")
     cases = plan(quick)
     print(f"sweep: {len(cases)} cases, roughly {sum(map(rough_seconds, cases)) / 60:.0f} min, against {url}", flush=True)
+    if "health" not in meta:  # what was measured: the server's own description
+        try:
+            base = url.rstrip("/")[:-3] if url.rstrip("/").endswith("/v1") else url.rstrip("/")
+            h = json.loads(urllib.request.urlopen(base + "/health", timeout=5).read())
+            meta["health"] = f"{h.get('engine')} engine, model {h.get('model')}, {h.get('max_batch_size')} at once, context {h.get('max_model_len')}"
+        except Exception:
+            pass
     raw.write(json.dumps({"meta": meta, "url": url, "start": time.strftime("%Y-%m-%d %H:%M:%S"), "quick": quick}) + "\n")
     for ci, c in enumerate(cases):
         cid, kind, mode, ctx, n, tokens, runs = c
@@ -208,9 +217,9 @@ def figure(summary, cid, key):
 
 
 def kl(meta):
-    """KL vs BF16 (code / text / 16K context) from --meta kl_code= kl_text= kl_long= (the final gate's tools/kl-tp2.sh
-    runs); defaults: the published figures of docs/benchmarks.md"""
-    return {k: float(meta.get(f"kl_{k}", d)) for k, d in (("code", 0.021), ("text", 0.040), ("long", 0.024))}
+    """KL vs BF16 (code / text / 16K context) from --meta kl_code= kl_text= kl_long= (tools/kl.sh / kl-tp2.sh runs);
+    None when not given: a sweep does not measure KL"""
+    return {k: (float(meta[f"kl_{k}"]) if f"kl_{k}" in meta else None) for k in ("code", "text", "long")}
 
 
 def headline(summary):
@@ -240,8 +249,8 @@ def headline(summary):
         "prefill_32k": med("prefill-32K", "prefill"),
         "prefill_120k": med("prefill-120K", "prefill"),
         "kl_code": kl(m)["code"], "kl_text": kl(m)["text"], "kl_16k": kl(m)["long"],
-        "kl_source": "measured (--meta)" if any(f"kl_{k}" in m for k in ("code", "text", "long")) else "docs/benchmarks.md",
-        "setup": "two DGX Sparks, Qwen3.8-27B (EXL3 3.0 bpw decode, NVFP4 prompt weights), DFlash2 + copy rows, 4 x 128K",
+        "kl_source": "measured (--meta)" if any(f"kl_{k}" in m for k in ("code", "text", "long")) else "not measured",
+        "setup": m.get("setup") or m.get("health") or "unknown (pass --meta setup=...)",
         "date": m.get("date"),
     }
 
@@ -292,7 +301,8 @@ def chart_data(summary):
         "method": "Medians of 3 runs (prose: replies that don't echo the prompt); bars: min to max. Generation rates leave out prompt processing.",
         "method2": f"Two DGX Sparks  ·  Qwen3.8-27B: EXL3 3.0 bpw decode + NVFP4 prompt weights  ·  DFlash2 + copy rows"
                    f"  ·  4 x 128K  ·  {when}",
-        "kl": "KL vs BF16: " + "  ·  ".join(f"{lab} {kl(m)[key]:.3f}" for key, lab in (("code", "code"), ("text", "text"), ("long", "16K"))),
+        "kl": ("KL vs BF16: " + "  ·  ".join(f"{lab} {kl(m)[key]:.3f}" for key, lab in (("code", "code"), ("text", "text"), ("long", "16K"))))
+              if all(kl(m)[k] is not None for k in ("code", "text", "long")) else "KL vs BF16: not measured in this run",
         "kl2": m.get("kl2", "lower is better  ·  speculative decoding is lossless"),
     }
 

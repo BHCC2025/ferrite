@@ -1,5 +1,14 @@
 //! Qwen3.5-family model: config, safetensors weights, forward pass, KV/GDN state, sampling.
 pub mod config;
+
+/// The GPU architecture this crate's kernels (k-core, k-core-tp2) were built for (`FE_KARCH`).
+pub const KARCH: &str = env!("FE_KARCH_BUILT");
+
+/// Fail fast (before any weight is read) when the card this process uses (device 0) cannot run this build's
+/// kernels; the message names the rebuild command.
+pub fn check_arch() -> Result<(), String> {
+    fe_cuda::check_arch(KARCH, Some(1), "cargo build --release -p fe-server --features ferrite -p fe-cli")
+}
 pub mod copy;
 pub mod follow;
 pub mod lowmem;

@@ -25,7 +25,13 @@ impl fmt::Display for CuError {
             cuGetErrorString(self.code, &mut s);
         }
         let cs = |p: *const std::ffi::c_char| if p.is_null() { "?".into() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy() };
-        write!(f, "{} failed: {} ({}): {}", self.call, cs(n), self.code, cs(s))
+        write!(f, "{} failed: {} ({}): {}", self.call, cs(n), self.code, cs(s))?;
+        if self.code == 209 {
+            // CUDA_ERROR_NO_BINARY_FOR_GPU: the cubins were assembled for another architecture
+            write!(f, " (this binary's GPU kernels were built for another card: rebuild with FE_KARCH set for this \
+                one, e.g. FE_KARCH=sm_120a for an RTX 50-series card, FE_KARCH=sm_121a for the DGX Spark)")?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for CuError {}
@@ -39,6 +45,55 @@ macro_rules! cu {
     ($f:ident ( $($a:expr),* $(,)? )) => {
         check(unsafe { $f($($a),*) }, stringify!($f))
     };
+}
+
+// ---- kernel architecture ----------------------------------------------------------------------
+
+/// The `FE_KARCH` name whose cubins run on a device of compute capability `cap` (`sm_120a` for 12.0).
+pub fn karch_for(cap: (i32, i32)) -> String {
+    format!("sm_{}{}a", cap.0, cap.1)
+}
+
+/// Every visible device: (ordinal, name, compute capability). Initialises the driver; creates no context.
+pub fn devices() -> Result<Vec<(i32, String, (i32, i32))>> {
+    cu!(cuInit(0))?;
+    let mut n = 0;
+    cu!(cuDeviceGetCount(&mut n))?;
+    let mut out = vec![];
+    for i in 0..n {
+        let mut dev = 0;
+        cu!(cuDeviceGet(&mut dev, i))?;
+        let at = |a| -> Result<i32> {
+            let mut v = 0;
+            cu!(cuDeviceGetAttribute(&mut v, a, dev))?;
+            Ok(v)
+        };
+        let cap = (at(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?, at(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?);
+        let mut buf = [0 as std::ffi::c_char; 256];
+        unsafe { cuDeviceGetName(buf.as_mut_ptr(), 256, dev) };
+        let name = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+        out.push((i, name, cap));
+    }
+    Ok(out)
+}
+
+/// Check that kernels built for `built` (a crate's `FE_KARCH_BUILT`) run on the first `use_n` visible devices (all
+/// when None): `sm_XYa` cubins load only on compute capability X.Y. The error names the rebuild command; `build_cmd`
+/// is the cargo command line without the FE_KARCH prefix.
+pub fn check_arch(built: &str, use_n: Option<usize>, build_cmd: &str) -> std::result::Result<(), String> {
+    let devs = devices().map_err(|e| format!("no usable CUDA device: {e}"))?;
+    if devs.is_empty() {
+        return Err("no CUDA device is visible (check CUDA_VISIBLE_DEVICES and nvidia-smi)".into());
+    }
+    let n = use_n.unwrap_or(devs.len()).min(devs.len()).max(1);
+    for (i, name, cap) in &devs[..n] {
+        let want = karch_for(*cap);
+        if want != built {
+            return Err(format!("this binary's GPU kernels were built for {built}, but device {i} ({name}) is compute \
+                capability {}.{} and needs {want}: rebuild with `FE_KARCH={want} {build_cmd}`", cap.0, cap.1));
+        }
+    }
+    Ok(())
 }
 
 // ---- context ----------------------------------------------------------------------------------

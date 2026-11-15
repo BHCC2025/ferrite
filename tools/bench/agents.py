@@ -11,7 +11,11 @@ Prints one summary line: tag N agg_tok/s per_agent_decode_mean ttft_p50/p95 per 
 """
 import argparse, json, os, random, statistics, sys, threading, time, urllib.request
 
-SRC = os.environ.get("AGENTS_SRC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))  # repo root: the corpus
+# the corpus: a fixed copy of the repository files the prompts quote (tools/bench/data/agents-corpus, taken at 0.6.0), so
+# the prompts stay the same as the repository changes and the bench runs from a release tarball; AGENTS_SRC names
+# another folder (the files without the .txt suffix there)
+CORPUS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "agents-corpus")
+SRC = os.environ.get("AGENTS_SRC", CORPUS)
 REF_FILES = [("crates/fe-model/ENGINE_API.md", None), ("TP2.md", 14000)]
 EDIT_FILES = ["crates/fe-model/src/tp.rs", "crates/fe-server/src/toolcall.rs", "crates/fe-exl3/src/linear.rs",
               "crates/fe-server/src/mock.rs", "crates/fe-fabric/src/roce.rs", "crates/fe-cuda/src/lib.rs",
@@ -23,7 +27,8 @@ TOOLS = ["read_file", "write_file", "edit_file", "list_dir", "grep", "glob", "ru
 
 
 def read(p, n=None):
-    with open(os.path.join(SRC, p), errors="replace") as f:
+    path = os.path.join(SRC, p) + (".txt" if SRC == CORPUS else "")
+    with open(path, errors="replace") as f:
         s = f.read()
     return s if n is None else s[:n]
 

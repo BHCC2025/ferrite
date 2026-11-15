@@ -14,8 +14,8 @@ their own pages: [rtx-5080.md](rtx-5080.md) and [arc-b70.md](arc-b70.md).
 | Hardware | DGX Spark (GB10, compute capability 12.1, 128 GB unified memory). The GPU kernels are compiled for `sm_121a` only. Two Sparks need the ConnectX-7 cable between them (RoCE). |
 | OS / driver | DGX OS (Ubuntu 24.04), NVIDIA driver 580.x with CUDA 13.0. Tested with 580.178.04 on kernel 7.0.0-1019-nvidia. |
 | Memory | One node with the defaults (128K context x 4 slots, NVFP4 prompt weights, DFlash2) needs about 80 GB available for the model and the 4 x 128K KV cache, plus the prompt cache's 12 GB pool (`FERRITE_PARK_GB`), so at least 95 GB must be available before starting; with agents running, about 34 GB stays available. The pool also shrinks by itself to keep 20 GB available. The GPU shares system memory: running out of it can stall or reboot the machine, so do not run other large GPU jobs beside the server. |
-| Disk | About 38 GB for the three model folders. |
-| Libraries | `libcuda.so.1` (the driver) and `libibverbs.so.1` (rdma-core, preinstalled on DGX OS). Two nodes also need NCCL 2.30+ (`libnccl.so.2`, `apt install libnccl2`, or point `FERRITE_NCCL_LIB` at it). |
+| Disk | 45 GB free: about 38 GB for the three model folders, plus Ferrite (the release tarball needs almost nothing; a source build about 6 GB under your home folder for rustup, cargo and the build). |
+| Libraries | `libcuda.so.1` (the driver) and `libibverbs.so.1` (rdma-core, preinstalled on DGX OS). Two nodes also need NCCL 2.30+ ([Two nodes](#two-nodes-tp2): a user-level `pip` install works, no sudo). |
 | Download tool | The Hugging Face CLI (`hf`). DGX OS's Python refuses a system-wide `pip install`, so give it its own environment: `python3 -m venv ~/.venvs/hf && ~/.venvs/hf/bin/pip install -U huggingface_hub`. `scripts/fetch-models.sh` finds `hf` there or on `PATH`. |
 
 `scripts/check-deps.sh` checks all of this (`--two-node` adds NCCL and the RDMA device).
@@ -29,19 +29,26 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 `scripts/install.sh` does everything below in six printed steps, and running it again skips the finished ones:
 
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
-   available memory (`FERRITE_MIN_FREE_GB`);
-2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the release tarball of `FERRITE_VERSION` (0.5.2), its sha256
-   checked, or when there is no release a clone of the repository and a source build (`--source` forces it). Run
-   inside a checkout or an unpacked release, it uses that folder instead;
+   available memory (`FERRITE_MIN_FREE_GB`), and that the port is free or already serves Ferrite;
+2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the latest published release, which it asks the GitHub API for
+   (`FERRITE_VERSION=0.6.0` or `--version 0.6.0` pins one). That is the release tarball with ready-made binaries,
+   its sha256 checked. When the release has no tarball (or with `--source`) it says so and builds from source: a
+   clone of the release's tag, rustup, the pinned toolchains and `cargo build`. Run inside a checkout or an unpacked
+   release, it uses that folder instead;
 3. installs the Hugging Face CLI into `~/.venvs/hf`;
 4. downloads and verifies the models into `FERRITE_MODELS` (`/var/tmp/models`);
-5. starts `scripts/serve.sh` in the background, with its log in `logs/server.log` and its process group id in
-   `logs/server.pid` (`--no-serve` stops before this);
-6. sends a test request and prints `OK: Ferrite is serving http://127.0.0.1:8000/v1 (model id 'qwen3.8-27b')`.
+5. starts the server in the background with `scripts/ferritectl.sh start` (log `logs/server-8000.log`;
+   `--no-serve` stops before this);
+6. sends a test request and prints `OK: Ferrite is serving http://<this machine>:8000/v1 (model id 'qwen3.8-27b')`.
 
 It needs no `sudo`: when a system package is missing it stops and prints the `apt` command to run. Every
 `scripts/serve.sh` setting below (`FERRITE_PORT`, `FERRITE_CTX`, ...) applies to the server it starts. Stop the server
-with `kill -- -$(cat ~/ferrite/logs/server.pid)`.
+with `~/ferrite/scripts/ferritectl.sh stop`.
+
+**Upgrading.** Run the same command again. When `~/ferrite` holds an older release, the installer stops the upgrade
+if that release's server is still running (stop it first), moves the old folder to `~/ferrite-<old version>` and
+installs the new one. The models and their verification are kept. A source checkout in `~/ferrite` is moved to the
+new release's tag when it has no local changes; otherwise the installer says why it left it alone.
 
 To let a coding agent do it, give it this line: `Install Ferrite on this DGX Spark by following https://github.com/BHCC2025/ferrite/blob/main/AGENTS.md exactly; stop and ask me if any check fails.`
 
@@ -76,7 +83,10 @@ Three folders land in `$FERRITE_MODELS`:
 
 The script pins the upstream revisions and checks every file's size and sha256 against `scripts/models.manifest`.
 `--quick` checks sizes only, `--verify-only` re-checks an existing folder, and roles (`quant`, `prompt`, `draft`)
-fetch a subset. Interrupted downloads resume when you run it again.
+fetch a subset. A failed transfer is retried (3 attempts). Run again after an interruption, it downloads what is
+missing, fetches again any file whose size or sha256 is wrong, and deletes the partial files the interruption left.
+A file cut off mid-transfer starts over: the Hugging Face CLI does not continue it. It stops before downloading
+when the disk has too little room (`FERRITE_FORCE=1` tries anyway).
 
 ## 3. Start the server (one node)
 
@@ -84,7 +94,20 @@ fetch a subset. Interrupted downloads resume when you run it again.
 FERRITE_MODELS=/var/tmp/models scripts/serve.sh
 ```
 
-Loading takes about a minute; the server is ready when `/v1/models` answers. Settings are environment variables.
+It runs in the foreground, and its process becomes the server: Ctrl-C or `kill <pid>` stops it.
+`scripts/ferritectl.sh start` runs it in the background instead (`stop`, `restart`, `status`, `log`). Loading takes
+about a minute; the server is ready when `/v1/models` answers.
+
+> **The server is open to your network.** It listens on every interface (`0.0.0.0`) by default, so any machine on the
+> local network can use it, for example a coding agent on your laptop. There is no API key. Use it on a trusted
+> network or firewall the port; `FERRITE_HOST=127.0.0.1` keeps it on the Spark itself.
+
+Before it loads the model, the launcher checks the port and the GPU lock. It checks the model files' sizes against
+the manifest, and it checks the memory against what the settings need. It stops at once with a message when one of
+them fails: the port is taken (and by what), another Ferrite job holds the GPU (and which), a file is missing or cut
+off (which one), or there is not enough memory. `FERRITE_FORCE=1` starts anyway despite the memory and file checks.
+
+Settings are environment variables.
 The site settings (model folders, locks, the two-node fabric) are read from `tools/site.sh` by every script and by the
 binaries themselves; the README has the full `FERRITE_*` table, and `tools/site.sh` run on its own prints the resolved
 values. `scripts/serve.sh` adds the server settings:
@@ -93,18 +116,29 @@ values. `scripts/serve.sh` adds the server settings:
 |---|---|---|
 | `FERRITE_MODELS` | `/var/tmp/models` | the folder from step 2 |
 | `FERRITE_EXL3_DIR`, `FERRITE_NVFP4_DIR`, `FERRITE_DRAFT_DIR` | the three folders under `FERRITE_MODELS` | set one of them to keep that model elsewhere |
-| `FERRITE_GPU_LOCK` | `/var/tmp/ferrite-gpu.lock` | the node's GPU lock: the server holds it while it runs and does not start while another Ferrite GPU job holds it |
-| `FERRITE_HOST` | `127.0.0.1` | `0.0.0.0` serves the LAN. There is no API key, so only do that on a trusted network or behind a firewall. |
-| `FERRITE_PORT` | `8000` | |
+| `FERRITE_GPU_LOCK` | `/var/tmp/ferrite-gpu.lock` | the node's GPU lock. A server holds it shared, plus its own card's lock (`ferrite-gpu.<card UUID>.lock` in the same folder) exclusively: servers on different cards run side by side, a second launcher on a busy card stops at once and names the holder, and a whole-node job (a test, a KL run) excludes them all. |
+| `FERRITE_LOCK_WAIT` | `0` | `1` waits for a held GPU lock instead of stopping |
+| `FERRITE_HOST` | `0.0.0.0` | every interface: other machines on the network can use the server, with no API key. `127.0.0.1` keeps it on this machine. |
+| `FERRITE_PORT` | `8000` | checked before the model loads |
+| `FERRITE_FORCE` | `0` | `1` starts even when the memory or model-file check fails |
+| `FERRITE_MALLOC` | `0` here (`1` for Flash-Next) | `1` fixes glibc's malloc thresholds at start, which keeps a long-running server's host memory flat; on the 27B engine it costs about 1.6% of decode speed, so it is off there by default |
 | `FERRITE_MODEL_ID` | `qwen3.8-27b` | the id `/v1/models` reports. Requests may name any model; the server always runs this one. |
 | `FERRITE_CTX` | `131072` | context per request. The KV cache takes ~64 KB a token a slot (128K x 4 slots = 34 GB), so lower this to save memory. |
 | `FERRITE_SLOTS` | `4` | requests at once: at most 4 with DFlash2 drafting; more requests wait in a queue |
 | `FERRITE_PROMPT` | `fp4` | prompt weights: `fp4` (the NVIDIA checkpoint) or `bf16` (see [Without the NVIDIA checkpoint](#without-the-nvidia-checkpoint)) |
-| `FERRITE_DRAFT` | `dflash` | speculative decoding: `dflash`, `mtp`, `auto` (DFlash2 up to 2 streams, MTP above) or `off`. Greedy output is the same in every mode; only the speed differs. |
-| `FERRITE_CACHE` | `1` | the prompt cache: each conversation's state is kept at its turn boundaries and at the end of the system prompt, so a later turn, or a new conversation with the same system prompt, skips what was already computed. `0` turns it off. With `FERRITE_DRAFT=mtp` or `auto` it only reuses an identical prefix in the same slot. |
+| `FERRITE_DRAFT` | `dflash` | speculative decoding: `dflash`, `mtp`, `auto` (DFlash2 up to 2 streams, MTP above) or `off`. Drafting is lossless: every mode gives the same greedy text ([Same text](#same-text)). |
+| `FERRITE_CACHE` | `1` | the prompt cache: each conversation's state is kept at its turn boundaries and at the end of the system prompt, so a later turn, or a new conversation with the same system prompt, skips what was already computed. `0` turns it off. It works with every `FERRITE_DRAFT` mode. |
 | `FERRITE_PARK_GB` | `12` | memory the prompt cache keeps for conversations moved out of a slot and for shared system prompts, on top of the model and the KV cache (two nodes: 24 a node). The server shrinks it as needed to keep 20 GB of memory available (`FE_PARK_RESERVE_GB`). |
 
-Extra arguments go to `fe-server` (`bin/fe-server --help` lists them).
+Extra arguments go to `fe-server` (`bin/fe-server --help` lists them; `bin/fe-server --version` names the release).
+
+### Same text
+
+With greedy decoding (temperature 0) a request's text does not depend on what else runs beside it, on the number of
+slots, on the drafting mode (`FERRITE_DRAFT` `dflash`, `mtp`, `auto` or `off`), on `FERRITE_CACHE`, or on whether its
+prompt came from the prompt cache or was computed in full. A prompt is cut into chunks at its turn boundaries
+whatever the settings, so the cuts and therefore the arithmetic are the same in every mode.
+`python3 tools/bench/modes.py` checks it against servers started with the different settings.
 
 ## 4. Test it
 
@@ -130,21 +164,22 @@ Any OpenAI-compatible client works. Use base URL `http://<spark-address>:8000/v1
 
 - Open WebUI: Settings, Connections, add an OpenAI API connection with the base URL above.
 - Continue (VS Code / JetBrains): a model with `provider: openai`, `apiBase: http://<spark-address>:8000/v1`,
-  `model: spark`.
+  `model: qwen3.8-27b`.
 - Cline: API provider "OpenAI Compatible", the base URL above, model id `qwen3.8-27b`.
 - Pi: an OpenAI-compatible provider with the base URL above; it sends the model id `qwen3.8-27b`.
 
-For another machine to reach the server, start it with `FERRITE_HOST=0.0.0.0`.
+Other machines reach the server as it is: it listens on every interface by default. To keep it on the Spark, start
+it with `FERRITE_HOST=127.0.0.1`. Requests may name any model id: the server always answers with the one it runs.
 
 ## Prompt cache
 
 The server keeps what it has computed for each conversation: it snapshots the state at turn boundaries, resumes a
 new turn from the longest matching snapshot, parks conversations that lose their slot, and computes a system prompt
-shared by several agents once. Four agents sharing a ~13K-token system prompt compute 74% fewer prompt tokens (86%
+shared by several agents once. Four agents sharing a ~13K-token system prompt compute 84% fewer prompt tokens (86%
 with thinking on), and later turns start in about half a second. A resumed reply is the same as one computed in full.
 
-- It is on by default with DFlash2 drafting: `FERRITE_CACHE=0` turns it off (`scripts/serve.sh` and
-  `tools/serve-tp2.sh`). With `FERRITE_DRAFT=mtp` or `auto` it only reuses an identical prefix in the same slot.
+- It is on by default, with every drafting mode: `FERRITE_CACHE=0` turns it off (`scripts/serve.sh` and
+  `tools/serve-tp2.sh`).
 - Its park pool is allocated at start: 12 GB on one Spark, 24 GB per node on two (`FERRITE_PARK_GB` overrides). It
   shrinks by itself if needed to keep 20 GB of memory available (`FE_PARK_RESERVE_GB`).
 - The response's `usage.prompt_tokens_details.cached_tokens` shows how much of a prompt came from the cache.
@@ -166,15 +201,29 @@ context. It needs:
 
 - the same Ferrite folder (same path, same build) and the same model folders on both nodes;
 - passwordless `ssh` from node A to node B: `FERRITE_PEER` is node B's ssh name;
-- NCCL on both nodes (`FERRITE_NCCL_LIB` if it is not on the loader path); `scripts/check-deps.sh --two-node`
-  checks it together with the RDMA devices and the interface below;
+- NCCL 2.30 or newer on both nodes. DGX OS does not ship it. Without sudo, install NVIDIA's wheel into a venv
+  (tested with NCCL 2.32.6) and point `FERRITE_NCCL_LIB` at it:
+
+  ```bash
+  python3 -m venv ~/.venvs/nccl && ~/.venvs/nccl/bin/pip install nvidia-nccl-cu13      # on both nodes
+  export FERRITE_NCCL_LIB=$(ls ~/.venvs/nccl/lib/python3*/site-packages/nvidia/nccl/lib/libnccl.so.2)
+  ```
+
+  With sudo, `sudo apt install libnccl2` puts it on the loader path instead. `tools/serve-tp2.sh` passes
+  `FERRITE_NCCL_LIB` on to node B. `scripts/check-deps.sh --two-node` checks NCCL together with the RDMA devices and
+  the interface below, and finds the venv by itself;
 - the fabric settings in `tools/site.sh`: `FERRITE_TP_HOST` (node A's address on the RoCE link, the rendezvous;
   its port is `FE_TP_PORT`, default 29620), `FERRITE_NET_IF` (the link's interface for NCCL), `FERRITE_ROCE_HCA`
   (one or two RDMA devices) and `FERRITE_ROCE_GID` (their RoCE v2 GID index). While `FERRITE_TP_HOST` is unset
   the two-node scripts detect all of them from both nodes (`tools/fabric-detect.sh`), as `FERRITE_FABRIC=auto`
   does; settings you keep can go in `tools/site.local.sh` (not tracked), which `tools/site.sh` reads first;
-- `FERRITE_MIN_FREE_GB` (default 45) available on each node; a TP2 job also takes `FERRITE_TP2_LOCK` on node A. Reference numbers for two nodes (2K-token prompts,
-500 tokens out, DFlash2): code 273 tok/s for one stream and 473 tok/s aggregate for 4 streams.
+- `FERRITE_MIN_FREE_GB` (default 45) available on each node; a TP2 job also takes `FERRITE_TP2_LOCK` on node A.
+
+Like `scripts/serve.sh` it listens on every interface (`FERRITE_HOST=127.0.0.1` keeps it on node A), checks the port
+first, and stops at once when another job holds a lock. Its process forwards Ctrl-C and SIGTERM, so stopping it
+stops both ranks; `scripts/ferritectl.sh start tp2` runs it in the background. The speed on two nodes is in the
+README's [Results](../README.md#results). For reference, with 2K-token prompts and
+500 tokens out (DFlash2): code 267 tok/s for one stream and 467 tok/s aggregate for 4 streams.
 
 ## Without the NVIDIA checkpoint
 
@@ -191,6 +240,47 @@ be downloaded. What that costs:
   over the whole vocabulary, which makes each draft slower.
 - Accuracy is the same class: KL against BF16 0.0218 (code) / 0.0466 (text) with bf16 prompt rows, against 0.0207 /
   0.0401 with NVFP4.
+
+## Clean machine
+
+What a fresh Ubuntu 24.04 or 26.04 needs before a source build (DGX OS has all of it except Rust). The same steps
+were run in clean `ubuntu:24.04` and `ubuntu:26.04` containers for the RTX 50 builds:
+
+```bash
+# system packages (the only step that needs sudo)
+sudo apt install -y curl ca-certificates git build-essential python3 python3-venv
+
+# ptxas, and libcublasLt for the 27B engine, from NVIDIA's CUDA repository (no full toolkit needed);
+# ubuntu2404 or ubuntu2604, x86_64 or sbsa (aarch64)
+curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update
+sudo apt install -y cuda-nvcc-13-5 libcublas-dev-13-5     # any 13.x; Flash-Next alone needs only cuda-nvcc
+export PATH=/usr/local/cuda/bin:$PATH
+
+# Rust: rustup with a stable default toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+```
+
+On Arch Linux (the Arc B70 target), `pacman -S rustup` installs rustup with **no** default toolchain: run
+`rustup default stable` once, or every `cargo` command stops with "no default is configured".
+
+The kernels are compiled for one GPU architecture, chosen at build time with `FE_KARCH`. Without it the build takes
+the card `nvidia-smi` reports on the build machine (and says so in a build warning), or `sm_121a` when there is
+none. Set it to build for a card that is not in the build machine:
+
+| Target | `FE_KARCH` | Build |
+|---|---|---|
+| DGX Spark (GB10) | `sm_121a` (the default on aarch64) | `cargo build --release -p fe-server --features ferrite -p fe-cli` |
+| RTX 5080, RTX 5060 Ti (Qwen3.8-27B) | `sm_120a` | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ferrite -p fe-cli` |
+| RTX 5060 Ti (Qwen3.8-Flash-Next) | `sm_120a` | `FE_KARCH=sm_120a cargo build --release -p fe-server --features fnext` |
+| Both RTX engines in one binary | `sm_120a` | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ferrite,fnext -p fe-cli` |
+| Intel Arc Pro B70 | none (SPIR-V) | `cargo build --release --features xe -p fe-server` ([arc-b70.md](arc-b70.md)) |
+
+`target/release/fe-server` is one file: building it with other features replaces the previous build. Build with both
+`ferrite,fnext` to keep both RTX engines. A binary built for the wrong card does not start. The launchers and
+`scripts/check-deps.sh` read the architecture from the binary and print the `FE_KARCH=... cargo build` command
+that fixes it.
 
 ## Build from source
 
@@ -219,12 +309,21 @@ The build compiles every `kernels/k-*` crate to PTX with that nightly (`target-c
 rustc 1.99.1 (host), nightly-2026-11-04 (kernels) and ptxas 13.0.88.
 `scripts/package-release.sh` builds and packs the release tarball into `dist/`.
 
-To build for an RTX 50 card instead (x86_64, `sm_120a`), set `FE_KARCH=sm_120a` for the build and for
-`scripts/check-deps.sh`; see [rtx-5080.md](rtx-5080.md).
+To build for an RTX 50 card instead (x86_64, `sm_120a`), set `FE_KARCH=sm_120a` for the build (the table in
+[Clean machine](#clean-machine)); see [rtx-5080.md](rtx-5080.md). A source build prints a few compiler warnings;
+they are harmless.
 
 ## Troubleshooting
 
-- `check-deps: ERROR: ... sm_121a`: the GPU is not a GB10; the kernels only run on DGX Spark.
+- `check-deps: ERROR: ... the kernels are built for ...` or `serve: ... was built for sm_121a, but this GPU ... needs
+  sm_120a`: the binary was built for another card; rebuild with the `FE_KARCH` it names.
+- `serve: port 8000 is already in use (by ...)`: another server has the port. Stop it, or set `FERRITE_PORT`.
+- `serve: another Ferrite GPU job holds /var/tmp/ferrite-gpu.lock (pid ...)`: a Ferrite server or job is already
+  running on that card. Stop it (`scripts/ferritectl.sh stop`, or `kill` the pid named), or wait for it with
+  `FERRITE_LOCK_WAIT=1`.
+- `serve: only N GB of memory is available; this setup needs about M GB`: stop other GPU jobs, or lower
+  `FERRITE_CTX` / `FERRITE_SLOTS` / `FERRITE_PARK_GB`. The GPU shares the memory, and running out of it can stall or
+  reboot the machine.
 - The server exits during load, or the machine stalls: not enough memory. Lower `FERRITE_CTX` / `FERRITE_SLOTS`,
   or the prompt cache's `FERRITE_PARK_GB`, or stop other GPU work. The pool already shrinks by itself to keep 20 GB
   available (`FE_PARK_RESERVE_GB`).

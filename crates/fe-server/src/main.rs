@@ -13,8 +13,28 @@ use fe_server::server::{AppState, GenDefaults, ServerConfig, router};
 use fe_server::template::ChatTemplate;
 use fe_server::tokenizer::Tok;
 
+/// `fe-server --version`: the release and the engines this binary was built with
+static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let mut e = vec!["mock"];
+    for (on, name) in [(cfg!(feature = "ferrite"), "ferrite"), (cfg!(feature = "fnext"), "fnext"), (cfg!(feature = "xe"), "xe")] {
+        if on {
+            e.push(name);
+        }
+    }
+    #[cfg(feature = "ferrite")]
+    let karch = Some(fe_model::KARCH);
+    #[cfg(all(feature = "fnext", not(feature = "ferrite")))]
+    let karch = Some(fe_fnext::KARCH);
+    #[cfg(not(any(feature = "ferrite", feature = "fnext")))]
+    let karch: Option<&str> = None;
+    match karch {
+        Some(k) => format!("{} (engines: {}; kernels {k})", env!("CARGO_PKG_VERSION"), e.join(" ")),
+        None => format!("{} (engines: {})", env!("CARGO_PKG_VERSION"), e.join(" ")),
+    }
+});
+
 #[derive(Parser, Debug)]
-#[command(name = "fe-server", about = "OpenAI-compatible server for the ferrite engine")]
+#[command(name = "fe-server", about = "OpenAI-compatible server for the ferrite engine", version = VERSION.as_str())]
 struct Args {
     /// Model directory (tokenizer.json, chat_template.jinja, generation_config.json, weights).
     #[arg(long, env = "FERRITE_EXL3_DIR")]
@@ -68,6 +88,8 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // still single-threaded: no other thread allocates yet
+    fixed_malloc_thresholds(!args.mock && args.engine == "fnext");
     // the engine reads its checkpoint folders from the environment (fe_site): hand it the flags before any thread
     // starts (a TP2 peer gets them through its own environment, tools/site.sh)
     for (k, v) in [("FERRITE_NVFP4_DIR", &args.nvfp4_dir), ("FERRITE_DRAFT_DIR", &args.draft_dir)] {
@@ -84,7 +106,17 @@ async fn serve(args: Args) -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // colours only on a terminal: a log file gets plain text
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
+    tracing::info!("fe-server {}", *VERSION);
+    // bind before loading: a port in use fails at once instead of after the model load; connections made while the
+    // model loads wait in the listen queue and are served once it is ready
+    let addr = format!("{}:{}", args.host, args.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
+    if !args.mock {
+        check_gpu_arch(&args.engine)?;
+    }
     let tok = Arc::new(Tok::from_dir(&args.model_dir)?);
     let template = Arc::new(ChatTemplate::from_dir(&args.model_dir)?);
     let defaults = GenDefaults::from_dir(&args.model_dir, &tok);
@@ -131,14 +163,42 @@ async fn serve(args: Args) -> Result<()> {
         cfg.defaults.top_p,
         cfg.defaults.top_k
     );
-    let addr = format!("{}:{}", args.host, args.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
+    // an engine that stops for good (a panic, a lost TP2 peer) takes the process down with a non-zero status, after a
+    // moment in which /health and new requests answer 503 with the reason: a launcher or systemd restarts it
+    let watch = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Some(why) = watch.engine.dead() {
+                tracing::error!("the engine stopped ({why}); exiting with status {ENGINE_DIED} so that it can be restarted");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                // _exit, not exit: a hung engine thread (a TP2 collective whose peer is gone) would block the CUDA
+                // driver's exit handlers forever
+                unsafe extern "C" {
+                    fn _exit(code: i32) -> !;
+                }
+                unsafe { _exit(ENGINE_DIED) }
+            }
+        }
+    });
     tracing::info!("listening on http://{addr}");
     axum::serve(listener, router(state)).with_graceful_shutdown(shutdown()).await?;
     Ok(())
 }
 
 /// BatchEngine over the CPU fake model, with the real vocabulary and eos (`--engine fake`).
+/// The engine's kernels must match the visible cards' architecture (else cuModuleLoadData fails after the load).
+fn check_gpu_arch(engine: &str) -> Result<()> {
+    let r: std::result::Result<(), String> = match engine {
+        #[cfg(feature = "fnext")]
+        "fnext" => fe_fnext::check_arch(),
+        #[cfg(feature = "ferrite")]
+        "ferrite" | "ferrite-batch" => fe_model::check_arch(),
+        _ => Ok(()),
+    };
+    r.map_err(|e| anyhow::anyhow!(e))
+}
+
 fn fake_engine(args: &Args, tok: &Tok) -> Result<Arc<dyn Engine>> {
     use fe_server::batch::fake::FakeModel;
     use fe_server::batch::{BatchConfig, BatchEngine};
@@ -216,6 +276,9 @@ fn fnext_engine(_: &Args) -> Result<Arc<dyn Engine>> {
     bail!("this fe-server was built without Flash-Next: build with --features fnext")
 }
 
+/// Exit status when the engine stopped serving (EX_SOFTWARE).
+const ENGINE_DIED: i32 = 70;
+
 async fn shutdown() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -238,4 +301,29 @@ async fn shutdown() {
         std::thread::sleep(Duration::from_secs(5));
         std::process::exit(0);
     });
+}
+
+/// glibc raises its mmap threshold (up to 32 MiB) each time a large block is freed, so the MB-sized buffers the
+/// engines make every step and every prompt (logit rows, embeddings, PLE rows) end up in the per-thread heaps, where
+/// freed space fragments and is not given back: a 4-client Flash-Next soak grew by ~2.5 GiB an hour that way, with
+/// the live Rust heap flat. Fixed thresholds (128 KiB) put such blocks in their own mappings, returned on free
+/// (the same soak then stays flat). Set before any thread exists; MALLOC_MMAP_THRESHOLD_ / MALLOC_TRIM_THRESHOLD_
+/// in the environment still win. On by default for `--engine fnext` only: the 27B engine creeps ~0.6 MB/min with
+/// glibc's defaults (an RTX 5080 soak) and decodes 1.6% slower with the fixed thresholds. FERRITE_MALLOC=1 / 0
+/// turns them on / off for any engine.
+fn fixed_malloc_thresholds(by_default: bool) {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if match std::env::var("FERRITE_MALLOC").as_deref() { Ok("1") => true, Ok("0") => false, _ => by_default } {
+        unsafe extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_TRIM_THRESHOLD: i32 = -1;
+        const M_MMAP_THRESHOLD: i32 = -3;
+        if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+            unsafe { mallopt(M_MMAP_THRESHOLD, 128 << 10) };
+        }
+        if std::env::var_os("MALLOC_TRIM_THRESHOLD_").is_none() {
+            unsafe { mallopt(M_TRIM_THRESHOLD, 128 << 10) };
+        }
+    }
 }

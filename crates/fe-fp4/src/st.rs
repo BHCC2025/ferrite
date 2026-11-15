@@ -83,7 +83,8 @@ impl Checkpoint {
         let t = self.get(name)?;
         let f = &self.files[t.file];
         let mut v = vec![0u8; t.bytes];
-        f.read_exact_at(&mut v, t.offset).with_context(|| format!("reading {name}"))?;
+        f.read_exact_at(&mut v, t.offset).with_context(|| format!("reading {name} from {:?}: the model folder is \
+            incomplete or damaged: check it with scripts/fetch-models.sh --verify-only", self.dir))?;
         unsafe { posix_fadvise(f.as_raw_fd(), t.offset as i64, t.bytes as i64, 4) };
         Ok(v)
     }

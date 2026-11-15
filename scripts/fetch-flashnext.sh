@@ -10,7 +10,10 @@
 #   tokenizer.json, tokenizer_config.json, generation_config.json   Qwen/Qwen3.8-Flash-Next
 #   chat_template.jinja              taken from the first GGUF's own chat template (the one the quant was made with)
 #
-# Every file is checked against the sizes and sha256 below; a download resumes where it stopped.
+# Every file is checked against the sizes and sha256 below. Downloads go through the Hugging Face CLI (`hf`) when it is
+# installed, else through curl in FNEXT_FETCH_PARTS parallel ranges; both resume where they stopped and retry with a
+# growing pause, so a dropped connection does not end the run. A complete file whose sha256 differs is moved aside
+# (NAME.bad) and fetched again.
 # Options:
 #   --dir DIR       target folder [$FERRITE_MODELS/Qwen3.8-Flash-Next, FERRITE_MODELS default /var/tmp/models]
 #   --verify-only   only check what is there
@@ -20,7 +23,10 @@
 #   FNEXT_DRAFT_REPO  Hugging Face repo of the draft [BHCC2025/Qwen3.8-Flash-Next-MTP-GGUF]
 #   FNEXT_DRAFT_REV   its revision [the one this release was tested with]
 #   HF_TOKEN          sent to Hugging Face when set (none of these repos needs one)
-# Needs curl, sha256sum and python3 (standard library only). Space: ~60 GB.
+#   FNEXT_FETCH       hf | curl: force one downloader [hf when the `hf` (or `huggingface-cli`) command exists]
+#   FNEXT_FETCH_PARTS parallel ranges per file with curl [8]
+#   FNEXT_FETCH_TRIES attempts per range (or per hf download) before giving up [10]
+# Needs curl, sha256sum and python3 (standard library only). Space: ~60 GB (~90 GB while a .bad copy is kept).
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -63,22 +69,100 @@ mkdir -p "$dir"
 auth=()
 [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
 bad=0
+tries=${FNEXT_FETCH_TRIES:-10}
+parts=${FNEXT_FETCH_PARTS:-8}
+case $tries$parts in *[!0-9]*) die "FNEXT_FETCH_TRIES / FNEXT_FETCH_PARTS must be numbers" ;; esac
+[ "$parts" -ge 1 ] || parts=1
+fetcher=${FNEXT_FETCH:-}
+hfcli=
+if command -v hf >/dev/null; then hfcli=hf; elif command -v huggingface-cli >/dev/null; then hfcli=huggingface-cli; fi
+[ -z "$fetcher" ] && { [ -n "$hfcli" ] && fetcher=hf || fetcher=curl; }
+case $fetcher in
+  hf) [ -n "$hfcli" ] || die "FNEXT_FETCH=hf but neither hf nor huggingface-cli is installed" ;;
+  curl) ;;
+  *) die "FNEXT_FETCH=$fetcher: hf or curl" ;;
+esac
+pause() { local s=$((5 * 2 ** ($1 - 1))); [ $s -gt 120 ] && s=120; echo "  (attempt $1 failed, retrying in ${s}s)" >&2; sleep $s; }
+size() { stat -c %s "$1" 2>/dev/null || echo 0; }
+# one byte range [a, b] of url into part file f, appended from where it stopped, with retries
+fetch_range() {  # url a b f
+  local url=$1 a=$2 b=$3 f=$4 n=$(($3 - $2 + 1)) i have
+  for i in $(seq 1 "$tries"); do
+    have=$(size "$f")
+    [ "$have" -ge "$n" ] && return 0
+    curl -fsSL --http1.1 --connect-timeout 30 --speed-limit 100000 --speed-time 60 "${auth[@]}" \
+      -r "$((a + have))-$b" "$url" >> "$f" && [ "$(size "$f")" -ge "$n" ] && return 0
+    [ "$(size "$f")" -gt "$n" ] && { echo "  range $a-$b: server sent more than asked, starting it over" >&2; : > "$f"; }
+    [ "$i" -lt "$tries" ] && pause "$i"
+  done
+  return 1
+}
+# curl: the file in $parts ranges at once (one range for small files), then joined
+fetch_curl() {  # url name bytes
+  local url=$1 name=$2 bytes=$3 out=$dir/$2 np=$parts k a b step ok=1 pids=() pf=() alive p got
+  [ "$bytes" -lt $((256 << 20)) ] && np=1
+  # a single-stream .part from an earlier run: carry it on as one range
+  if [ -f "$out.part" ] && [ ! -f "$out.part.0" ]; then np=1; mv "$out.part" "$out.part.0"; fi
+  # ranges of an earlier run (every range file is created when its curl starts): keep that run's split
+  if [ -f "$out.part.0" ]; then np=0; while [ -f "$out.part.$np" ]; do np=$((np + 1)); done; fi
+  step=$(((bytes + np - 1) / np))
+  for k in $(seq 0 $((np - 1))); do
+    a=$((k * step)); b=$(((k + 1) * step - 1)); [ $b -ge "$bytes" ] && b=$((bytes - 1))
+    pf+=("$out.part.$k")
+    fetch_range "$url" $a $b "$out.part.$k" & pids+=($!)
+  done
+  while [ $np -gt 1 ]; do  # progress while the ranges run
+    alive=0; for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ $alive = 1 ] || break
+    sleep 15
+    got=0; for p in "${pf[@]}"; do got=$((got + $(size "$p"))); done
+    printf "  %s: %d of %d MB\n" "$name" $((got / 1000000)) $((bytes / 1000000))
+  done
+  for p in "${pids[@]}"; do wait "$p" || ok=0; done
+  [ $ok = 1 ] || return 1
+  cat "${pf[@]}" > "$out.joined" && mv "$out.joined" "$out" && rm -f "${pf[@]}"
+}
+# hf CLI: into a staging folder in $dir (it resumes there), then moved into place
+fetch_hf() {  # repo rev path name
+  local i stage=$dir/.hf-download
+  for i in $(seq 1 "$tries"); do
+    if $hfcli download "$1" "$3" --revision "$2" --local-dir "$stage" >/dev/null; then
+      mv "$stage/$3" "$dir/$4" && return 0
+    fi
+    [ "$i" -lt "$tries" ] && pause "$i"
+  done
+  return 1
+}
+fetch() {  # repo rev path name bytes
+  echo "download $4 ($(($5 / 1000000)) MB) from $1 (with $fetcher)"
+  if [ $fetcher = hf ]; then fetch_hf "$1" "$2" "$3" "$4"; else fetch_curl "$HF/$1/resolve/$2/$3" "$4" "$5"; fi \
+    || die "download of $4 failed after $tries attempts (rerun to resume)"
+}
 check() {  # name bytes sha
   local f=$dir/$1
   [ -f "$f" ] || { echo "missing  $1"; return 1; }
   [ "$(stat -c %s "$f")" = "$2" ] || { echo "SIZE     $1: $(stat -c %s "$f") bytes, expected $2"; return 1; }
-  [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$3" ] || { echo "SHA256   $1 differs"; return 1; }
+  [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$3" ] || { echo "SHA256   $1 differs"; return 2; }
   echo "ok       $1"
 }
 for line in "${files[@]}"; do
   read -r repo rev path name bytes sha <<<"$line"
   if [ $mode = fetch ] && ! { [ -f "$dir/$name" ] && [ "$(stat -c %s "$dir/$name")" = "$bytes" ]; }; then
-    echo "download $name ($((bytes / 1000000)) MB) from $repo"
-    curl -fL --retry 5 --retry-delay 5 -C - "${auth[@]}" -o "$dir/$name.part" "$HF/$repo/resolve/$rev/$path" \
-      || die "download of $name failed (rerun to resume)"
-    mv "$dir/$name.part" "$dir/$name"
+    [ -f "$dir/$name" ] && mv "$dir/$name" "$dir/$name.bad"  # a wrong-size file: not resumable, set aside
+    fetch "$repo" "$rev" "$path" "$name" "$bytes"
   fi
-  check "$name" "$bytes" "$sha" || bad=1
+  rc=0; check "$name" "$bytes" "$sha" || rc=$?
+  if [ $rc = 2 ] && [ $mode = fetch ]; then
+    # right size, wrong content: keep it as .bad (replacing an older .bad) and download it again
+    echo "         moving it to $name.bad and downloading it again"
+    mv -f "$dir/$name" "$dir/$name.bad"
+    fetch "$repo" "$rev" "$path" "$name" "$bytes"
+    rc=0; check "$name" "$bytes" "$sha" || rc=$?
+    [ $rc = 0 ] && rm -f "$dir/$name.bad"
+  elif [ $rc = 2 ]; then
+    echo "         run without --verify-only to download it again"
+  fi
+  [ $rc = 0 ] || bad=1
 done
 
 # the chat template the quant carries (tokenizer.chat_template of the first GGUF)
@@ -113,6 +197,7 @@ if [ -f "$dir/chat_template.jinja" ] && [ "$(sha256sum "$dir/chat_template.jinja
 else
   echo "missing  chat_template.jinja (or it differs)"; bad=1
 fi
+rm -rf "$dir/.hf-download"
 [ $bad = 0 ] || die "some files are missing or differ (see above)"
 echo "Flash-Next files ready in $dir"
 [ $draft = 1 ] || echo "(no MTP draft: the server runs without speculative decoding)"

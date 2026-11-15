@@ -69,6 +69,9 @@ pub struct ChatRequest {
     pub add_generation_prompt: Option<bool>,
     pub continue_final_message: Option<bool>,
     pub n: Option<u32>,
+    /// not supported: `true` is rejected (a client asking for them must not get a reply without them)
+    pub logprobs: Option<Json>,
+    pub top_logprobs: Option<Json>,
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -84,6 +87,8 @@ pub struct CompletionRequest {
     pub echo: Option<bool>,
     pub n: Option<u32>,
     pub suffix: Option<String>,
+    /// not supported: a number > 0 is rejected
+    pub logprobs: Option<Json>,
 }
 
 /// An OpenAI-shaped error response.
@@ -100,6 +105,9 @@ impl ApiError {
     pub fn internal(msg: impl Into<String>) -> Self {
         Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: msg.into() }
     }
+    pub fn unavailable(msg: impl Into<String>) -> Self {
+        Self { status: StatusCode::SERVICE_UNAVAILABLE, message: msg.into() }
+    }
     pub fn body(&self) -> Json {
         let kind = if self.status.is_client_error() { "invalid_request_error" } else { "server_error" };
         json!({"error": {"message": self.message, "type": kind, "param": null, "code": self.status.as_u16()}})
@@ -109,6 +117,16 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, AxJson(self.body())).into_response()
+    }
+}
+
+/// `logprobs` / `top_logprobs` as a client sends them when it wants none: absent, null, false or 0.
+pub fn wants_logprobs(v: &Option<Json>) -> bool {
+    match v {
+        None | Some(Json::Null) => false,
+        Some(Json::Bool(b)) => *b,
+        Some(Json::Number(n)) => n.as_f64() != Some(0.0),
+        Some(_) => true,
     }
 }
 

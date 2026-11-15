@@ -2,18 +2,17 @@
  "meta": {
   "date": "Nov 2026",
   "driver": "580.178.04",
-  "kl_code": "0.0208",
-  "kl_text": "0.0401",
-  "kl_long": "0.0240",
+  "setup": "two DGX Sparks, Qwen3.8-27B (EXL3 3.0 bpw decode, NVFP4 prompt weights), DFlash2 + copy rows, 4 x 128K",
+  "health": "ferrite engine, model qwen3.8-27b, 4 at once, context 131072",
   "url": "http://127.0.0.1:8050/v1",
-  "start": "2026-11-08 10:36:23"
+  "start": "2026-11-15 02:11:15"
  },
  "cases": {
   "prefill-2K": {
    "prefill": {
-    "median": 3544.4,
-    "min": 3481.8,
-    "max": 3571.8,
+    "median": 3568.5,
+    "min": 3476.1,
+    "max": 3570.2,
     "n": 3
    },
    "prompt_tokens": {
@@ -32,9 +31,9 @@
   },
   "prefill-8K": {
    "prefill": {
-    "median": 3334.6,
-    "min": 3319.8,
-    "max": 3354.2,
+    "median": 3338.4,
+    "min": 3318.4,
+    "max": 3349.3,
     "n": 3
    },
    "prompt_tokens": {
@@ -53,9 +52,9 @@
   },
   "prefill-32K": {
    "prefill": {
-    "median": 2798.9,
-    "min": 2794.3,
-    "max": 2810.6,
+    "median": 2806.4,
+    "min": 2801.4,
+    "max": 2806.6,
     "n": 3
    },
    "prompt_tokens": {
@@ -74,9 +73,9 @@
   },
   "prefill-64K": {
    "prefill": {
-    "median": 2321.4,
-    "min": 2320.6,
-    "max": 2325.6,
+    "median": 2325.2,
+    "min": 2302.9,
+    "max": 2332.4,
     "n": 3
    },
    "prompt_tokens": {
@@ -95,9 +94,9 @@
   },
   "prefill-120K": {
    "prefill": {
-    "median": 1792.4,
-    "min": 1792.4,
-    "max": 1794.4,
+    "median": 1784.2,
+    "min": 1765.2,
+    "max": 1794.9,
     "n": 3
    },
    "prompt_tokens": {
@@ -127,22 +126,22 @@
     "n": 3
    },
    "per_stream": {
-    "median": 273.4,
-    "min": 272.7,
-    "max": 274.7,
+    "median": 266.6,
+    "min": 266.1,
+    "max": 266.9,
     "n": 3
    },
    "per_stream_clean": null,
    "aggregate_with_ttft": {
-    "median": 208.4,
-    "min": 208.1,
-    "max": 208.8,
+    "median": 204.5,
+    "min": 204.1,
+    "max": 204.7,
     "n": 3
    },
    "combined": {
-    "median": 274.0,
-    "min": 273.2,
-    "max": 275.3,
+    "median": 267.1,
+    "min": 266.6,
+    "max": 267.4,
     "n": 3
    },
    "ttft_last": {
@@ -178,27 +177,27 @@
     "n": 5
    },
    "per_stream": {
-    "median": 78.9,
-    "min": 75.8,
-    "max": 592.6,
+    "median": 76.7,
+    "min": 74.0,
+    "max": 573.3,
     "n": 5
    },
    "per_stream_clean": {
-    "median": 76.5,
-    "min": 75.8,
-    "max": 78.9,
+    "median": 74.0,
+    "min": 74.0,
+    "max": 76.7,
     "n": 3
    },
    "aggregate_with_ttft": {
-    "median": 73.4,
-    "min": 70.5,
-    "max": 372.3,
+    "median": 71.5,
+    "min": 69.0,
+    "max": 368.1,
     "n": 5
    },
    "combined": {
-    "median": 79.1,
-    "min": 75.9,
-    "max": 593.8,
+    "median": 76.9,
+    "min": 74.1,
+    "max": 574.4,
     "n": 5
    },
    "ttft_last": {
@@ -234,34 +233,34 @@
     "n": 12
    },
    "per_stream": {
-    "median": 119.3,
-    "min": 115.6,
-    "max": 121.7,
+    "median": 117.9,
+    "min": 114.3,
+    "max": 119.6,
     "n": 12
    },
    "per_stream_clean": null,
    "aggregate_with_ttft": {
-    "median": 313.2,
-    "min": 309.1,
-    "max": 313.9,
+    "median": 311.9,
+    "min": 307.9,
+    "max": 313.7,
     "n": 3
    },
    "combined": {
-    "median": 473.0,
-    "min": 463.5,
-    "max": 474.2,
+    "median": 467.4,
+    "min": 458.0,
+    "max": 470.6,
     "n": 3
    },
    "ttft_last": {
-    "median": 2.2,
-    "min": 2.2,
-    "max": 2.2,
+    "median": 2.1,
+    "min": 2.1,
+    "max": 2.1,
     "n": 3
    },
    "ttft": {
-    "median": 2.2,
-    "min": 2.2,
-    "max": 2.2,
+    "median": 2.1,
+    "min": 2.1,
+    "max": 2.1,
     "n": 12
    },
    "kind": "gen",
@@ -285,39 +284,39 @@
     "n": 12
    },
    "per_stream": {
-    "median": 71.8,
-    "min": 47.8,
-    "max": 309.5,
+    "median": 70.8,
+    "min": 46.8,
+    "max": 304.2,
     "n": 12
    },
    "per_stream_clean": {
-    "median": 50.8,
-    "min": 47.8,
-    "max": 52.4,
+    "median": 49.8,
+    "min": 46.8,
+    "max": 51.4,
     "n": 5
    },
    "aggregate_with_ttft": {
-    "median": 163.2,
-    "min": 162.5,
-    "max": 219.7,
+    "median": 161.2,
+    "min": 160.2,
+    "max": 218.1,
     "n": 3
    },
    "combined": {
-    "median": 194.4,
-    "min": 191.6,
-    "max": 279.6,
+    "median": 190.5,
+    "min": 187.6,
+    "max": 274.7,
     "n": 3
    },
    "ttft_last": {
-    "median": 1.9,
-    "min": 1.9,
-    "max": 1.9,
+    "median": 1.8,
+    "min": 1.8,
+    "max": 1.8,
     "n": 3
    },
    "ttft": {
-    "median": 1.9,
-    "min": 1.9,
-    "max": 1.9,
+    "median": 1.8,
+    "min": 1.8,
+    "max": 1.8,
     "n": 12
    },
    "kind": "gen",
@@ -341,22 +340,22 @@
     "n": 3
    },
    "per_stream": {
-    "median": 237.5,
-    "min": 226.6,
-    "max": 242.3,
+    "median": 230.4,
+    "min": 218.0,
+    "max": 235.1,
     "n": 3
    },
    "per_stream_clean": null,
    "aggregate_with_ttft": {
-    "median": 36.8,
-    "min": 36.5,
-    "max": 36.9,
+    "median": 36.7,
+    "min": 36.4,
+    "max": 36.7,
     "n": 3
    },
    "combined": {
-    "median": 238.0,
-    "min": 227.1,
-    "max": 242.8,
+    "median": 230.9,
+    "min": 218.4,
+    "max": 235.6,
     "n": 3
    },
    "ttft_last": {
@@ -392,27 +391,27 @@
     "n": 5
    },
    "per_stream": {
-    "median": 90.3,
-    "min": 71.5,
-    "max": 127.8,
+    "median": 87.7,
+    "min": 69.5,
+    "max": 123.9,
     "n": 5
    },
    "per_stream_clean": {
-    "median": 80.9,
-    "min": 71.5,
-    "max": 90.3,
+    "median": 78.6,
+    "min": 69.5,
+    "max": 87.7,
     "n": 2
    },
    "aggregate_with_ttft": {
-    "median": 33.5,
-    "min": 30.6,
-    "max": 37.7,
+    "median": 33.2,
+    "min": 30.2,
+    "max": 37.2,
     "n": 5
    },
    "combined": {
-    "median": 90.4,
-    "min": 71.7,
-    "max": 128.1,
+    "median": 87.8,
+    "min": 69.7,
+    "max": 124.2,
     "n": 5
    },
    "ttft_last": {
@@ -448,34 +447,34 @@
     "n": 12
    },
    "per_stream": {
-    "median": 95.4,
-    "min": 73.9,
-    "max": 106.6,
+    "median": 85.0,
+    "min": 80.8,
+    "max": 101.5,
     "n": 12
    },
    "per_stream_clean": null,
    "aggregate_with_ttft": {
-    "median": 40.8,
-    "min": 40.7,
-    "max": 40.9,
+    "median": 41.1,
+    "min": 41.0,
+    "max": 41.2,
     "n": 3
    },
    "combined": {
-    "median": 339.6,
-    "min": 336.0,
-    "max": 346.5,
+    "median": 335.2,
+    "min": 334.6,
+    "max": 340.1,
     "n": 3
    },
    "ttft_last": {
-    "median": 44.1,
-    "min": 44.0,
-    "max": 44.1,
+    "median": 43.3,
+    "min": 43.3,
+    "max": 43.7,
     "n": 3
    },
    "ttft": {
-    "median": 43.4,
-    "min": 41.7,
-    "max": 44.1,
+    "median": 42.5,
+    "min": 41.4,
+    "max": 43.7,
     "n": 12
    },
    "kind": "gen",
@@ -499,39 +498,39 @@
     "n": 12
    },
    "per_stream": {
-    "median": 63.3,
-    "min": 44.2,
-    "max": 242.9,
+    "median": 64.6,
+    "min": 43.2,
+    "max": 252.8,
     "n": 12
    },
    "per_stream_clean": {
-    "median": 44.8,
-    "min": 44.2,
-    "max": 54.2,
+    "median": 43.7,
+    "min": 43.2,
+    "max": 52.4,
     "n": 5
    },
    "aggregate_with_ttft": {
     "median": 42.1,
-    "min": 37.3,
-    "max": 43.7,
+    "min": 37.5,
+    "max": 43.8,
     "n": 3
    },
    "combined": {
-    "median": 187.2,
-    "min": 172.7,
-    "max": 267.2,
+    "median": 184.6,
+    "min": 168.3,
+    "max": 260.2,
     "n": 3
    },
    "ttft_last": {
-    "median": 35.4,
-    "min": 35.4,
-    "max": 35.5,
+    "median": 35.2,
+    "min": 35.0,
+    "max": 35.2,
     "n": 3
    },
    "ttft": {
-    "median": 35.4,
-    "min": 34.8,
-    "max": 35.5,
+    "median": 35.0,
+    "min": 34.6,
+    "max": 35.2,
     "n": 12
    },
    "kind": "gen",
@@ -544,21 +543,21 @@
   },
   "edit-1s": {
    "aggregate_with_ttft": {
-    "median": 457.6,
-    "min": 457.0,
-    "max": 460.2,
+    "median": 442.6,
+    "min": 441.8,
+    "max": 443.9,
     "n": 3
    },
    "per_stream": {
-    "median": 582.3,
-    "min": 577.8,
-    "max": 582.8,
+    "median": 564.3,
+    "min": 560.1,
+    "max": 564.8,
     "n": 3
    },
    "combined": {
-    "median": 583.7,
-    "min": 579.2,
-    "max": 583.7,
+    "median": 563.9,
+    "min": 559.7,
+    "max": 566.0,
     "n": 3
    },
    "kind": "edit",
@@ -571,21 +570,21 @@
   },
   "edit-4s": {
    "aggregate_with_ttft": {
-    "median": 412.8,
-    "min": 404.9,
+    "median": 405.4,
+    "min": 394.0,
     "max": 422.3,
     "n": 3
    },
    "per_stream": {
-    "median": 154.9,
-    "min": 128.2,
-    "max": 197.1,
+    "median": 153.6,
+    "min": 124.2,
+    "max": 184.8,
     "n": 12
    },
    "combined": {
-    "median": 481.0,
-    "min": 471.4,
-    "max": 494.6,
+    "median": 471.8,
+    "min": 455.9,
+    "max": 495.6,
     "n": 3
    },
    "kind": "edit",
@@ -598,26 +597,26 @@
   }
  },
  "headline": {
-  "code_4s_2k": 473.0,
-  "code_1s_2k": 273.4,
-  "code_1s_32k": 237.5,
-  "code_4s_32k": 339.6,
-  "prose_1s_2k": 76.5,
-  "prose_4s_2k_per_request": 50.8,
-  "edit_1s": 582.3,
-  "edit_4s": 481.0,
-  "code_4s_2k_with_ttft": 313.2,
-  "code_4s_32k_with_ttft": 40.8,
-  "edit_4s_with_ttft": 412.8,
-  "ttft_4s_2k_s": 2.2,
-  "ttft_4s_32k_s": 44.1,
-  "prefill_2k": 3544.4,
-  "prefill_32k": 2798.9,
-  "prefill_120k": 1792.4,
+  "code_4s_2k": 467.4,
+  "code_1s_2k": 266.6,
+  "code_1s_32k": 230.4,
+  "code_4s_32k": 335.2,
+  "prose_1s_2k": 74.0,
+  "prose_4s_2k_per_request": 49.8,
+  "edit_1s": 564.3,
+  "edit_4s": 471.8,
+  "code_4s_2k_with_ttft": 311.9,
+  "code_4s_32k_with_ttft": 41.1,
+  "edit_4s_with_ttft": 405.4,
+  "ttft_4s_2k_s": 2.1,
+  "ttft_4s_32k_s": 43.3,
+  "prefill_2k": 3568.5,
+  "prefill_32k": 2806.4,
+  "prefill_120k": 1784.2,
   "kl_code": 0.0208,
   "kl_text": 0.0401,
   "kl_16k": 0.024,
-  "kl_source": "measured (--meta)",
+  "kl_source": "measured (--meta) on the same weights and kernels in an earlier release; not re-run for 0.6.1",
   "setup": "two DGX Sparks, Qwen3.8-27B (EXL3 3.0 bpw decode, NVFP4 prompt weights), DFlash2 + copy rows, 4 x 128K",
   "date": "Nov 2026"
  }

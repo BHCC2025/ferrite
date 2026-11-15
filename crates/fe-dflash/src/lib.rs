@@ -32,6 +32,7 @@ pub struct Kd {
     pub module: Module,
     dynconv: Function,
     norm_rope: Function,
+    #[allow(dead_code)] // loaded with the module; the drafter runs the split / mma attention kernels
     attn: Function,
     attn_part: Function,
     attn_comb: Function,
@@ -394,7 +395,8 @@ impl DFlash {
         let (rank, world) = tp.unwrap_or((0, 1));
         ensure!(world == 1 || world == 2, "DFlash2 TP: world {world}");
         let (nq, nkv, ni) = (NQ / world, NKV / world, INTER / world);
-        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))
+            .with_context(|| format!("the DFlash2 drafter: reading {:?} (scripts/fetch-models.sh draft)", dir.join("config.json")))?)?;
         let dc = &cfg["dflash_config"];
         let block = block_size(&cfg);
         let layer_ids: Vec<usize> = dc["target_layer_ids"].as_array().context("target_layer_ids")?.iter()

@@ -17,7 +17,7 @@ use serde_json::{Map, Value as Json, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::api::{ApiError, ChatRequest, CompletionRequest, SamplingRequest, parse_body};
+use crate::api::{ApiError, ChatRequest, CompletionRequest, SamplingRequest, parse_body, wants_logprobs};
 use crate::engine::{CancelToken, Engine, FinishReason, GenEvent, GenRequest, SamplingParams, Timings, TokenSink};
 use crate::parser::{Delta, OutputParser, ParserConfig, Parsed};
 use crate::stop::StopMatcher;
@@ -138,7 +138,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models/{id}", get(model_one))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
-        .layer(DefaultBodyLimit::max(256 << 20))
+        // a 128K-token prompt is about 0.5 MB of text; larger bodies are rejected before any tokenizing
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
 }
 
@@ -146,17 +147,30 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// (tests/health_contract.rs): `max_batch_size` = requests the loaded engine decodes at once (never more than the
 /// engine reports), `max_model_len` = prompt + output tokens a request may use, `running` = requests holding a
 /// slot now, `queued` = requests waiting for one.
-async fn health(State(s): State<Arc<AppState>>) -> AxJson<Json> {
+async fn health(State(s): State<Arc<AppState>>) -> Response {
+    if let Some(why) = s.engine.dead() {
+        // the engine is gone (the process exits in a moment): a load balancer or supervisor must see it
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, AxJson(json!({
+            "status": "error",
+            "error": format!("the engine stopped: {why}"),
+            "model": s.cfg.model_id,
+            "engine": s.engine.info().name,
+        }))).into_response();
+    }
     AxJson(json!({
         "status": "ok",
         "model": s.cfg.model_id,
         "engine": s.engine.info().name,
+        "version": env!("CARGO_PKG_VERSION"),
         "max_batch_size": s.cfg.max_concurrent,
         "max_model_len": s.cfg.max_context,
         "running": s.running(),
         "queued": s.queued(),
-    }))
+    })).into_response()
 }
+
+/// Request bodies above this many bytes get a 413 (axum's DefaultBodyLimit).
+pub const BODY_LIMIT: usize = 32 << 20;
 
 fn model_card(s: &AppState) -> Json {
     json!({
@@ -275,9 +289,12 @@ fn resolve_sampling(
     default_max: Option<usize>,
 ) -> Result<(SamplingParams, Vec<String>, bool, bool), ApiError> {
     let ctx = s.cfg.max_context;
-    if prompt_len >= ctx {
+    // the engine may keep the context's last positions for its own rows: such a prompt is the client's to shorten
+    let reserve = s.engine.prompt_reserve();
+    if prompt_len + reserve >= ctx {
+        let room = if reserve > 0 { format!(" (a prompt may use at most {} of them)", ctx.saturating_sub(reserve + 1)) } else { String::new() };
         return Err(ApiError::bad_request(format!(
-            "the prompt is {prompt_len} tokens; this model's context window is {ctx} tokens"
+            "the prompt is {prompt_len} tokens; this model's context window is {ctx} tokens{room}"
         )));
     }
     let room = ctx - prompt_len;
@@ -348,6 +365,9 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
     }
     if req.n.unwrap_or(1) > 1 {
         return Err(ApiError::bad_request("n > 1 is not supported"));
+    }
+    if wants_logprobs(&req.logprobs) || wants_logprobs(&req.top_logprobs) {
+        return Err(ApiError::bad_request("logprobs are not supported"));
     }
     let mut messages = normalize_messages(&req.messages).map_err(ApiError::bad_request)?;
     let tools: Vec<Json> = req.tools.clone().unwrap_or_default();
@@ -447,6 +467,9 @@ fn prepare_completion(s: &AppState, req: CompletionRequest) -> Result<Prepared, 
     }
     if req.suffix.as_deref().is_some_and(|x| !x.is_empty()) {
         return Err(ApiError::bad_request("suffix is not supported"));
+    }
+    if wants_logprobs(&req.logprobs) {
+        return Err(ApiError::bad_request("logprobs are not supported"));
     }
     let ids_of = |a: &[Json]| -> Option<Vec<u32>> { a.iter().map(|v| v.as_u64().map(|x| x as u32)).collect() };
     let (text, prompt_ids) = match req.prompt.as_ref() {
@@ -999,6 +1022,9 @@ async fn run(state: Arc<AppState>, prepared: Result<Prepared, ApiError>, t_start
             return e.into_response();
         }
     };
+    if let Some(why) = state.engine.dead() {
+        return ApiError::unavailable(format!("the engine stopped: {why}")).into_response();
+    }
     tracing::info!(
         "{} queued: prompt {} tokens, max_tokens {}, temp {}, stream {}",
         p.id,
