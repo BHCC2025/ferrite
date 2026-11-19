@@ -81,6 +81,11 @@ each), with the cache on instead of off (`FERRITE_CACHE=0`):
 
 How it works and its limits: [docs/prompt-cache.md](docs/prompt-cache.md).
 
+**Coding agents.** The server fills the sampling fields a client leaves out from the model's published settings,
+keeps a `temperature: 0` request on the fast greedy path, closes a runaway reasoning block, cuts loops short and
+enforces `tool_choice`. Tested harness settings are in [docs/harness.md](docs/harness.md); the API checks behind
+them are a standalone suite, [tools/conformance](tools/conformance/README.md).
+
 ## Quick start
 
 Requirements: a DGX Spark (GB10) with DGX OS, NVIDIA driver 580+, at least 95 GB of available memory and 45 GB of
@@ -93,7 +98,7 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.6.0` pins one) and the models into
+It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.7.0` pins one) and the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the
 models, and `--source` builds from source. Run again over an older release, the same command upgrades it.
@@ -122,7 +127,8 @@ scripts/serve.sh                      # or in the background: scripts/ferritectl
 curl -s localhost:8000/v1/models
 ```
 
-The release tarball holds the binaries, every launcher, the benchmark clients (`tools/bench`) and all of `docs/`.
+The release tarball holds the binaries, every launcher, the benchmark clients (`tools/bench`), the conformance suite
+(`tools/conformance`) and all of `docs/`.
 
 Point any OpenAI-compatible client at `http://<spark>:8000/v1`: Open WebUI, Continue, Cline and other coding agents.
 Details, the two-Spark setup and troubleshooting are in [docs/quickstart.md](docs/quickstart.md) and [TP2.md](TP2.md).

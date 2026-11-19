@@ -193,6 +193,7 @@ fi
 
 fl_say "$quant, prompt weights $prompt, drafting $dr, ctx $ctx x $slots slots, prompt cache \
 $([ "$cache" = 1 ] && echo "on (a pool of up to ${park} GB, keeping 20 GB available)" || echo off); $memline"
+fl_sampling "$quant" qwen3.8-27b
 fl_banner "${FERRITE_MODEL_ID:-qwen3.8-27b}" "loading takes a minute"
 exec "$bin" --engine ferrite --model-dir "$quant" --weights-dir "$quant" \
   --nvfp4-dir "$nvfp4" --draft-dir "$draft" \

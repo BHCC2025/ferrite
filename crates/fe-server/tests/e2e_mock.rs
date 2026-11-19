@@ -437,3 +437,228 @@ async fn dropped_stream_cancels_generation() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// FE_DUMP_REQUESTS: the body as received in `<id>.json`, the outcome in `<id>.meta.json`; a rejected request is kept too.
+#[tokio::test]
+async fn request_capture_writes_body_and_meta() {
+    let Some(s) = state() else { return };
+    let dir = std::env::temp_dir().join(format!("fe-capture-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    s.dump_dir.set(dir.clone()).expect("capture dir not set by the environment");
+    // odd spacing and key order: the file must hold the bytes as received, not a re-serialisation
+    let raw = r#"{ "messages":[{"role":"user","content":"Say hi."}],   "max_tokens": 24, "model":"qwen3.8-27b","stream":false }"#;
+    let req = Request::builder().method("POST").uri("/v1/chat/completions").header("content-type", "application/json").body(Body::from(raw)).unwrap();
+    let resp = router(s.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Json = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id = v["id"].as_str().unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join(format!("{id}.json"))).unwrap(), raw);
+    let meta: Json = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{id}.meta.json"))).unwrap()).unwrap();
+    assert_eq!(meta["id"], id);
+    assert_eq!(meta["finish_reason"], v["choices"][0]["finish_reason"]);
+    assert_eq!(meta["completion_tokens"], v["usage"]["completion_tokens"]);
+    assert_eq!(meta["prompt_tokens"], v["usage"]["prompt_tokens"]);
+    assert_eq!(meta["reasoning_cap_fired"], false);
+    assert_eq!(meta["loop_breaker_fired"], false);
+    assert_eq!(meta["stream"], false);
+    // streaming: same files
+    let (st, bytes) = post(&s, "/v1/chat/completions", json!({"messages": [{"role": "user", "content": "Say hi."}], "max_tokens": 16, "stream": true})).await;
+    assert_eq!(st, StatusCode::OK);
+    let ev = sse_events(&bytes);
+    let id2 = ev[0]["id"].as_str().unwrap().to_string();
+    let meta2: Json = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{id2}.meta.json"))).unwrap()).unwrap();
+    assert_eq!(meta2["stream"], true);
+    assert!(meta2["finish_reason"].is_string());
+    assert!(dir.join(format!("{id2}.json")).exists());
+    // a rejected request is kept with the reason
+    let (st, _) = post(&s, "/v1/chat/completions", json!({"messages": "not a list"})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let rejected: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("rejected-")).collect();
+    assert_eq!(rejected.len(), 2, "{rejected:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Off by default: nothing is written anywhere.
+#[tokio::test]
+async fn request_capture_is_off_by_default() {
+    let Some(s) = state() else { return };
+    assert!(std::env::var_os("FE_DUMP_REQUESTS").is_some() || s.dump_dir.get().is_none());
+}
+
+// ---- sampling profiles, the effective-sampling header, the watchdog, the repeated-sentence rule (mock engine) ----
+
+use fe_server::server::Profile;
+
+fn state_cfg(delay_ms: u64, f: impl FnOnce(&mut GenDefaults)) -> Option<Arc<AppState>> {
+    let dir = model_dir()?;
+    let tok = Arc::new(Tok::from_dir(&dir).unwrap());
+    let template = Arc::new(ChatTemplate::from_dir(&dir).unwrap());
+    let mut defaults = GenDefaults::from_dir(&dir, &tok);
+    f(&mut defaults);
+    let engine = Arc::new(MockEngine::new(tok.clone(), MockConfig { delay: Duration::from_millis(delay_ms), max_batch: 4, ..Default::default() }));
+    let cfg = ServerConfig { model_id: "qwen3.8-27b".into(), max_concurrent: 4, max_context: 131_072, defaults };
+    Some(AppState::new(engine, tok, template, cfg))
+}
+
+fn card_profiles(d: &mut GenDefaults) {
+    d.phase.profile_thinking = Profile { temperature: Some(1.0), top_p: Some(0.95), top_k: Some(20), min_p: Some(0.0), presence_penalty: Some(0.0),
+        frequency_penalty: None, repetition_penalty: Some(1.0) };
+    d.phase.profile_plain = Profile { temperature: Some(0.7), top_p: Some(0.8), top_k: Some(20), min_p: Some(0.0), presence_penalty: Some(1.5),
+        frequency_penalty: None, repetition_penalty: Some(1.0) };
+    d.phase.greedy_floor = false;
+    d.phase.greedy_keeps_fast_path = true;
+}
+
+/// POST and return the parsed `x-sampling-effective` header.
+async fn effective(s: &Arc<AppState>, body: Json) -> Json {
+    let req = Request::builder().method("POST").uri("/v1/chat/completions").header("content-type", "application/json")
+        .body(Body::from(body.to_string())).unwrap();
+    let resp = router(s.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers().get("x-sampling-effective").expect("x-sampling-effective header").to_str().unwrap().to_string();
+    let _ = resp.into_body().collect().await;
+    serde_json::from_str(&h).unwrap()
+}
+
+#[tokio::test]
+async fn profile_of_the_request_mode_fills_what_the_client_omits() {
+    let Some(s) = state_cfg(0, card_profiles) else { return };
+    let msg = json!([{"role": "user", "content": "Hi"}]);
+    for stream in [false, true] {
+        // thinking: the thinking profile
+        let e = effective(&s, json!({"messages": msg, "stream": stream})).await;
+        assert_eq!(e["mode"], "thinking", "{e}");
+        assert_eq!((e["temperature"].as_f64(), e["top_p"].as_f64(), e["top_k"].as_u64(), e["presence_penalty"].as_f64()), (Some(1.0), Some(0.95), Some(20), Some(0.0)), "{e}");
+        assert_eq!(e["from"]["temperature"], "profile");
+        // not thinking: the non-thinking profile
+        let e = effective(&s, json!({"messages": msg, "stream": stream, "chat_template_kwargs": {"enable_thinking": false}})).await;
+        assert_eq!(e["mode"], "non_thinking", "{e}");
+        assert_eq!((e["temperature"].as_f64(), e["top_p"].as_f64(), e["top_k"].as_u64(), e["presence_penalty"].as_f64(), e["repetition_penalty"].as_f64()),
+            (Some(0.7), Some(0.8), Some(20), Some(1.5), Some(1.0)), "{e}");
+        assert_eq!(e["from"]["presence_penalty"], "profile");
+    }
+    // a field the client sends always wins, field by field (0 included); the others still come from the profile
+    let e = effective(&s, json!({"messages": msg, "temperature": 0, "presence_penalty": 0.25, "chat_template_kwargs": {"enable_thinking": false}})).await;
+    assert_eq!((e["temperature"].as_f64(), e["presence_penalty"].as_f64(), e["top_p"].as_f64()), (Some(0.0), Some(0.25), Some(0.8)), "{e}");
+    assert_eq!((&e["from"]["temperature"], &e["from"]["presence_penalty"], &e["from"]["top_p"]), (&json!("client"), &json!("client"), &json!("profile")));
+    let e = effective(&s, json!({"messages": msg, "presence_penalty": 0, "top_k": 0, "chat_template_kwargs": {"enable_thinking": false}})).await;
+    assert_eq!((e["presence_penalty"].as_f64(), e["top_k"].as_u64(), e["temperature"].as_f64()), (Some(0.0), Some(0), Some(0.7)), "{e}");
+    // a raw completion has no mode: no profile
+    let req = Request::builder().method("POST").uri("/v1/completions").header("content-type", "application/json")
+        .body(Body::from(json!({"prompt": "Once", "max_tokens": 4}).to_string())).unwrap();
+    let resp = router(s.clone()).oneshot(req).await.unwrap();
+    let e: Json = serde_json::from_str(resp.headers().get("x-sampling-effective").unwrap().to_str().unwrap()).unwrap();
+    assert_eq!((&e["mode"], e["presence_penalty"].as_f64(), &e["from"]["temperature"]), (&json!("none"), Some(0.0), &json!("default")), "{e}");
+}
+
+/// A client that sends temperature 0 gets no penalty from the profile (the request stays on the device argmax); its own
+/// penalties still apply, a client that omits temperature gets the whole profile, and the key switches the rule off.
+#[tokio::test]
+async fn greedy_client_keeps_the_fast_path() {
+    let Some(s) = state_cfg(0, card_profiles) else { return };
+    let msg = json!([{"role": "user", "content": "Hi"}]);
+    let off = json!({"enable_thinking": false});
+    let pens = |e: &Json| (e["presence_penalty"].as_f64(), e["frequency_penalty"].as_f64(), e["repetition_penalty"].as_f64());
+    for stream in [false, true] {
+        for t in [json!(0), json!(0.0), json!(0.000001)] {
+            let e = effective(&s, json!({"messages": msg, "stream": stream, "temperature": t, "chat_template_kwargs": off})).await;
+            assert_eq!(e["mode"], "non_thinking", "{e}");
+            assert_eq!(e["temperature"].as_f64(), Some(0.0), "{e}");
+            assert_eq!(pens(&e), (Some(0.0), Some(0.0), Some(1.0)), "{e}");
+            assert_eq!((&e["from"]["temperature"], &e["from"]["presence_penalty"], &e["from"]["repetition_penalty"], &e["from"]["frequency_penalty"]),
+                (&json!("client"), &json!("greedy_fast_path"), &json!("greedy_fast_path"), &json!("default")), "{e}");
+            assert_eq!(e["greedy_keeps_fast_path"], true, "{e}");
+            // top_p / top_k are still the profile's (unused at temperature 0)
+            assert_eq!((e["top_p"].as_f64(), e["top_k"].as_u64()), (Some(0.8), Some(20)), "{e}");
+        }
+    }
+    // the client's own penalties apply, one by one; the ones it omits stay neutral
+    let e = effective(&s, json!({"messages": msg, "temperature": 0, "presence_penalty": 1.5, "chat_template_kwargs": off})).await;
+    assert_eq!(pens(&e), (Some(1.5), Some(0.0), Some(1.0)), "{e}");
+    assert_eq!(e["from"]["presence_penalty"], "client");
+    let e = effective(&s, json!({"messages": msg, "temperature": 0, "repetition_penalty": 1.1, "frequency_penalty": 0.2, "chat_template_kwargs": off})).await;
+    assert_eq!(pens(&e), (Some(0.0), Some(0.2), Some(1.1)), "{e}");
+    // no temperature from the client, or one above 0: the whole profile
+    let e = effective(&s, json!({"messages": msg, "chat_template_kwargs": off})).await;
+    assert_eq!((e["temperature"].as_f64(), e["top_p"].as_f64(), e["top_k"].as_u64(), e["presence_penalty"].as_f64()), (Some(0.7), Some(0.8), Some(20), Some(1.5)), "{e}");
+    assert_eq!(e["from"]["presence_penalty"], "profile");
+    let e = effective(&s, json!({"messages": msg, "temperature": 0.2, "chat_template_kwargs": off})).await;
+    assert_eq!((e["temperature"].as_f64(), e["presence_penalty"].as_f64(), &e["from"]["presence_penalty"]), (Some(0.2), Some(1.5), &json!("profile")), "{e}");
+    let e = effective(&s, json!({"messages": msg, "top_k": 1, "chat_template_kwargs": off})).await;
+    assert_eq!(e["presence_penalty"].as_f64(), Some(1.5), "top_k 1 without temperature is not the rule: {e}");
+    // thinking mode: the same rule, with a profile that has a penalty there
+    let Some(s2) = state_cfg(0, |d| { card_profiles(d); d.phase.profile_thinking.presence_penalty = Some(0.5); d.phase.profile_thinking.repetition_penalty = Some(1.05); }) else { return };
+    let e = effective(&s2, json!({"messages": msg, "temperature": 0})).await;
+    assert_eq!((e["mode"].as_str(), pens(&e)), (Some("thinking"), (Some(0.0), Some(0.0), Some(1.0))), "{e}");
+    let e = effective(&s2, json!({"messages": msg})).await;
+    assert_eq!(pens(&e), (Some(0.5), Some(0.0), Some(1.05)), "{e}");
+    // switched off: the profile fills every omitted field again
+    let Some(s3) = state_cfg(0, |d| { card_profiles(d); d.phase.greedy_keeps_fast_path = false; }) else { return };
+    let e = effective(&s3, json!({"messages": msg, "temperature": 0, "chat_template_kwargs": off})).await;
+    assert_eq!((e["presence_penalty"].as_f64(), &e["from"]["presence_penalty"], &e["greedy_keeps_fast_path"]), (Some(1.5), &json!("profile"), &json!(false)), "{e}");
+}
+
+#[tokio::test]
+async fn greedy_floor_is_off_by_default_and_only_touches_the_reasoning_phase() {
+    let msg = json!([{"role": "user", "content": "Hi"}]);
+    let Some(s) = state_cfg(0, card_profiles) else { return };
+    let e = effective(&s, json!({"messages": msg, "temperature": 0})).await;
+    assert_eq!(e["greedy_floor"], false);
+    assert!(e.get("reasoning_temperature").is_none(), "{e}");
+    let Some(s) = state_cfg(0, |d| { card_profiles(d); d.phase.greedy_floor = true; }) else { return };
+    // temperature 0 while thinking: the block is sampled at the profile temperature, the answer stays at 0
+    let e = effective(&s, json!({"messages": msg, "temperature": 0})).await;
+    assert_eq!((e["greedy_floor"].as_bool(), e["temperature"].as_f64(), e["reasoning_temperature"].as_f64()), (Some(true), Some(0.0), Some(1.0)), "{e}");
+    // not thinking, or a client temperature above 0: untouched
+    let e = effective(&s, json!({"messages": msg, "temperature": 0, "chat_template_kwargs": {"enable_thinking": false}})).await;
+    assert!(e.get("reasoning_temperature").is_none(), "{e}");
+    let e = effective(&s, json!({"messages": msg, "temperature": 0.3})).await;
+    assert!(e.get("reasoning_temperature").is_none() && e["temperature"].as_f64() == Some(0.3), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watchdog_ends_a_request_that_goes_silent() {
+    // the engine sends its first token and stalls: the no-token timeout (0.3 s here) ends the request cleanly
+    let Some(s) = state_cfg(1, |d| d.phase.no_token_timeout = 0.3) else { return };
+    let t = Instant::now();
+    let v = post_json(&s, "/v1/chat/completions", json!({"messages": [{"role": "user", "content": "[[mock:stall]]"}], "chat_template_kwargs": {"enable_thinking": false}})).await;
+    assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+    assert!(v["usage"]["completion_tokens"].as_u64().unwrap() >= 1);
+    assert!(t.elapsed() >= Duration::from_millis(300) && t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    // the wall-clock limit alone (no-token timeout off)
+    let Some(s) = state_cfg(1, |d| { d.phase.no_token_timeout = 0.0; d.phase.reply_wall_limit = 0.4; }) else { return };
+    let t = Instant::now();
+    let (status, bytes) = post(&s, "/v1/chat/completions", json!({"messages": [{"role": "user", "content": "[[mock:stall]]"}], "stream": true, "chat_template_kwargs": {"enable_thinking": false}})).await;
+    assert_eq!(status, StatusCode::OK);
+    let ev = sse_events(&bytes);
+    assert!(ev.iter().any(|e| e["choices"][0]["finish_reason"] == "length"), "{ev:?}");
+    assert!(t.elapsed() >= Duration::from_millis(400) && t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    // off (the defaults of a state without a sampling.json watchdog entry keep 60 s): a normal reply is untouched
+    let Some(s) = state_cfg(0, |d| d.phase.no_token_timeout = 0.3) else { return };
+    let v = post_json(&s, "/v1/chat/completions", json!({"messages": [{"role": "user", "content": "Hi"}]})).await;
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn wandering_reasoning_is_closed_and_a_wandering_answer_is_ended() {
+    let Some(s) = state_cfg(0, |d| { d.phase.loop_breaker = true; d.phase.max_reasoning = 0; d.phase.loop_rules = Default::default(); }) else { return };
+    let full = s.tok.encode(fe_server::mock::WANDER).unwrap().len();
+    // thinking: the block is closed where the rule fires and the answer follows
+    let v = post_json(&s, "/v1/chat/completions", json!({"messages": [{"role": "user", "content": "[[mock:wander]]"}], "max_tokens": 20000})).await;
+    let m = &v["choices"][0]["message"];
+    let reasoning = s.tok.encode(m["reasoning_content"].as_str().unwrap()).unwrap().len();
+    assert!(reasoning >= 600 && reasoning < full / 2, "reasoning {reasoning} of {full} tokens");
+    assert_eq!(m["content"], "The closing line: \"The river keeps its silver secrets under stone.\"", "{m}");
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    // not thinking: boosted once, then ended (finish length) well before the text is out
+    let v = post_json(&s, "/v1/chat/completions", json!({"messages": [{"role": "user", "content": "[[mock:wander]]"}], "max_tokens": 20000,
+        "chat_template_kwargs": {"enable_thinking": false}})).await;
+    let out = v["usage"]["completion_tokens"].as_u64().unwrap() as usize;
+    assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+    assert!(out >= 2400 && out < 2 * full, "{out} of {} tokens", 3 * full);
+    // the rule off: the whole block and the whole answer come through
+    let Some(s) = state_cfg(0, |d| { d.phase.loop_breaker = true; d.phase.max_reasoning = 0; d.phase.loop_rules = Default::default(); d.phase.loop_rules.sentence.enabled = false; }) else { return };
+    let v = post_json(&s, "/v1/chat/completions", json!({"messages": [{"role": "user", "content": "[[mock:wander]]"}], "max_tokens": 20000})).await;
+    let reasoning = s.tok.encode(v["choices"][0]["message"]["reasoning_content"].as_str().unwrap()).unwrap().len();
+    assert!(reasoning + 8 >= full, "{reasoning} of {full}");
+}

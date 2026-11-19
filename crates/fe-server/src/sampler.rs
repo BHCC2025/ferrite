@@ -49,7 +49,7 @@ impl Sampler {
         self.params.temperature <= 0.0 && !self.has_penalties()
     }
 
-    fn has_penalties(&self) -> bool {
+    pub fn has_penalties(&self) -> bool {
         self.params.repetition_penalty != 1.0 || self.params.presence_penalty != 0.0 || self.params.frequency_penalty != 0.0
     }
 
@@ -97,13 +97,33 @@ impl Sampler {
                 }
             }
         }
+        match self.kept_candidates(logits) {
+            Err(t) => t,
+            Ok(c) => {
+                let kept: f64 = c.iter().map(|c| (c.1 as f64).exp()).sum();
+                let mut u = self.rng.next_f64() * kept;
+                for c in &c {
+                    u -= (c.1 as f64).exp();
+                    if u < 0.0 {
+                        return c.0;
+                    }
+                }
+                c[c.len() - 1].0
+            }
+        }
+    }
+
+    /// The tokens a draw can return, with their scaled log weights (Err(token): greedy / degenerate, the one token). Temperature, top_k, min_p and
+    /// top_p applied; no penalties here.
+    fn kept_candidates(&self, logits: &[f32]) -> std::result::Result<Vec<(u32, f32)>, u32> {
+        let p = &self.params;
         // tiny temperatures are greedy (as vLLM: below 1e-5), which also keeps 1/T finite
         if p.temperature < 1e-5 {
-            return argmax(logits);
+            return Err(argmax(logits));
         }
         let max = logits.iter().copied().filter(|l| !l.is_nan()).fold(f32::NEG_INFINITY, f32::max);
         if !max.is_finite() {
-            return argmax(logits);
+            return Err(argmax(logits));
         }
         let inv_t = 1.0 / p.temperature;
         // candidates: tokens within e^-20.7 (1e-9) of the best one; the rest cannot matter
@@ -126,7 +146,7 @@ impl Sampler {
             cand.retain(|c| c.1 >= cut);
         }
         if cand.is_empty() {
-            return argmax(logits);
+            return Err(argmax(logits));
         }
         let total: f64 = cand.iter().map(|c| (c.1 as f64).exp()).sum();
         let mut keep = cand.len();
@@ -158,15 +178,43 @@ impl Sampler {
                 }
             }
         }
-        let kept: f64 = cand[..keep].iter().map(|c| (c.1 as f64).exp()).sum();
-        let mut u = self.rng.next_f64() * kept;
-        for c in &cand[..keep] {
-            u -= (c.1 as f64).exp();
-            if u < 0.0 {
-                return c.0;
+        cand.truncate(keep);
+        Ok(cand)
+    }
+
+    /// Speculative acceptance of drafted tokens (deterministic drafts) against the target rows `lgs` (k + 1 rows of logits, the verify pass):
+    /// draft j is accepted with the target probability of that token, on a reject the token is drawn from the target without it, if all k are
+    /// accepted a bonus token is drawn from row k. The emitted tokens are distributed exactly as plain sampling (no penalties; the caller checks).
+    /// Returns (accepted drafts, the next token).
+    pub fn spec_accept(&mut self, lgs: &[Vec<f32>], drafts: &[u32]) -> (usize, u32) {
+        for (j, &x) in drafts.iter().enumerate() {
+            match self.kept_candidates(&lgs[j]) {
+                Err(t) => {
+                    if t != x {
+                        return (j, t);
+                    }
+                }
+                Ok(c) => {
+                    let total: f64 = c.iter().map(|c| (c.1 as f64).exp()).sum();
+                    let wx: f64 = c.iter().find(|c| c.0 == x).map_or(0.0, |c| (c.1 as f64).exp());
+                    if self.rng.next_f64() * total < wx {
+                        continue;
+                    }
+                    let mut u = self.rng.next_f64() * (total - wx);
+                    let mut last = c[0].0;
+                    for c in c.iter().filter(|c| c.0 != x) {
+                        last = c.0;
+                        u -= (c.1 as f64).exp();
+                        if u < 0.0 {
+                            break;
+                        }
+                    }
+                    return (j, last);
+                }
             }
         }
-        cand[keep - 1].0
+        let mut row = lgs[drafts.len()].clone();
+        (drafts.len(), self.sample(&mut row))
     }
 }
 
@@ -238,6 +286,16 @@ mod tests {
         assert!(Sampler::new(&params(|p| p.temperature = 0.0), &[]).is_plain_greedy());
     }
 
+    /// Temperature 0 without a penalty is the device argmax whatever top_p / top_k / min_p say (a profile fills those in).
+    #[test]
+    fn truncation_fields_do_not_leave_plain_greedy() {
+        let s = Sampler::new(&params(|p| { p.temperature = 0.0; p.top_p = 0.8; p.top_k = 20; p.min_p = 0.05 }), &[1, 2]);
+        assert!(s.is_plain_greedy() && !s.has_penalties());
+        for f in [|p: &mut SamplingParams| p.presence_penalty = 1.5, |p: &mut SamplingParams| p.frequency_penalty = 0.1, |p: &mut SamplingParams| p.repetition_penalty = 1.05] {
+            assert!(!Sampler::new(&params(|p| { p.temperature = 0.0; f(p) }), &[]).is_plain_greedy());
+        }
+    }
+
     #[test]
     fn degenerate_params_never_panic() {
         let l = vec![1.0f32, 3.0, 2.0];
@@ -262,5 +320,56 @@ mod tests {
     fn bf16_rows() {
         let row: Vec<u16> = [0.5f32, 4.0, -1.0].iter().map(|f| (f.to_bits() >> 16) as u16).collect();
         assert_eq!(Sampler::new(&params(|p| p.temperature = 0.0), &[]).sample_bf16(&row), 1);
+    }
+
+    /// The speculative accept / reject must reproduce plain sampling exactly: a toy Markov model, deterministic (argmax) drafts, three-token
+    /// sequences compared with the exact joint probabilities.
+    #[test]
+    fn spec_accept_is_lossless() {
+        const V: usize = 5;
+        let lg: [[f32; V]; V] = [[1.0, 0.2, -0.5, 0.7, 0.0], [0.1, 1.5, 0.3, -1.0, 0.9], [0.8, 0.8, 0.4, 0.0, -0.3], [-0.2, 0.5, 1.1, 0.6, 0.6], [0.3, 0.1, 0.0, 1.2, 0.4]];
+        for (temp, top_p) in [(1.0f32, 1.0f32), (0.7, 0.9)] {
+            let pr = |prev: usize| -> [f64; V] {
+                let s = Sampler::new(&params(|p| { p.temperature = temp; p.top_p = top_p; }), &[]);
+                let c = s.kept_candidates(&lg[prev]).unwrap();
+                let tot: f64 = c.iter().map(|c| (c.1 as f64).exp()).sum();
+                let mut o = [0.0; V];
+                for c in c {
+                    o[c.0 as usize] = (c.1 as f64).exp() / tot;
+                }
+                o
+            };
+            let n = 600_000usize;
+            let mut cnt = vec![0usize; V * V * V];
+            let mut s = Sampler::new(&params(|p| { p.temperature = temp; p.top_p = top_p; p.seed = Some(11); }), &[]);
+            for _ in 0..n {
+                let mut seq: Vec<usize> = vec![];
+                let mut prev = 0usize;
+                while seq.len() < 3 {
+                    let am = |r: &[f32; V]| (0..V).fold(0, |b, i| if r[i] > r[b] { i } else { b });
+                    let d1 = am(&lg[prev]);
+                    let d2 = am(&lg[d1]);
+                    let rows = vec![lg[prev].to_vec(), lg[d1].to_vec(), lg[d2].to_vec()];
+                    let (m, nxt) = s.spec_accept(&rows, &[d1 as u32, d2 as u32]);
+                    let drafts = [d1, d2];
+                    seq.extend(drafts[..m].iter().copied());
+                    seq.push(nxt as usize);
+                    prev = *seq.last().unwrap();
+                }
+                cnt[seq[0] * 25 + seq[1] * 5 + seq[2]] += 1;
+            }
+            let mut worst = 0.0f64;
+            for a in 0..V {
+                for b in 0..V {
+                    for c in 0..V {
+                        let p = pr(0)[a] * pr(a)[b] * pr(b)[c];
+                        let e = cnt[a * 25 + b * 5 + c] as f64 / n as f64;
+                        let sd = (p * (1.0 - p) / n as f64).sqrt().max(1e-9);
+                        worst = worst.max((e - p).abs() / sd);
+                    }
+                }
+            }
+            assert!(worst < 5.0, "temp {temp} top_p {top_p}: worst z-score {worst}");
+        }
     }
 }

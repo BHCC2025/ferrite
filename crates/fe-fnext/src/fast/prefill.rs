@@ -1880,6 +1880,7 @@ impl Fast {
         }
         self.tp_on(1)?;
         let (t, _) = self.tp_pick(0);
+        self.bad_rows = if self.tp_row_finite(0) { 0 } else { 1 };
         self.tokens.extend_from_slice(toks);
         Ok(t)
     }

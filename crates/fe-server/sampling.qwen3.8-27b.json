@@ -1,0 +1,22 @@
+{
+  "_doc": "fe-server sampling profiles and protections for Qwen3.8-27B (read at start). profiles: what a request of that mode gets for the fields its client does not send (a field the client sends always wins); the values are the model card's. greedy_keeps_fast_path (on by default): a client that sends temperature 0 asks for greedy decoding, so the profile adds no presence / frequency / repetition penalty to it (the client's own penalties still apply) and the request keeps the fast greedy path; false: the profile fills every omitted field, penalties included. greedy_floor (off): a client temperature of 0 becomes the thinking profile's temperature inside the reasoning block only. Env overrides: FE_GREEDY_FAST_PATH, FE_GREEDY_FLOOR, FE_MAX_REASONING_TOKENS, FE_LOOP_BREAKER, FE_LOOP_RULES, FE_NO_TOKEN_TIMEOUT, FE_REPLY_WALL_LIMIT.",
+  "profiles": {
+    "thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.0},
+    "non_thinking": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0}
+  },
+  "greedy_keeps_fast_path": true,
+  "greedy_floor": false,
+  "think_start": "<think>",
+  "think_end": "</think>",
+  "max_reasoning_tokens": 8192,
+  "loop_breaker": true,
+  "loop_rules": {
+    "min_period": 1, "max_period": 512,
+    "reasoning": {"min_repeats": 4, "min_repeated_tokens": 400},
+    "answer": {"min_repeats": 8, "min_repeated_tokens": 400},
+    "call": {"min_repeats": 30, "min_repeated_tokens": 3000},
+    "sentence": {"enabled": true, "window": 64, "min_chars": 16, "min_count": 3, "min_fraction": 0.7, "min_tokens": 600, "answer_min_tokens": 1200}
+  },
+  "watchdog": {"no_token_timeout_s": 60, "reply_wall_limit_s": 0},
+  "call_marks": ["<tool_call>", "<function="]
+}

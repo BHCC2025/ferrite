@@ -403,7 +403,7 @@ impl Worker {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.serve(&req, &sink)));
             let msg = match res {
                 Ok(Ok((reason, cached, timings))) => {
-                    sink.finish(Finish { reason, cached_prompt_tokens: cached, timings: Some(timings) });
+                    sink.finish(Finish { reason, cached_prompt_tokens: cached, timings: Some(timings), events: Default::default() });
                     continue;
                 }
                 Ok(Err(e)) => format!("xe engine: {e:#}"),
@@ -1291,7 +1291,7 @@ impl Worker {
         let sink = run.sink;
         if !run.started {
             // ended before its prompt was processed (cancelled, or nothing to generate): nothing new is in the caches
-            sink.finish(Finish { reason, cached_prompt_tokens: 0, timings: None });
+            sink.finish(Finish { reason, cached_prompt_tokens: 0, timings: None, events: Default::default() });
             return Ok(());
         }
         let r = (|| -> Result<()> {
@@ -1313,7 +1313,7 @@ impl Worker {
             draft: Some((s.drafted, s.accepted)) };
         match r {
             Ok(()) => {
-                sink.finish(Finish { reason, cached_prompt_tokens: run.c0, timings: Some(timings) });
+                sink.finish(Finish { reason, cached_prompt_tokens: run.c0, timings: Some(timings), events: Default::default() });
                 Ok(())
             }
             Err(e) => {

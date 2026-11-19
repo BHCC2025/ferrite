@@ -196,7 +196,7 @@ pub(crate) fn alloc_lanes(c: &Config, ch: &Config, ctx: usize, layers: &[Layer],
         out.push(Some(LaneState {
             layers: ls, ple_hist, layers0: ls0, ple_hist0, mtp: m, hsave: DeviceBuffer::zeroed(hsave_len)?, tokens: vec![], snaps: vec![],
             ctx_mapped: 8192.min(ctx), draft_p: 1.0, acc_ema: 0.9,
-            graphs: (0..3 * MAX_ROWS + 1).map(|_| None).collect(), graphs0: (0..3 * MAX_ROWS + 1).map(|_| None).collect(),
+            graphs: (0..2 * N_GRAPHS).map(|_| None).collect(), graphs0: (0..2 * N_GRAPHS).map(|_| None).collect(),
             mtp_graphs: (0..=MAX_ROWS).map(|_| None).collect(),
         }));
     }
@@ -300,6 +300,9 @@ impl Fast {
     /// Capture (once per lane set and device) and run the batched step graph(s) of `self.plan`, wait for the result.
     /// Layer split: device 0's segment first, device 1's waits for it on the cross-device event (as run_step).
     fn launch_lanes(&mut self, key: &[usize], n: usize, verify: bool) -> Result<()> {
+        // the logits host copy is part of the captured graph: part of the key (see G_LOGITS)
+        let key: Vec<usize> = key.iter().copied().chain([self.logits_in_graph(n, verify, true) as usize]).collect();
+        let key = &key[..];
         self.bound_lane_graphs()?;
         // every graph is captured before anything launches (instantiation can wait for the device)
         self.each_dev(|m| {
@@ -322,9 +325,13 @@ impl Fast {
             self.done_ev.sync()?;
             self.other.as_ref().unwrap().done_ev.sync()?;
             // every row's greedy token over both vocabulary halves
+            self.bad_rows = 0;
             for r in 0..n.min(MAX_ROWS) {
                 let (t, _) = self.tp_pick(r);
                 self.tok_h.as_mut_slice()[r] = t;
+                if !self.tp_row_finite(r) {
+                    self.bad_rows |= 1 << r;
+                }
             }
             return Ok(());
         }
@@ -743,21 +750,32 @@ impl Fast {
             if self.has_mtp() {
                 jobs.extend((1..=rr_max).map(|r| (K_VERIFY, r)));
             }
+            let want = self.want_logits;
             for (kind, rr) in jobs {
-                self.plan = set.iter().enumerate().map(|(i, &ln)| (ln, i * rr, rr)).collect();
-                let key: Vec<usize> = [kind, rr].into_iter().chain(set.iter().copied()).collect();
                 let rows = n * rr;
                 let verify = kind == K_VERIFY;
-                let r = self.each_dev(|m| {
-                    if !m.lane_graphs.contains_key(&key) {
-                        let g = m.capture(|m| unsafe { m.enqueue(rows, verify) })?;
-                        m.lane_graphs.insert(key.clone(), g);
-                        made += 1;
+                // plain steps: the greedy graph and the one that copies logits (sampled lanes); verifies are greedy only
+                // (spec_lanes), keys as launch_lanes builds them
+                for lg in [false, true] {
+                    if lg && verify {
+                        continue;
                     }
-                    Ok(())
-                });
-                self.plan.clear();
-                r?;
+                    self.want_logits = lg;
+                    self.plan = set.iter().enumerate().map(|(i, &ln)| (ln, i * rr, rr)).collect();
+                    let key: Vec<usize> = [kind, rr].into_iter().chain(set.iter().copied())
+                        .chain([self.logits_in_graph(rows, verify, true) as usize]).collect();
+                    let r = self.each_dev(|m| {
+                        if !m.lane_graphs.contains_key(&key) {
+                            let g = m.capture(|m| unsafe { m.enqueue(rows, verify) })?;
+                            m.lane_graphs.insert(key.clone(), g);
+                            made += 1;
+                        }
+                        Ok(())
+                    });
+                    self.plan.clear();
+                    self.want_logits = want;
+                    r?;
+                }
             }
             if self.has_mtp() {
                 for k in 1..=rr_max {
@@ -972,6 +990,15 @@ impl Fast {
     /// One speculative step for several greedy lanes with the MTP block: `items` = (lane, its Spec). Returns each
     /// lane's new tokens (kept drafts, then the trunk's next token). One lane: `spec_step`.
     pub fn spec_lanes(&mut self, items: &mut [(usize, &mut Spec)], n_draft: usize) -> Result<Vec<Vec<u32>>> {
+        self.spec_lanes_ctl(items, n_draft, &[], &mut |_, _, _| {})
+    }
+
+    /// [`Fast::spec_lanes`] under the caller's control, as [`Fast::spec_step_ctl`]: `force[i]` (missing = None) is a
+    /// token the engine writes itself as item i's next one (that lane verifies its last token alone in this step),
+    /// `keep(i, tokens, finite)` may shorten what item i is about to produce (to one token at least); what it cuts is
+    /// given back (the lane keeps fewer verify rows).
+    pub fn spec_lanes_ctl(&mut self, items: &mut [(usize, &mut Spec)], n_draft: usize, force: &[Option<u32>],
+        keep: &mut dyn FnMut(usize, &mut Vec<u32>, bool)) -> Result<Vec<Vec<u32>>> {
         let n = items.len();
         if n == 0 {
             return Ok(vec![]);
@@ -979,9 +1006,10 @@ impl Fast {
         if !self.has_mtp() {
             bail!("spec_lanes without the MTP block");
         }
+        let forced = |i: usize| force.get(i).copied().flatten();
         if n == 1 {
             self.select_lane(items[0].0)?;
-            return Ok(vec![self.spec_step(items[0].1, n_draft)?]);
+            return Ok(vec![self.spec_step_ctl(items[0].1, n_draft, forced(0), &mut |o, f| keep(0, o, f))?]);
         }
         if n > MAX_LANES.min(MAX_ROWS) {
             bail!("spec_lanes: {n} lanes");
@@ -998,7 +1026,7 @@ impl Fast {
         let mut conf: Vec<bool> = vec![false; n];
         for i in 0..n {
             let ln = lanes[i];
-            conf[i] = *self.lane_draft_p(ln) >= self.p_min;
+            conf[i] = forced(i).is_none() && *self.lane_draft_p(ln) >= self.p_min;
             if !conf[i] {
                 items[i].1.drafts.clear();
             }
@@ -1063,10 +1091,12 @@ impl Fast {
             return Err(e);
         }
         let pred: Vec<u32> = self.tok_h.as_slice()[..rows].to_vec();
+        let bad = self.bad_rows;
         self.step_no.fetch_add(1, Ordering::Relaxed);
         let t2 = std::time::Instant::now();
         // ---- commits: lane i keeps k_i + 1 rows ----
         let mut ks = vec![0usize; n];
+        let mut outs: Vec<Vec<u32>> = vec![];
         for i in 0..n {
             let sp = &items[i].1;
             let p = &pred[i * rr..(i + 1) * rr];
@@ -1081,6 +1111,20 @@ impl Fast {
                 let a = self.lane_acc(lanes[i]);
                 *a = 0.8 * *a + 0.2 * (k as f32 / sp.drafts.len() as f32);
             }
+            // what the lane is about to produce: the kept drafts, then the trunk's next token (or the forced one)
+            let sp = &items[i].1;
+            let mut out: Vec<u32> = sp.drafts[..k].to_vec();
+            out.push(forced(i).unwrap_or(p[k]));
+            let finite = (bad >> (i * rr)) & ((1u32 << (k + 1)) - 1) == 0;
+            let full = out.len();
+            keep(i, &mut out, finite);
+            if out.is_empty() || out.len() > full {
+                self.want_logits = want;
+                bail!("spec_lanes: keep left {} of {full} tokens", out.len());
+            }
+            // tokens given back: the lane keeps fewer rows
+            ks[i] = out.len() - 1;
+            outs.push(out);
         }
         self.bound_lane_graphs()?;
         let two = self.other.is_some();
@@ -1110,14 +1154,11 @@ impl Fast {
         // ---- MTP catch-up over the kept positions, K rows per lane (padded) ----
         let kk = ks.iter().max().unwrap() + 1;
         let hin = self.mtp.as_ref().unwrap().hin.ptr();
-        let mut outs: Vec<Vec<u32>> = vec![];
         let mut segs = vec![];
         for i in 0..n {
             let k = ks[i];
-            let next = pred[i * rr + k];
-            let mut out: Vec<u32> = items[i].1.drafts[..k].to_vec();
-            out.push(next);
-            outs.push(out.clone());
+            let next = outs[i][k];
+            let mut out: Vec<u32> = outs[i].clone();
             out.resize(kk, next);
             self.s.memcpy_dtod(hin.add::<f32>(i * kk * hd), hb.add::<f32>(i * rr * hd), kk * hd * 4)?;
             let pos0 = self.lane_tokens(lanes[i]).len() - k;

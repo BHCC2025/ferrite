@@ -58,6 +58,12 @@ const P_WORDS: usize = P_PSN + 8 * 32;
 pub const MAX_ROWS: usize = 24;
 /// Lanes a batched step can hold (one step-parameter block each).
 pub const MAX_LANES: usize = 8;
+/// Step graphs of one kind set (per lane and device): plain rows 1..=MAX_ROWS, verify rows, commits.
+pub(crate) const N_GRAPHS: usize = 3 * MAX_ROWS + 1;
+/// Index offset of the step graphs captured WITH the logits host copy. The copy is baked into a graph when it is
+/// captured, so `want_logits` is part of every step-graph key: a graph captured for a greedy request must never serve
+/// a sampled one (it would read the previous request's logits), nor the other way round (a wasted copy).
+pub(crate) const G_LOGITS: usize = N_GRAPHS;
 
 /// A weight kept in its GGUF quant type on the card.
 pub struct QW {
@@ -503,6 +509,9 @@ pub struct Fast {
     done_ev: Event,
     /// copy the last row's logits to the host each step (sampling); greedy only needs the token
     pub want_logits: bool,
+    /// rows of the last trunk step whose greedy pick came from a row with a non-finite maximum or probability (bit r =
+    /// logit row r). Only FNEXT_TP=2 brings those two numbers to the host; without it the mask stays 0.
+    pub bad_rows: u32,
     /// the running request's cancel flag (set by the server when its client goes away): a prompt stops between
     /// groups and between a group's layers with [`Cancelled`]; the lane's state is then incomplete (restore a
     /// snapshot or reset it)
@@ -1102,7 +1111,7 @@ impl Fast {
         // the last device's set is active between calls; device 0's is parked in `other` (swap_dev)
         let other = if ngpu == 2 {
             let (kn, fk, q, s, s2, done_ev) = kits.remove(0);
-            Some(Box::new(DevSet { kn, fk, q, s, s2, w: works.remove(0), graphs: (0..3 * MAX_ROWS + 1).map(|_| None).collect(),
+            Some(Box::new(DevSet { kn, fk, q, s, s2, w: works.remove(0), graphs: (0..2 * N_GRAPHS).map(|_| None).collect(),
                 lane_graphs: Default::default(), dynp: dyns.remove(0), arena: arenas.remove(0), done_ev, pw: None, pw_need: Default::default(), lo: 0, hi: split,
                 layers: std::mem::take(&mut layers0), c: ch.clone(), tabs_h: std::mem::take(&mut tabs_h0), ev_fork: std::mem::take(&mut ev_fork0),
                 ev_join: std::mem::take(&mut ev_join0), tp_rank: 0, head_tp: head0.take(), mtp_head_g: (0..=MAX_ROWS).map(|_| None).collect(), cu: cus[0].clone() }))
@@ -1113,7 +1122,7 @@ impl Fast {
         let (w, dynp, arena, cu) = (works.remove(0), dyns.remove(0), arenas.remove(0), cus[last].clone());
         let (lo, hi) = range(last);
         let mut fast = Fast {
-            c: c.clone(), g: g.clone(), kn, fk, q, s, layers, head, output, w, ctx, tokens: vec![], graphs: (0..3 * MAX_ROWS + 1).map(|_| None).collect(),
+            c: c.clone(), g: g.clone(), kn, fk, q, s, layers, head, output, w, ctx, tokens: vec![], graphs: (0..2 * N_GRAPHS).map(|_| None).collect(),
             prm_h: HostBuffer::alloc(MAX_LANES * P_WORDS)?, emb_h: HostBuffer::alloc(r * c.n_embd)?, ple_h: HostBuffer::alloc(r * c.n_embd)?,
             tok_h: HostBuffer::alloc(r)?, logit_h: HostBuffer::alloc(MAX_LANES * c.n_vocab)?, pmx_h: HostBuffer::alloc(r)?, sh: sh.clone(),
             resident: Arc::new(resident.into_iter().map(|l| l.into_iter().map(AtomicU8::new).collect()).collect()),
@@ -1121,7 +1130,7 @@ impl Fast {
             missed: Arc::new(std::sync::Mutex::new(vec![])), step_no: Arc::new(AtomicU64::new(1)), dynp, cu,
             tabs_h, _arena: arena, expert_bytes_on_card: on_card, n_resident: n_res, cpu: None,
             stop: Arc::new(AtomicBool::new(false)), cur_rows: Arc::new(AtomicU32::new(1)), counts: counts_a,
-            stats: Arc::new(std::sync::Mutex::new(Stats::default())), done_ev, want_logits: true, cancel: None, uploads: 0, mtp, pw: None, pcfg, hm: hostmem::HostMem::new(&g), ctx_mapped: 8192.min(ctx), s2,
+            stats: Arc::new(std::sync::Mutex::new(Stats::default())), done_ev, want_logits: true, bad_rows: 0, cancel: None, uploads: 0, mtp, pw: None, pcfg, hm: hostmem::HostMem::new(&g), ctx_mapped: 8192.min(ctx), s2,
             ev_fork, ev_join, mtp_graphs: (0..=MAX_ROWS).map(|_| None).collect(),
             spec_stats: (0, 0), draft_p: 1.0, acc_ema: 0.9, spec_ms: [0.0; 5], mtp_ms: [0.0; 3], mtp_counts: vec![], ple_idx: vec![], snaps: vec![], lanes, cur_lane: 0, plan: vec![], lane_graphs: Default::default(), ctx_cap: ctx, pcpu: None, ycpu: None, ple_flag: HostBuffer::alloc(1)?, pw_need: Default::default(),
             p_min: std::env::var("FNEXT_PMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7), dump: vec![],
@@ -1843,7 +1852,7 @@ impl Fast {
         }
         let t1 = std::time::Instant::now();
         self.cur_rows.store(rows as u32, Ordering::Relaxed);
-        let gi = rows + if verify { MAX_ROWS } else { 0 };
+        let gi = self.step_graph_index(rows, verify);
         if self.tp {
             // a fresh epoch: the all-reduce tags of this step differ from every earlier one
             self.epoch = self.epoch.wrapping_add(1);
@@ -1930,9 +1939,13 @@ impl Fast {
             self.other.as_ref().unwrap().done_ev.sync()?;
             // the greedy token of each row: the larger of the two halves' best logits (card 0 on ties)
             let nl = if verify { rows } else { 1 };
+            self.bad_rows = 0;
             for r in 0..nl {
                 let (t, _) = self.tp_pick(r);
                 self.tok_h.as_mut_slice()[r] = t;
+                if !self.tp_row_finite(r) {
+                    self.bad_rows |= 1 << r;
+                }
             }
         }
         self.tokens.extend_from_slice(toks);
@@ -1956,6 +1969,19 @@ impl Fast {
         st.steps += 1;
         st.rows += rows as u64;
         Ok(())
+    }
+
+    /// Does a step graph over `rows` rows copy logits to the host? (`multi`: a batched step over several lanes.) One
+    /// logit row per lane, or the last row of a single-lane step; passes with more logit rows than MAX_LANES never copy.
+    /// Must stay the condition `enqueue` uses for its copies (`want_logits && nl <= MAX_LANES`).
+    pub(crate) fn logits_in_graph(&self, rows: usize, verify: bool, multi: bool) -> bool {
+        let nl = if verify || multi { rows } else { 1 };
+        self.want_logits && nl <= MAX_LANES
+    }
+
+    /// Slot of the single-lane step graph for `rows` rows in `graphs`.
+    fn step_graph_index(&self, rows: usize, verify: bool) -> usize {
+        rows + if verify { MAX_ROWS } else { 0 } + if self.logits_in_graph(rows, verify, false) { G_LOGITS } else { 0 }
     }
 
     /// Logits of the last row of the last step (when `want_logits`).
@@ -3156,6 +3182,26 @@ impl Fast {
         (if mb > ma { b[0] } else { a[0] }, 1.0 / tot)
     }
 
+    /// FNEXT_TP=2: are row r's best logit and its probability finite on both vocabulary halves? (A NaN anywhere in a
+    /// half makes that half's probability a NaN; an infinity shows in its maximum.)
+    fn tp_row_finite(&self, r: usize) -> bool {
+        let tv = self.tv_h.as_slice();
+        [&tv[3 * r..3 * r + 3], &tv[MAX_ROWS * 3 + 3 * r..MAX_ROWS * 3 + 3 * r + 3]].iter()
+            .all(|h| f32::from_bits(h[1]).is_finite() && f32::from_bits(h[2]).is_finite())
+    }
+
+    /// A new draft for `tok` as the next token of the current lane (the token at position tokens.len(), not yet run
+    /// through the trunk), replacing the draft the MTP block made for another token there: the block's row of that
+    /// position is run again with `tok` and the trunk residual of the position before it. For a first token the
+    /// server replaced, and for a lane that returns to drafting after steps through [`Fast::prefill_mtp`].
+    pub fn mtp_draft_for(&mut self, tok: u32) -> Result<u32> {
+        let hd = self.c.hc_dim();
+        let pos = self.tokens.len();
+        let m = self.mtp.as_ref().ok_or_else(|| anyhow!("mtp_draft_for without the MTP block"))?;
+        self.s.memcpy_dtod(m.hin.ptr(), m.hprev.ptr(), hd * 4)?;
+        self.mtp_run(&[tok], pos)
+    }
+
     /// One MTP pass: tokens at positions pos0.. with h rows already in mtp.hin; returns the draft after the last row.
     fn mtp_run(&mut self, toks: &[u32], pos0: usize) -> Result<u32> {
         if self.tp {
@@ -3314,6 +3360,16 @@ impl Fast {
     /// One speculative step: draft more (chained MTP while confident), verify, commit, catch the MTP block up.
     /// Returns the tokens it produced (the kept drafts, then the trunk's next token); `sp` moves on.
     pub fn spec_step(&mut self, sp: &mut Spec, n_draft: usize) -> Result<Vec<u32>> {
+        self.spec_step_ctl(sp, n_draft, None, &mut |_, _| {})
+    }
+
+    /// [`Fast::spec_step`] under the caller's control. `force`: the engine writes this token itself as the next one
+    /// (the step then verifies the last token alone and drops the model's choice; the MTP block absorbs the forced
+    /// token like any kept row, so the next step drafts again). `keep` sees the tokens the step is about to produce
+    /// (and whether the logit rows behind them were finite) and may shorten them, to one at least: the tokens it cuts
+    /// are given back, the verify keeps fewer rows and the step ends as if the drafts after them had missed.
+    pub fn spec_step_ctl(&mut self, sp: &mut Spec, n_draft: usize, force: Option<u32>,
+        keep: &mut dyn FnMut(&mut Vec<u32>, bool)) -> Result<Vec<u32>> {
         let hd = self.c.hc_dim();
         let t0 = std::time::Instant::now();
         // adaptive length: drafts while the recent acceptance rate keeps them likely to pay (FNEXT_ADAPT=0 off)
@@ -3324,7 +3380,7 @@ impl Fast {
         } else {
             n_draft
         };
-        let mut confident = self.draft_p >= self.p_min;
+        let mut confident = force.is_none() && self.draft_p >= self.p_min;
         if !confident {
             sp.drafts.clear();
         }
@@ -3359,11 +3415,19 @@ impl Fast {
         if !sp.drafts.is_empty() {
             self.acc_ema = 0.8 * self.acc_ema + 0.2 * (k as f32 / sp.drafts.len() as f32);
         }
+        let mut out: Vec<u32> = sp.drafts[..k].to_vec();
+        out.push(force.unwrap_or(pred[k]));
+        let finite = self.bad_rows & ((1u32 << (k + 1)) - 1) == 0;
+        let full = out.len();
+        keep(&mut out, finite);
+        if out.is_empty() || out.len() > full {
+            bail!("spec_step: keep left {} of {full} tokens", out.len());
+        }
+        // tokens given back: the verify keeps fewer rows (out[k] is then the accepted draft of that row)
+        let k = out.len() - 1;
         self.commit(&rows, k + 1)?;
         let t3 = std::time::Instant::now();
-        let next = pred[k];
-        let mut out: Vec<u32> = sp.drafts[..k].to_vec();
-        out.push(next);
+        let next = out[k];
         // MTP catch-up over the kept positions: tokens [d1..dk, next], h = trunk rows 0..k of the verify
         let pos0 = self.tokens.len() - k;
         let m = self.mtp.as_ref().unwrap();

@@ -1,0 +1,111 @@
+{
+ "description": "Short coding prompts the way a coding harness sends them: a system prompt is always present; tool_prompts are sent with the tools offered.",
+ "system": "You are an expert coding assistant operating inside a coding harness. Answer concisely and show code in fenced blocks. When tools are available, use them to read, write and edit files and to run commands instead of guessing.",
+ "prompts": [
+  "Write a Python function that reverses a string.",
+  "Fix the off-by-one in this loop:\n```python\nfor i in range(1, len(items)):\n    print(items[i])\n```\nIt should print every item.",
+  "What does this regex match: ^\\d{3}-\\d{4}$",
+  "Add a docstring to this function:\n```python\ndef clamp(x, lo, hi):\n    return max(lo, min(x, hi))\n```",
+  "Give me a one-line shell command that counts the lines in every .py file under the current directory.",
+  "How do I undo the last git commit but keep the changes staged? One line.",
+  "Give me a unified diff that renames the variable tmp to total in:\n```python\ndef add(xs):\n    tmp = 0\n    for x in xs:\n        tmp += x\n    return tmp\n```",
+  "Write a Rust function that returns the sum of a slice of i32.",
+  "Explain in two sentences what this does:\n```bash\nfind . -name '*.log' -mtime +7 -delete\n```",
+  "Convert this to a list comprehension:\n```python\nout = []\nfor x in xs:\n    if x % 2 == 0:\n        out.append(x * x)\n```",
+  "Write a SQL query that returns the 5 most recent rows from the table orders by created_at.",
+  "What is the time complexity of binary search, and why? Two sentences."
+ ],
+ "tool_prompts": [
+  "Create hello.py that prints hello world.",
+  "Run the test suite with pytest and tell me whether it passes.",
+  "Read README.md and tell me what the project does.",
+  "In utils.py rename the function foo to bar."
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "read",
+    "description": "Read a file from disk.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "File path"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "write",
+    "description": "Write a file to disk, replacing it.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "content": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "path",
+      "content"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "edit",
+    "description": "Replace one exact occurrence of old_text with new_text in a file.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "old_text": {
+       "type": "string"
+      },
+      "new_text": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "path",
+      "old_text",
+      "new_text"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "bash",
+    "description": "Run a shell command and return its output.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "command": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "command"
+     ]
+    }
+   }
+  }
+ ]
+}

@@ -10,6 +10,8 @@ pub mod engine;
 pub mod fnext;
 #[cfg(feature = "ferrite")]
 pub mod ferrite;
+pub mod guard;
+pub mod loopdet;
 pub mod mock;
 pub mod parser;
 pub mod pyjson;

@@ -150,6 +150,11 @@ pub fn extract_types_from_schema(schema: &Json) -> Vec<String> {
     if types.is_empty() { vec!["string".into()] } else { types }
 }
 
+/// True when a value of these schema types is always passed as the string it was written as (so it can be streamed).
+pub fn is_string_only(types: &[String]) -> bool {
+    !types.is_empty() && types.iter().all(|t| normalize_type(t) == "string")
+}
+
 fn normalize_type(t: &str) -> String {
     let t = t.trim().to_lowercase();
     match t.as_str() {

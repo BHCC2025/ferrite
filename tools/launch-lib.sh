@@ -28,6 +28,18 @@ fl_int() {
   [ "$2" -ge "$3" ] && [ "$2" -le "$4" ] || fl_die "$1 must be from $3 to $4, not $2"
 }
 
+# fl_sampling DIR NAME: fe-server reads DIR/sampling.json (the per-mode sampling defaults and the protections of
+# docs/harness.md). A model folder without one (fetched before the file existed) gets the copy this tree ships for
+# the model, crates/fe-server/sampling.NAME.json, through FE_SAMPLING_JSON. A file in the folder, or FE_SAMPLING_JSON
+# set by the user, wins.
+fl_sampling() {
+  [ -z "${FE_SAMPLING_JSON:-}" ] || return 0
+  [ ! -f "$1/sampling.json" ] || return 0
+  local f="${root:-.}/crates/fe-server/sampling.$2.json"
+  if [ -f "$f" ]; then export FE_SAMPLING_JSON="$f"; fi
+  return 0
+}
+
 # fl_net: FERRITE_HOST / FERRITE_PORT defaults and checks; then the port must be free
 fl_net() {
   export FERRITE_HOST=${FERRITE_HOST:-0.0.0.0}

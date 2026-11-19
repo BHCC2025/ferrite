@@ -1,8 +1,8 @@
 //! The axum app: routes, request preparation, the token → text → deltas pipeline, SSE / JSON output,
 //! concurrency slots and cancellation.
 use std::convert::Infallible;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -19,7 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::{ApiError, ChatRequest, CompletionRequest, SamplingRequest, parse_body, wants_logprobs};
 use crate::engine::{CancelToken, Engine, FinishReason, GenEvent, GenRequest, SamplingParams, Timings, TokenSink};
-use crate::parser::{Delta, OutputParser, ParserConfig, Parsed};
+use crate::parser::{Delta, ForcedCall, OutputParser, ParserConfig, Parsed};
 use crate::stop::StopMatcher;
 use crate::template::{ChatTemplate, normalize_messages};
 use crate::tokenizer::{IncrementalDecoder, Tok};
@@ -35,6 +35,135 @@ pub struct GenDefaults {
     pub min_p: f32,
     pub repetition_penalty: f32,
     pub eos_ids: Vec<u32>,
+    pub phase: PhaseDefaults,
+}
+
+/// Reasoning tokens after which the engine closes the block itself when neither sampling.json nor FE_MAX_REASONING_TOKENS says otherwise.
+pub const DEFAULT_MAX_REASONING: usize = 8192;
+
+/// Thinking-phase behaviour from `sampling.json` in the model dir (env FE_THINK_TEMP / FE_THINK_TOP_P / FE_MAX_REASONING_TOKENS /
+/// FE_LOOP_BREAKER / FE_LOOP_RULES override): the reasoning block is sampled at these settings when the client asks for greedy (or says nothing and the
+/// model default is greedy); the answer / tool-call phase keeps the client's values.
+/// One mode's sampling profile (`profiles.thinking` / `profiles.non_thinking` in sampling.json): the values a request of that mode gets
+/// for the fields its client does not send. A field the profile leaves out falls back to generation_config.json (penalties: off).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Profile {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+}
+
+impl Profile {
+    pub fn from_json(v: Option<&Json>) -> Self {
+        let f = |k: &str| v.and_then(|v| v.get(k)).and_then(Json::as_f64).map(|x| x as f32);
+        Self {
+            temperature: f("temperature"),
+            top_p: f("top_p"),
+            top_k: v.and_then(|v| v.get("top_k")).and_then(Json::as_u64).map(|x| x as usize),
+            min_p: f("min_p"),
+            presence_penalty: f("presence_penalty"),
+            frequency_penalty: f("frequency_penalty"),
+            repetition_penalty: f("repetition_penalty"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PhaseDefaults {
+    /// per-mode sampling profiles: a request that thinks / one that does not. A field the client sends always wins.
+    pub profile_thinking: Profile,
+    pub profile_plain: Profile,
+    /// `greedy_floor` in sampling.json (env FE_GREEDY_FLOOR=1/0 overrides; default off): a client temperature of 0 is replaced by the
+    /// thinking profile's temperature inside the reasoning block only (the answer / tool call stays greedy)
+    pub greedy_floor: bool,
+    /// `greedy_keeps_fast_path` in sampling.json (env FE_GREEDY_FAST_PATH=1/0 overrides; default on): a client that sends
+    /// temperature 0 asks for greedy decoding, so the profile adds no penalty to it (presence / frequency / repetition penalty stay
+    /// at the model defaults unless the client sends them): the request keeps the device argmax and its copy rows. Off: the
+    /// profile fills every field the client omits, penalties included. A client that omits temperature gets the whole profile
+    /// either way.
+    pub greedy_keeps_fast_path: bool,
+    /// watchdog (`watchdog.no_token_timeout_s`, default 60, env FE_NO_TOKEN_TIMEOUT; `watchdog.reply_wall_limit_s`, default 0 = off,
+    /// env FE_REPLY_WALL_LIMIT), seconds; 0 = off
+    pub no_token_timeout: f64,
+    pub reply_wall_limit: f64,
+    pub max_reasoning: usize,
+    pub loop_breaker: bool,
+    /// loop-breaker thresholds: `loop_rules` in sampling.json, env FE_LOOP_RULES (the same JSON object) overrides it
+    pub loop_rules: crate::loopdet::LoopCfg,
+    pub think_end: Option<u32>,
+    pub call_marks: Vec<Vec<u32>>,
+}
+
+impl PhaseDefaults {
+    pub fn from_dir(dir: &Path, tok: &Tok) -> Self {
+        // sampling.json of the model dir; FE_SAMPLING_JSON=<file> reads another one instead (A/B runs of profiles and thresholds)
+        let path = std::env::var_os("FE_SAMPLING_JSON").filter(|p| !p.is_empty()).map_or_else(|| dir.join("sampling.json"), PathBuf::from);
+        let cfg: Json = match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+                tracing::warn!("{}: not valid JSON ({e}): ignored, built-in defaults apply", path.display());
+                Json::Null
+            }),
+            Err(_) => Json::Null,
+        };
+        let envf = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
+        // profiles.thinking / profiles.non_thinking; the older top-level `thinking` object (temperature, top_p) and FE_THINK_TEMP /
+        // FE_THINK_TOP_P still fill the thinking profile
+        let profiles = cfg.get("profiles");
+        let mut profile_thinking = Profile::from_json(profiles.and_then(|p| p.get("thinking")).or(cfg.get("thinking")));
+        if let Some(t) = envf("FE_THINK_TEMP") {
+            profile_thinking.temperature = Some(t as f32);
+        }
+        if let Some(t) = envf("FE_THINK_TOP_P") {
+            profile_thinking.top_p = Some(t as f32);
+        }
+        let profile_plain = Profile::from_json(profiles.and_then(|p| p.get("non_thinking")));
+        let greedy_floor = match std::env::var("FE_GREEDY_FLOOR").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => cfg.get("greedy_floor").and_then(Json::as_bool).unwrap_or(false),
+        };
+        let greedy_keeps_fast_path = match std::env::var("FE_GREEDY_FAST_PATH").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => cfg.get("greedy_keeps_fast_path").and_then(Json::as_bool).unwrap_or(true),
+        };
+        let wd = cfg.get("watchdog");
+        let wdf = |k: &str| wd.and_then(|w| w.get(k)).and_then(Json::as_f64);
+        let no_token_timeout = envf("FE_NO_TOKEN_TIMEOUT").or(wdf("no_token_timeout_s")).unwrap_or(60.0).max(0.0);
+        let reply_wall_limit = envf("FE_REPLY_WALL_LIMIT").or(wdf("reply_wall_limit_s")).unwrap_or(0.0).max(0.0);
+        // default 8192; 0 = no cap
+        let max_reasoning = envf("FE_MAX_REASONING_TOKENS").or(cfg.get("max_reasoning_tokens").and_then(Json::as_f64)).unwrap_or(DEFAULT_MAX_REASONING as f64) as usize;
+        let loop_breaker = match std::env::var("FE_LOOP_BREAKER").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => cfg.get("loop_breaker").and_then(Json::as_bool).unwrap_or(false),
+        };
+        let env_rules: Option<Json> = std::env::var("FE_LOOP_RULES").ok().and_then(|s| match serde_json::from_str(&s) {
+            Ok(j) => Some(j),
+            Err(e) => {
+                tracing::warn!("FE_LOOP_RULES is not valid JSON ({e}): ignored");
+                None
+            }
+        });
+        let loop_rules = crate::loopdet::LoopCfg::from_json(env_rules.as_ref().or(cfg.get("loop_rules")));
+        // the token that ends the reasoning block (`think_end` in sampling.json, default `</think>`); None when the vocabulary has no such token
+        let think_end = tok.token_id(cfg.get("think_end").and_then(Json::as_str).unwrap_or("</think>"));
+        let mut call_marks = Vec::new();
+        if let Some(arr) = cfg.get("call_marks").and_then(Json::as_array) {
+            for m in arr.iter().filter_map(Json::as_str) {
+                if let Ok(ids) = tok.encode(m) {
+                    if !ids.is_empty() {
+                        call_marks.push(ids);
+                    }
+                }
+            }
+        }
+        Self { profile_thinking, profile_plain, greedy_floor, greedy_keeps_fast_path, no_token_timeout, reply_wall_limit, max_reasoning, loop_breaker, loop_rules, think_end, call_marks }
+    }
 }
 
 impl GenDefaults {
@@ -69,6 +198,7 @@ impl GenDefaults {
             min_p: f("min_p", 0.0),
             repetition_penalty: f("repetition_penalty", 1.0),
             eos_ids,
+            phase: PhaseDefaults::from_dir(dir, tok),
         }
     }
 }
@@ -97,9 +227,33 @@ pub struct AppState {
     queued: Arc<AtomicUsize>,
     running: Arc<AtomicUsize>,
     created: u64,
+    /// Request capture (env FE_DUMP_REQUESTS=<dir>, off when unset): every chat-completions body as received in `<id>.json`, and
+    /// `<id>.meta.json` when the request completes. Set once at start (tests set it directly).
+    pub dump_dir: OnceLock<PathBuf>,
+}
+
+/// Write `<dir>/<name>` (a capture file); failures are logged, never returned (capture must not break a request).
+fn capture_write(dir: &Path, name: &str, bytes: &[u8]) {
+    if let Err(e) = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(dir.join(name), bytes)) {
+        tracing::warn!("request capture: cannot write {}: {e}", dir.join(name).display());
+    }
 }
 
 impl AppState {
+    /// The body of a chat-completions request exactly as received (replayable with tools/conformance/run.py --replay).
+    fn capture_body(&self, id: &str, body: &[u8]) {
+        if let Some(dir) = self.dump_dir.get() {
+            capture_write(dir, &format!("{id}.json"), body);
+        }
+    }
+
+    /// The sidecar written when the request completes (or is rejected / cancelled).
+    fn capture_meta(&self, id: &str, meta: Json) {
+        if let Some(dir) = self.dump_dir.get() {
+            capture_write(dir, &format!("{id}.meta.json"), serde_json::to_string_pretty(&meta).unwrap_or_default().as_bytes());
+        }
+    }
+
     /// `cfg.max_concurrent` and `cfg.max_context` are capped at what the engine reports ([`Engine::info`]): the
     /// server never runs, and `/health` never claims, more requests at once or a longer request than the loaded
     /// engine handles.
@@ -107,7 +261,18 @@ impl AppState {
         let info = engine.info();
         cfg.max_concurrent = cfg.max_concurrent.clamp(1, info.max_batch.max(1));
         cfg.max_context = cfg.max_context.min(info.max_context);
+        {
+            // the loop breaker's log line shows the cycle as text
+            let t = tok.clone();
+            crate::loopdet::set_detok(Box::new(move |ids| t.decode(ids, false).unwrap_or_default()));
+        }
+        let dump_dir = OnceLock::new();
+        if let Some(d) = std::env::var_os("FE_DUMP_REQUESTS").filter(|d| !d.is_empty()) {
+            tracing::info!("request capture on: chat-completions bodies and .meta.json sidecars go to {}", Path::new(&d).display());
+            let _ = dump_dir.set(PathBuf::from(d));
+        }
         Arc::new(Self {
+            dump_dir,
             slots: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
             marks: crate::snapshots::Marks::new(&tok)
                 .unwrap_or_else(|_| crate::snapshots::Marks::from_ids(Vec::new(), Vec::new(), Vec::new())),
@@ -220,6 +385,14 @@ struct Prepared {
     include_usage: bool,
     /// Completions `echo`: the prompt text to put in front of the output.
     echo: Option<String>,
+    /// the sampling this request runs with and where each value came from (client / profile / default): logged, and sent in the
+    /// `x-sampling-effective` response header
+    effective: Json,
+}
+
+/// An f32 setting as JSON without the float32 tail (0.95, not 0.949999988079071).
+fn jf(x: f32) -> Json {
+    json!((x as f64 * 1e6).round() / 1e6)
 }
 
 #[derive(Debug, PartialEq)]
@@ -287,7 +460,9 @@ fn resolve_sampling(
     r: &SamplingRequest,
     prompt_len: usize,
     default_max: Option<usize>,
-) -> Result<(SamplingParams, Vec<String>, bool, bool), ApiError> {
+    // chat requests: does the reply think (picks the sampling profile); None: no profile (raw completions)
+    thinking: Option<bool>,
+) -> Result<(SamplingParams, Vec<String>, bool, bool, Json), ApiError> {
     let ctx = s.cfg.max_context;
     // the engine may keep the context's last positions for its own rows: such a prompt is the client's to shorten
     let reserve = s.engine.prompt_reserve();
@@ -335,28 +510,62 @@ fn resolve_sampling(
             stop_ids.push(*id);
         }
     }
+    // every field: the client's value if it sent one, else the profile of the request's mode, else the model default
+    let none = Profile::default();
+    let prof = match thinking {
+        Some(true) => &d.phase.profile_thinking,
+        Some(false) => &d.phase.profile_plain,
+        None => &none,
+    };
+    let mut from = Map::new();
+    // greedy_keeps_fast_path: the client sent temperature 0 itself (greedy, as below). The profile's penalties are then not
+    // added: a penalty the client does not send stays at the model default, and the header names why ("greedy_fast_path").
+    // top_p / top_k / min_p still come from the profile: no engine reads them at temperature 0 (Sampler::is_plain_greedy).
+    let keep_greedy = d.phase.greedy_keeps_fast_path && thinking.is_some() && r.temperature.is_some_and(|t| t < 1e-5);
+    let mut pick_from = |name: &str, client: Option<f64>, profile: Option<f32>, default: f32, withheld: bool| -> f32 {
+        let (v, src) = match (client, profile) {
+            (Some(c), _) => (c as f32, "client"),
+            (None, Some(_)) if withheld => (default, "greedy_fast_path"),
+            (None, Some(p)) => (p, "profile"),
+            (None, None) => (default, "default"),
+        };
+        from.insert(name.to_string(), json!(src));
+        v
+    };
+    let mut pick = |name: &str, client: Option<f64>, profile: Option<f32>, default: f32| pick_from(name, client, profile, default, false);
+    let temperature = match pick("temperature", r.temperature, prof.temperature, d.temperature) {
+        t if t < 1e-5 => 0.0, // greedy, as vLLM treats temperatures below 1e-5
+        t => t,
+    };
+    let top_p = pick("top_p", r.top_p, prof.top_p, d.top_p);
+    let top_k = pick("top_k", r.top_k.map(|k| k.max(0) as f64), prof.top_k.map(|k| k as f32), d.top_k as f32) as usize;
+    let min_p = pick("min_p", r.min_p, prof.min_p, d.min_p);
+    let presence_penalty = pick_from("presence_penalty", r.presence_penalty, prof.presence_penalty, 0.0, keep_greedy);
+    let frequency_penalty = pick_from("frequency_penalty", r.frequency_penalty, prof.frequency_penalty, 0.0, keep_greedy);
+    let repetition_penalty = pick_from("repetition_penalty", r.repetition_penalty, prof.repetition_penalty, d.repetition_penalty, keep_greedy);
     let params = SamplingParams {
         max_tokens,
         min_tokens: (r.min_tokens.unwrap_or(0) as usize).min(max_tokens),
-        temperature: match r.temperature.map(|t| t as f32).unwrap_or(d.temperature) {
-            t if t < 1e-5 => 0.0, // greedy, as vLLM treats temperatures below 1e-5
-            t => t,
-        },
-        top_p: r.top_p.map(|t| t as f32).unwrap_or(d.top_p),
-        top_k: match r.top_k {
-            Some(k) if k > 0 => k as usize,
-            Some(_) => 0,
-            None => d.top_k,
-        },
-        min_p: r.min_p.map(|t| t as f32).unwrap_or(d.min_p),
-        presence_penalty: r.presence_penalty.unwrap_or(0.0) as f32,
-        frequency_penalty: r.frequency_penalty.unwrap_or(0.0) as f32,
-        repetition_penalty: r.repetition_penalty.map(|t| t as f32).unwrap_or(d.repetition_penalty),
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        presence_penalty,
+        frequency_penalty,
+        repetition_penalty,
         seed: r.seed.map(|v| v as u64),
         stop_token_ids: stop_ids,
+        ..Default::default()
     };
+    let effective = json!({
+        "mode": match thinking { Some(true) => "thinking", Some(false) => "non_thinking", None => "none" },
+        "temperature": jf(temperature), "top_p": jf(top_p), "top_k": top_k, "min_p": jf(min_p),
+        "presence_penalty": jf(presence_penalty), "frequency_penalty": jf(frequency_penalty), "repetition_penalty": jf(repetition_penalty),
+        "from": from,
+        "greedy_keeps_fast_path": d.phase.greedy_keeps_fast_path,
+    });
     let stops = r.stop.clone().map(|s| s.into_vec()).unwrap_or_default();
-    Ok((params, stops, r.include_stop_str_in_output.unwrap_or(false), r.skip_special_tokens.unwrap_or(true)))
+    Ok((params, stops, r.include_stop_str_in_output.unwrap_or(false), r.skip_special_tokens.unwrap_or(true), effective))
 }
 
 fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
@@ -403,6 +612,24 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
     if let Some(on) = req.enable_thinking {
         kwargs.entry("enable_thinking").or_insert(Json::Bool(on));
     }
+    // tool_choice required / named: the reply IS the call. The generation prompt is prefilled with the call opener (below), which only
+    // works outside a reasoning block: such a reply does not think.
+    let continue_final = req.continue_final_message.unwrap_or(false);
+    let add_gen = req.add_generation_prompt.unwrap_or(true) && !continue_final;
+    let offered = ToolSet::from_openai(template_tools.as_deref().unwrap_or(&[]));
+    let mut forced: Option<ForcedCall> = match &choice {
+        _ if template_tools.is_none() || !add_gen || s.template.dsml => None,
+        ToolChoice::Required => {
+            // one function offered: that is the call; several: the name is the model's choice among them (constrained below)
+            let names: Vec<&str> = offered.names().collect();
+            if names.len() == 1 { Some(ForcedCall::Named(names[0].to_string())) } else { Some(ForcedCall::Any) }
+        }
+        ToolChoice::Named(n) => Some(ForcedCall::Named(n.clone())),
+        _ => None,
+    };
+    if forced.is_some() {
+        kwargs.insert("enable_thinking".into(), Json::Bool(false));
+    }
     if let Some(effort) = &req.reasoning_effort {
         match effort.to_lowercase().as_str() {
             "none" => {
@@ -419,8 +646,6 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
             _ => {}
         }
     }
-    let continue_final = req.continue_final_message.unwrap_or(false);
-    let add_gen = req.add_generation_prompt.unwrap_or(true) && !continue_final;
     let mut prompt = s
         .template
         .render(&messages, template_tools.as_deref(), add_gen, &kwargs)
@@ -432,16 +657,55 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
         }
     }
     let thinking = prompt_opens_thinking(&prompt);
+    if thinking {
+        // a template that opens a reasoning block regardless: the system hint is all there is
+        forced = None;
+    }
+    if let Some(f) = &forced {
+        prompt.push_str(&f.opener());
+    }
     if tracing::enabled!(tracing::Level::DEBUG) {
         let tail: String = prompt.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
         tracing::debug!("rendered prompt ({} chars, thinking {thinking}), tail: {tail:?}", prompt.len());
     }
     let prompt_ids = s.tok.encode(&prompt).map_err(|e| ApiError::internal(e.to_string()))?;
-    let (params, stops, include_stop, skip_special) = resolve_sampling(s, &req.sampling, prompt_ids.len(), None)?;
+    let (mut params, stops, include_stop, skip_special, mut effective) = resolve_sampling(s, &req.sampling, prompt_ids.len(), None, Some(thinking))?;
+    let ph = &s.cfg.defaults.phase;
+    // the loop breaker watches every chat reply (answer and tool-call rules); the reasoning rule and cap need the block's end token
+    params.loop_breaker = ph.loop_breaker;
+    params.loop_rules = ph.loop_rules.clone();
+    params.call_marks = ph.call_marks.clone();
+    params.call_open = forced.is_some();
+    if forced == Some(ForcedCall::Any) {
+        // the reply continues `<function=`: only an offered name may follow
+        params.prefix_choices = offered.names().filter_map(|n| s.tok.encode(&format!("{n}>\n")).ok()).filter(|c| !c.is_empty()).collect();
+    }
+    if thinking {
+        if let Some(te) = ph.think_end {
+            params.think_end = Some(te);
+            params.max_reasoning = ph.max_reasoning;
+            // greedy_floor: a greedy request (temperature 0) thinks at the thinking profile's temperature; its answer / tool call stays greedy
+            if ph.greedy_floor && params.temperature <= 0.0 {
+                if let Some(t) = ph.profile_thinking.temperature.filter(|&t| t > 0.0) {
+                    let mut r = params.clone();
+                    r.temperature = t;
+                    r.think_end = None;
+                    r.reasoning = None;
+                    params.reasoning = Some(Box::new(r));
+                    effective["reasoning_temperature"] = jf(t);
+                }
+            }
+            effective["max_reasoning_tokens"] = json!(ph.max_reasoning);
+        }
+    }
+    effective["greedy_floor"] = json!(ph.greedy_floor);
+    effective["loop_breaker"] = json!(ph.loop_breaker);
     let parser = ParserConfig {
         thinking,
         tools: template_tools.as_ref().map(|t| ToolSet::from_openai(t)),
         max_tool_calls: (req.parallel_tool_calls == Some(false)).then_some(1),
+        dsml: s.template.dsml,
+        forced,
     };
     let stream = req.stream.unwrap_or(false);
     Ok(Prepared {
@@ -458,6 +722,7 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
         stream,
         include_usage: stream && req.stream_options.and_then(|o| o.include_usage).unwrap_or(false),
         echo: None,
+        effective,
     })
 }
 
@@ -498,7 +763,7 @@ fn prepare_completion(s: &AppState, req: CompletionRequest) -> Result<Prepared, 
     if let Some(bad) = prompt_ids.iter().find(|&&t| t as usize >= vocab) {
         return Err(ApiError::bad_request(format!("token id {bad} is out of range")));
     }
-    let (params, stops, include_stop, skip_special) = resolve_sampling(s, &req.sampling, prompt_ids.len(), Some(16))?;
+    let (params, stops, include_stop, skip_special, effective) = resolve_sampling(s, &req.sampling, prompt_ids.len(), Some(16), None)?;
     let echo = if req.echo.unwrap_or(false) {
         Some(if text.is_empty() { s.tok.decode(&prompt_ids, skip_special).unwrap_or_default() } else { text })
     } else {
@@ -519,6 +784,7 @@ fn prepare_completion(s: &AppState, req: CompletionRequest) -> Result<Prepared, 
         stream,
         include_usage: stream && req.stream_options.and_then(|o| o.include_usage).unwrap_or(false),
         echo,
+        effective,
     })
 }
 
@@ -582,6 +848,11 @@ struct Pipeline {
     /// Set when the server ends the request itself (stop string or max_tokens).
     server_finish: Option<&'static str>,
     closed: bool,
+    /// tokens generated while inside the reasoning block / the cap on them (FE_MAX_REASONING_TOKENS, 0 = no cap)
+    reasoning_tokens: usize,
+    max_reasoning: usize,
+    /// the server-side reasoning backstop ended the request
+    capped: bool,
 }
 
 impl Pipeline {
@@ -594,6 +865,10 @@ impl Pipeline {
             completion_tokens: 0,
             server_finish: None,
             closed: false,
+            reasoning_tokens: 0,
+            capped: false,
+            // the engine closes the block itself at max_reasoning (graceful); this is the backstop for engines that do not
+            max_reasoning: if p.params.max_reasoning > 0 { p.params.max_reasoning * 2 + 1024 } else { std::env::var("FE_MAX_REASONING_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(16384) },
         }
     }
 
@@ -623,6 +898,15 @@ impl Pipeline {
             self.server_finish = Some("stop");
         }
         let mut deltas = self.parse(&emit);
+        if self.parser.as_ref().is_some_and(|p| p.in_reasoning()) {
+            self.reasoning_tokens += ids.len();
+            if self.max_reasoning > 0 && self.reasoning_tokens > self.max_reasoning && self.server_finish.is_none() {
+                // a reasoning runaway (a 48K-token reasoning block with no answer was seen): end the request as length instead of burning the whole budget
+                tracing::warn!("reasoning cap reached ({} tokens): ending the request as length", self.reasoning_tokens);
+                self.server_finish = Some("length");
+                self.capped = true;
+            }
+        }
         if self.server_finish.is_some() {
             deltas.extend(self.close(tok)?);
         }
@@ -655,6 +939,10 @@ impl Pipeline {
     fn tool_calls(&self) -> usize {
         self.parser.as_ref().map(|p| p.tool_calls()).unwrap_or(0)
     }
+
+    fn malformed(&self) -> bool {
+        self.parser.as_ref().is_some_and(|p| p.malformed())
+    }
 }
 
 struct Outcome {
@@ -681,6 +969,14 @@ struct Driver {
     t_start: Instant,
     t_first: Option<Instant>,
     finished: bool,
+    stream: bool,
+    /// what the engine's reasoning cap / loop breaker did (from its `Finish`)
+    events: crate::loopdet::PhaseEvents,
+    /// when the request went to the engine / when its latest tokens arrived (the watchdog's clocks)
+    t_engine: Instant,
+    t_last: Option<Instant>,
+    /// why the watchdog ended the request
+    watchdog: Option<&'static str>,
 }
 
 impl Drop for Driver {
@@ -691,6 +987,7 @@ impl Drop for Driver {
                 self.id,
                 self.pipe.completion_tokens
             );
+            self.capture(None, Some("client disconnected"), self.pipe.completion_tokens, 0);
         }
     }
 }
@@ -706,16 +1003,79 @@ impl Driver {
             t_start,
             t_first: None,
             finished: false,
+            stream: p.stream,
+            events: Default::default(),
+            t_engine: Instant::now(),
+            t_last: None,
+            watchdog: None,
         }
     }
 
+    /// The request-capture sidecar (`<id>.meta.json`); a no-op unless FE_DUMP_REQUESTS is set.
+    fn capture(&self, finish_reason: Option<&str>, error: Option<&str>, completion_tokens: usize, cached: usize) {
+        if self.state.dump_dir.get().is_none() {
+            return;
+        }
+        let ev = &self.events;
+        self.state.capture_meta(&self.id, json!({
+            "id": self.id,
+            "finish_reason": finish_reason,
+            "error": error,
+            "stream": self.stream,
+            "prompt_tokens": self.prompt_tokens,
+            "cached_prompt_tokens": cached,
+            "completion_tokens": completion_tokens,
+            // counted by the server's parser (text inside the reasoning block) / by the engine (0 for engines without phase tracking)
+            "reasoning_tokens": self.pipe.reasoning_tokens,
+            "engine_reasoning_tokens": ev.reasoning_tokens,
+            "tool_calls": self.pipe.tool_calls(),
+            "malformed_tool_call": self.pipe.malformed(),
+            // the engine closed the reasoning block at the cap (the request went on), or the server-side backstop ended the request
+            "reasoning_cap_fired": ev.reasoning_capped || self.pipe.capped,
+            "reasoning_cap_by": if ev.reasoning_capped { json!("engine") } else if self.pipe.capped { json!("server") } else { Json::Null },
+            "loop_breaker_fired": ev.loop_breaks > 0,
+            "loop_breaker_firings": ev.loop_breaks,
+            "sentence_loop_firings": ev.sentence_breaks,
+            "watchdog": self.watchdog,
+            "seconds": (self.t_start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
+        }));
+    }
+
     async fn next(&mut self) -> Step {
-        let ev = self.running.rx.recv().await;
         let tok = self.state.tok.clone();
+        // watchdog: no token for no_token_timeout seconds since the last accepted one (from the first token on: a prompt has the
+        // keep-alive and the engine's own step watchdog), or the reply's wall-clock limit (from the hand-over to the engine)
+        let (quiet, wall) = { let ph = &self.state.cfg.defaults.phase; (ph.no_token_timeout, ph.reply_wall_limit) };
+        let mut limit: Option<(Instant, &'static str)> = None;
+        if let (true, Some(t)) = (quiet > 0.0, self.t_last) {
+            limit = Some((t + std::time::Duration::from_secs_f64(quiet), "no token within the no-token timeout"));
+        }
+        if wall > 0.0 {
+            let at = self.t_engine + std::time::Duration::from_secs_f64(wall);
+            if limit.is_none_or(|l| at < l.0) {
+                limit = Some((at, "the reply reached its wall-clock limit"));
+            }
+        }
+        let ev = match limit {
+            None => self.running.rx.recv().await,
+            Some((at, why)) => match tokio::time::timeout_at(tokio::time::Instant::from_std(at), self.running.rx.recv()).await {
+                Ok(ev) => ev,
+                Err(_) => {
+                    tracing::warn!("watchdog: {}: {why} ({} s since the last token, {} s in all): ending the request after {} output tokens",
+                        self.id, self.t_last.map_or(0, |t| t.elapsed().as_secs()), self.t_engine.elapsed().as_secs(), self.pipe.completion_tokens);
+                    self.watchdog = Some(why);
+                    self.running.cancel.cancel();
+                    let (cached, timings) = self.engine_finish().await;
+                    let d = self.pipe.close(&tok).unwrap_or_default();
+                    return Step::Final(d, self.outcome("length", None, 0, cached).with_timings(timings));
+                }
+            },
+        };
         match ev {
             Some(GenEvent::Tokens(ids)) => {
+                self.t_last = Some(Instant::now());
                 if self.t_first.is_none() {
-                    self.t_first = Some(Instant::now());
+                    self.t_first = self.t_last;
                 }
                 match self.pipe.tokens(&tok, &ids) {
                     Ok(d) if self.pipe.server_finish.is_none() => Step::Deltas(d),
@@ -734,6 +1094,7 @@ impl Driver {
                 }
             }
             Some(GenEvent::Finished(f)) => {
+                self.events = f.events.clone();
                 let d = self.pipe.close(&tok).unwrap_or_default();
                 let (reason, err, extra) = match (self.pipe.server_finish, &f.reason) {
                     (Some(r), _) => (r, None, 0),
@@ -758,7 +1119,10 @@ impl Driver {
         loop {
             tokio::select! {
                 ev = self.running.rx.recv() => match ev {
-                    Some(GenEvent::Finished(f)) => return (f.cached_prompt_tokens, f.timings),
+                    Some(GenEvent::Finished(f)) => {
+                        self.events = f.events;
+                        return (f.cached_prompt_tokens, f.timings);
+                    }
                     Some(GenEvent::Tokens(_)) => continue,
                     None => return (0, None),
                 },
@@ -771,6 +1135,9 @@ impl Driver {
         self.finished = true;
         let reason = if reason == "stop" && self.pipe.tool_calls() > 0 { "tool_calls" } else { reason };
         let completion_tokens = self.pipe.completion_tokens + extra;
+        if self.pipe.malformed() {
+            tracing::warn!("{} malformed tool call: DSML closing tags with no call block (answer passed as content, {} tokens)", self.id, completion_tokens);
+        }
         let now = Instant::now();
         let ttft = self.t_first.map(|t| t - self.t_start).unwrap_or(now - self.t_start);
         let gen_s = self.t_first.map(|t| (now - t).as_secs_f64()).unwrap_or(0.0);
@@ -786,6 +1153,7 @@ impl Driver {
                 tps
             ),
         }
+        self.capture(Some(reason), error.as_deref(), completion_tokens, cached);
         Outcome { finish_reason: reason, error, completion_tokens, cached_prompt_tokens: cached, timings: None }
     }
 }
@@ -881,14 +1249,23 @@ fn sse(data: String) -> Result<Event, Infallible> {
     Ok(Event::default().data(data))
 }
 
+/// The `x-sampling-effective` response header: the sampling the request runs with (compact JSON).
+fn effective_header(resp: &mut Response, effective: &Json) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&effective.to_string()) {
+        resp.headers_mut().insert("x-sampling-effective", v);
+    }
+}
+
 fn stream_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(256);
+    let effective = p.effective.clone();
     tokio::spawn(async move {
         let model = state.cfg.model_id.clone();
         let running = tokio::select! {
             r = start(&state, &p) => r,
             _ = tx.closed() => {
                 tracing::info!("{} cancelled while queued (client gone)", p.id);
+                state.capture_meta(&p.id, json!({"id": p.id, "finish_reason": null, "cancelled": "while queued", "completion_tokens": 0, "reasoning_cap_fired": false, "loop_breaker_fired": false}));
                 return;
             }
         };
@@ -931,13 +1308,14 @@ fn stream_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> Respo
             }
         }
     });
-    // SSE comment lines every 15 s keep idle-timeout clients alive through queueing and long prefills
+    // SSE comment lines (`: keep-alive`) every 10 s of silence keep idle-timeout clients alive through queueing and long prefills
     let mut resp = Sse::new(ReceiverStream::new(rx))
-        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10)).text("keep-alive"))
         .into_response();
     // SSE is UTF-8 by definition, but clients that go by the header (python requests: text/* without a charset is ISO-8859-1)
     // would decode every multi-byte character into mojibake: say it
     resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/event-stream; charset=utf-8"));
+    effective_header(&mut resp, &effective);
     resp
 }
 
@@ -999,12 +1377,25 @@ async fn full_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> R
     if let Some(t) = &outcome.timings {
         body["timings"] = t.to_json();
     }
-    AxJson(body).into_response()
+    let mut resp = AxJson(body).into_response();
+    effective_header(&mut resp, &p.effective);
+    resp
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let t_start = Instant::now();
     let prepared = parse_body::<ChatRequest>(&body).and_then(|r| prepare_chat(&state, r));
+    if state.dump_dir.get().is_some() {
+        match &prepared {
+            Ok(p) => state.capture_body(&p.id, &body),
+            Err(e) => {
+                // a rejected request has no id of its own
+                let id = random_id("rejected-", 24);
+                state.capture_body(&id, &body);
+                state.capture_meta(&id, json!({"id": id, "finish_reason": null, "rejected": true, "error": e.message, "completion_tokens": 0, "reasoning_cap_fired": false, "loop_breaker_fired": false}));
+            }
+        }
+    }
     run(state, prepared, t_start).await
 }
 
@@ -1033,6 +1424,8 @@ async fn run(state: Arc<AppState>, prepared: Result<Prepared, ApiError>, t_start
         p.params.temperature,
         p.stream
     );
+    // (worded so that counting the warning lines "loop breaker:" / "reasoning cap:" in a log never counts this per-request line)
+    tracing::info!("{} sampling: {}", p.id, p.effective);
     if p.stream { stream_response(state, p, t_start) } else { full_response(state, p, t_start).await }
 }
 
@@ -1055,6 +1448,7 @@ mod tests {
             stream: true,
             include_usage,
             echo: None,
+            effective: Json::Null,
         }
     }
 

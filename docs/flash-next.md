@@ -164,6 +164,58 @@ and names the process holding it (`FERRITE_LOCK_WAIT=1` waits for it instead). I
 | `FNEXT_COUNTS` | `crates/fe-fnext/data/routing-mix.json` | expert routing counts that pick the experts loaded first |
 | `FNEXT_CPU_POOL` | the E-cores on a hybrid Intel CPU, else one thread per physical core not taken by the engine's 3 own threads | CPUs that compute the experts that miss the card |
 
+## Recommended settings
+
+The server reads `sampling.json` from the model folder: the base model's published sampling settings, which it
+applies to the fields a request leaves out, and the protections below. Ferrite's copy for this model is
+`crates/fe-server/sampling.qwen3.8-flash-next.json`; `tools/serve-fnext.sh` uses it when the folder has none, and
+`FE_SAMPLING_JSON=<file>` names another file.
+
+| | Thinking | Non-thinking |
+|---|---|---|
+| temperature | 1.0 | 0.7 |
+| top_p | 0.95 | 0.80 |
+| top_k | 20 | 20 |
+| presence_penalty | 0 | 1.5 |
+| repetition_penalty | 1.0 | 1.0 |
+
+- A value the client sends always wins, field by field. The values a request ran with are returned in the
+  `x-sampling-effective` response header and written to the log.
+- **Temperature 0 stays greedy.** A request that sends `temperature: 0` gets no penalty from the table, so it
+  keeps MTP drafting. A penalty the client sends itself still applies and takes the request off that path.
+  `"greedy_keeps_fast_path": false` in `sampling.json` (or `FE_GREEDY_FAST_PATH=0`) turns the rule off.
+- **A request that leaves temperature out is sampled** with the table's values and decodes one token a step
+  (see Limits). A coding agent that wants the drafting speed sends `temperature: 0`.
+
+Protections, the same code as for the 27B model:
+
+| Protection | Default | Switch |
+|---|---|---|
+| Reasoning cap: a thinking block still open after 8,192 tokens is closed by the engine and the model answers | 8192 | `max_reasoning_tokens`, `FE_MAX_REASONING_TOKENS` (0 = off) |
+| Loop breaker: an exact repeating cycle closes a reasoning block; in an answer it boosts the sampling for 96 tokens and ends the reply (`finish_reason: "length"`) if the cycle returns. Tool-call arguments are held to a far stricter rule | on | `loop_breaker`, `FE_LOOP_BREAKER=0`; thresholds `loop_rules`, `FE_LOOP_RULES` |
+| Repeated-sentence rule: a reply that keeps coming back to the same sentences is treated like a cycle; never inside a code block or a tool call | on | `loop_rules.sentence` |
+| The first token of a reply is never a stop token | on | none |
+| `tool_choice` `required` / a named function is enforced, limited to the tools offered | on | none |
+| No token for 60 s after the first one ends the reply | 60 s | `FE_NO_TOKEN_TIMEOUT` (seconds, 0 = off) |
+| Wall-clock limit of a reply | off | `FE_REPLY_WALL_LIMIT` (seconds) |
+| Non-finite logits end the request with an error instead of text | on | `FE_FINITE_CHECK=0` |
+| SSE keep-alive comment every 10 s of silence | on | none |
+| Request capture for replay | off | `FE_DUMP_REQUESTS=<dir>` |
+
+A protection acts at the token where it fires, whatever the number of drafts a step verified: the tokens accepted
+past that point are given back. With protections firing, greedy replies are the same with drafting on and off, and
+the same alone as with other requests beside them. A request on which none fires gets the tokens it got before.
+
+Harness settings that were tested end to end are in [harness.md](harness.md).
+
+### The Coder file is for code
+
+The GSQ-RCO Coder file is pruned for code and handles general-chat prompts poorly, non-English words in particular.
+Measured on two RTX PRO 4000 Blackwell 24 GB with short prompts and a 1,024-token limit (temperature 0, 0.6 and
+the default sampling, thinking on and off): coding prompts, with and without tools, ended on their own in 176 of
+176 runs; general-chat prompts ran to the limit in 39 of 112. A request to translate two words into French and
+Spanish circled without producing the Spanish. Use this model for code.
+
 ## Limits
 
 - Experimental: measured on one machine, two 5060 Ti cards. The single-card preset was measured on that machine under
@@ -171,8 +223,13 @@ and names the process holding it (`FERRITE_LOCK_WAIT=1` waits for it instead). I
 - Text only: the vision tower (`mmproj`) is not supported.
 - The first request after a start reads experts and PLE rows from disk and is slower; a short prompt right after a
   very long one is ~20% slower for a while (its expert slots refill).
-- Requests that sample (temperature > 0) decode one token a step; greedy requests use MTP drafting. Several requests
-  at once share a step either way.
+- Requests that sample (temperature > 0, or no temperature at all) decode one token a step; greedy requests use MTP
+  drafting. Several requests at once share a step either way, and while one of them samples, the greedy ones beside
+  it decode one token a step too and do not return to drafting during that request.
+- After the reasoning cap or a reasoning cycle closes a thinking block, a greedy request keeps drafting. The boosted
+  stretch after an answer loop is sampled: a request that runs alone drafts again when the stretch ends, one with
+  other requests beside it stays at one token a step.
+- The check for non-finite logits covers sampled picks on every preset; greedy picks are covered on two cards only.
 - A prompt is processed while the other requests wait: their decoding pauses until it is done. Requests that
   arrive together with fresh prompts therefore start one after another (four 2K-token prompts on two cards: the
   last first token after ~6.5 s, 88 tok/s in total over the whole run, against ~190 with short or cached prompts).

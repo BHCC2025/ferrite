@@ -1,0 +1,697 @@
+Here's a complete, self-contained dashboard. It leans into a "bookshop ledger" identity — a warm paper-and-ink light theme with a deep-ink dark theme, a Fraunces display face paired with IBM Plex Sans/Mono, and a live canvas chart that animates on load.
+
+```html
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Marginalia — Inventory Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,900;1,9..144,500&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* ---------- Tokens ---------- */
+  :root{
+    --paper:#f4efe3; --paper-2:#ece4d3; --card:#fbf8f0;
+    --ink:#241f18; --ink-soft:#5c5546; --ink-faint:#8a8271;
+    --line:#d8cfba; --line-soft:#e6ddc9;
+    --accent:#b5502a; --accent-2:#2f6b57; --gold:#b0862f;
+    --shadow:0 1px 2px rgba(36,31,24,.05), 0 14px 34px -14px rgba(36,31,24,.22);
+    --shadow-sm:0 1px 2px rgba(36,31,24,.06), 0 6px 16px -8px rgba(36,31,24,.18);
+    --radius:14px; --radius-sm:9px;
+    --font-display:"Fraunces", Georgia, serif;
+    --font-body:"IBM Plex Sans", system-ui, sans-serif;
+    --font-mono:"IBM Plex Mono", ui-monospace, monospace;
+  }
+  [data-theme="dark"]{
+    --paper:#141210; --paper-2:#1b1815; --card:#1e1b17;
+    --ink:#ece4d3; --ink-soft:#b3a992; --ink-faint:#7c7462;
+    --line:#332e26; --line-soft:#2a2620;
+    --accent:#e07a4c; --accent-2:#5aa88c; --gold:#d3a94a;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 18px 40px -18px rgba(0,0,0,.7);
+    --shadow-sm:0 1px 2px rgba(0,0,0,.4), 0 8px 20px -10px rgba(0,0,0,.55);
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--font-body); font-size:15px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    transition:background .35s ease, color .35s ease;
+  }
+  ::selection{background:var(--accent); color:#fff}
+  a{color:inherit}
+  :focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:4px}
+
+  /* ---------- App grid ---------- */
+  .app{
+    display:grid;
+    grid-template-columns:250px 1fr;
+    grid-template-rows:auto 1fr auto;
+    grid-template-areas:"header header" "sidebar main" "footer footer";
+    min-height:100vh;
+  }
+
+  /* ---------- Header ---------- */
+  .topbar{
+    grid-area:header; position:sticky; top:0; z-index:40;
+    display:flex; align-items:center; justify-content:space-between; gap:16px;
+    padding:14px 26px; background:var(--paper);
+    border-bottom:1px solid var(--line);
+  }
+  .brand{display:flex; align-items:center; gap:14px}
+  .brand__mark{
+    width:42px; height:42px; flex:none; display:grid; place-items:center;
+    background:var(--ink); color:var(--paper); border-radius:11px;
+    font-family:var(--font-display); font-weight:900; font-size:22px;
+    box-shadow:var(--shadow-sm);
+  }
+  .brand__name{font-family:var(--font-display); font-weight:900; font-size:22px; letter-spacing:-.01em; line-height:1}
+  .brand__sub{font-family:var(--font-mono); font-size:10.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-faint); margin-top:3px}
+  .topbar__right{display:flex; align-items:center; gap:14px}
+  .clock{font-family:var(--font-mono); font-size:12.5px; color:var(--ink-soft); display:flex; align-items:center; gap:8px}
+  .clock .dot{width:7px; height:7px; border-radius:50%; background:var(--accent-2); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent-2) 25%, transparent); animation:pulse 2.4s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .theme-toggle{
+    display:inline-flex; align-items:center; gap:8px; cursor:pointer;
+    font-family:var(--font-mono); font-size:12px; letter-spacing:.04em;
+    background:var(--card); color:var(--ink); border:1px solid var(--line);
+    padding:8px 13px; border-radius:999px; box-shadow:var(--shadow-sm);
+    transition:transform .15s, border-color .2s;
+  }
+  .theme-toggle:hover{transform:translateY(-1px); border-color:var(--accent)}
+  .theme-toggle .ico{font-size:14px}
+
+  /* ---------- Sidebar ---------- */
+  .sidebar{
+    grid-area:sidebar; background:var(--paper-2);
+    border-right:1px solid var(--line); padding:22px 16px;
+    display:flex; flex-direction:column; gap:6px;
+  }
+  .nav-label{font-family:var(--font-mono); font-size:10px; letter-spacing:.18em; text-transform:uppercase; color:var(--ink-faint); padding:0 12px 8px}
+  .nav{display:flex; flex-direction:column; gap:2px}
+  .nav a{
+    display:flex; align-items:center; gap:12px; text-decoration:none;
+    padding:10px 12px; border-radius:var(--radius-sm); color:var(--ink-soft);
+    font-weight:500; font-size:14px; position:relative;
+    transition:background .18s, color .18s, transform .18s;
+  }
+  .nav a .ico{width:20px; text-align:center; font-size:15px; flex:none}
+  .nav a:hover{background:var(--card); color:var(--ink); transform:translateX(3px)}
+  .nav a.active{background:var(--card); color:var(--ink); box-shadow:var(--shadow-sm)}
+  .nav a.active::before{content:""; position:absolute; left:-16px; top:8px; bottom:8px; width:3px; background:var(--accent); border-radius:3px}
+  .nav a .badge{margin-left:auto; font-family:var(--font-mono); font-size:11px; background:var(--accent); color:#fff; padding:1px 7px; border-radius:999px}
+  .sidebar__foot{margin-top:auto; padding:14px 12px 0; border-top:1px solid var(--line); font-family:var(--font-mono); font-size:11px; color:var(--ink-faint); line-height:1.7}
+
+  /* ---------- Main ---------- */
+  .main{grid-area:main; padding:26px 30px 40px; min-width:0}
+  .page-head{display:flex; align-items:flex-end; justify-content:space-between; gap:20px; flex-wrap:wrap; margin-bottom:22px}
+  .page-head h1{font-family:var(--font-display); font-weight:900; font-size:clamp(30px,4vw,44px); margin:0; letter-spacing:-.02em}
+  .page-head .lede{margin:6px 0 0; color:var(--ink-soft); max-width:52ch}
+  .page-head .meta{font-family:var(--font-mono); font-size:12px; color:var(--ink-faint); text-align:right}
+  .page-head .meta b{color:var(--ink); font-weight:600}
+
+  /* ---------- Cards ---------- */
+  .cards{display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:22px}
+  .card{
+    background:var(--card); border:1px solid var(--line); border-radius:var(--radius);
+    padding:18px 18px 16px; box-shadow:var(--shadow-sm); position:relative; overflow:hidden;
+    transition:transform .2s, box-shadow .2s;
+  }
+  .card:hover{transform:translateY(-3px); box-shadow:var(--shadow)}
+  .card::after{content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--accent)}
+  .card:nth-child(2)::after{background:var(--accent-2)}
+  .card:nth-child(3)::after{background:var(--gold)}
+  .card:nth-child(4)::after{background:var(--ink)}
+  .card__label{font-family:var(--font-mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-faint)}
+  .card__value{font-family:var(--font-display); font-weight:900; font-size:34px; line-height:1.05; margin:8px 0 4px; letter-spacing:-.02em}
+  .card__value small{font-size:16px; font-weight:600; color:var(--ink-soft)}
+  .card__foot{font-size:12.5px; color:var(--ink-soft); display:flex; align-items:center; gap:6px}
+  .trend{font-family:var(--font-mono); font-size:11px; padding:1px 7px; border-radius:999px}
+  .trend.up{background:color-mix(in srgb, var(--accent-2) 18%, transparent); color:var(--accent-2)}
+  .trend.down{background:color-mix(in srgb, var(--accent) 18%, transparent); color:var(--accent)}
+
+  /* ---------- Panels ---------- */
+  .panel{background:var(--card); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow-sm); margin-bottom:22px}
+  .panel__head{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 20px; border-bottom:1px solid var(--line-soft)}
+  .panel__head h2{font-family:var(--font-display); font-weight:600; font-size:19px; margin:0}
+  .panel__head .hint{font-family:var(--font-mono); font-size:11px; color:var(--ink-faint)}
+
+  /* ---------- Filter form ---------- */
+  .filters{display:grid; grid-template-columns:1.4fr 1fr 1fr 1fr auto; gap:14px; align-items:end; padding:18px 20px}
+  .field{display:flex; flex-direction:column; gap:6px}
+  .field label{font-family:var(--font-mono); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-faint)}
+  .field input, .field select{
+    font-family:var(--font-body); font-size:14px; color:var(--ink);
+    background:var(--paper); border:1px solid var(--line); border-radius:var(--radius-sm);
+    padding:10px 12px; transition:border-color .2s, box-shadow .2s;
+  }
+  .field input:focus, .field select:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent)}
+  .btn{
+    font-family:var(--font-mono); font-size:12.5px; letter-spacing:.03em; cursor:pointer;
+    border:1px solid var(--line); background:var(--card); color:var(--ink);
+    padding:10px 16px; border-radius:var(--radius-sm); transition:transform .15s, background .2s, color .2s;
+  }
+  .btn:hover{transform:translateY(-1px)}
+  .btn--primary{background:var(--ink); color:var(--paper); border-color:var(--ink)}
+  .btn--primary:hover{background:var(--accent); border-color:var(--accent)}
+
+  /* ---------- Table ---------- */
+  .table-wrap{overflow-x:auto}
+  table{width:100%; border-collapse:collapse; font-size:14px}
+  thead th{
+    text-align:left; font-family:var(--font-mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--ink-faint); padding:12px 16px; border-bottom:1px solid var(--line); white-space:nowrap;
+  }
+  th.sortable{cursor:pointer; user-select:none; transition:color .15s}
+  th.sortable:hover{color:var(--ink)}
+  th .arrow{opacity:.35; margin-left:5px; font-size:10px}
+  th.sorted .arrow{opacity:1; color:var(--accent)}
+  tbody td{padding:12px 16px; border-bottom:1px solid var(--line-soft); vertical-align:middle}
+  tbody tr{transition:background .15s}
+  tbody tr:hover{background:color-mix(in srgb, var(--accent) 6%, transparent)}
+  .b-title{font-weight:600}
+  .b-author{color:var(--ink-soft); font-size:13px}
+  .num{font-family:var(--font-mono); text-align:right; white-space:nowrap}
+  .price{color:var(--ink); font-weight:500}
+  .stock{display:inline-flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:12.5px}
+  .stock .pip{width:8px; height:8px; border-radius:50%}
+  .stock.in .pip{background:var(--accent-2)}
+  .stock.low .pip{background:var(--gold)}
+  .stock.out .pip{background:var(--accent)}
+  .stock.out{color:var(--accent)}
+  .empty{padding:34px; text-align:center; color:var(--ink-faint); font-family:var(--font-mono); font-size:13px}
+
+  /* ---------- Pagination ---------- */
+  .pager{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 20px; flex-wrap:wrap}
+  .pager__info{font-family:var(--font-mono); font-size:12px; color:var(--ink-soft)}
+  .pager__btns{display:flex; gap:6px}
+  .pager__btns button{
+    font-family:var(--font-mono); font-size:12.5px; min-width:34px; padding:7px 10px; cursor:pointer;
+    background:var(--paper); border:1px solid var(--line); border-radius:var(--radius-sm); color:var(--ink);
+    transition:transform .12s, background .2s, color .2s;
+  }
+  .pager__btns button:hover:not(:disabled){transform:translateY(-1px); border-color:var(--accent)}
+  .pager__btns button.active{background:var(--ink); color:var(--paper); border-color:var(--ink)}
+  .pager__btns button:disabled{opacity:.4; cursor:not-allowed}
+
+  /* ---------- Chart ---------- */
+  .chart-body{padding:18px 20px 8px}
+  .chart-canvas{width:100%; height:230px; display:block}
+  .chart-legend{display:flex; gap:18px; flex-wrap:wrap; padding:6px 20px 18px; font-family:var(--font-mono); font-size:11.5px; color:var(--ink-soft)}
+  .chart-legend span{display:inline-flex; align-items:center; gap:7px}
+  .chart-legend i{width:11px; height:11px; border-radius:3px; display:inline-block}
+
+  /* ---------- Footer ---------- */
+  .footer{grid-area:footer; border-top:1px solid var(--line); background:var(--paper-2); padding:20px 30px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap}
+  .footer p{margin:0; font-size:13px; color:var(--ink-soft)}
+  .footer .mono{font-family:var(--font-mono); font-size:11.5px; color:var(--ink-faint)}
+
+  /* ---------- Reveal ---------- */
+  .reveal{opacity:0; transform:translateY(14px); animation:rise .6s cubic-bezier(.2,.7,.2,1) forwards}
+  @keyframes rise{to{opacity:1; transform:none}}
+
+  /* ---------- Breakpoints ---------- */
+  @media (max-width:1080px){
+    .cards{grid-template-columns:repeat(2,1fr)}
+    .filters{grid-template-columns:1fr 1fr}
+    .filters .field--search{grid-column:1 / -1}
+    .filters .btn{grid-column:1 / -1}
+  }
+  @media (max-width:820px){
+    .app{grid-template-columns:1fr; grid-template-areas:"header" "sidebar" "main" "footer"}
+    .sidebar{flex-direction:row; flex-wrap:wrap; border-right:none; border-bottom:1px solid var(--line); padding:14px}
+    .nav-label{width:100%}
+    .nav{flex-direction:row; flex-wrap:wrap; gap:6px}
+    .nav a{padding:8px 12px}
+    .nav a.active::before{display:none}
+    .sidebar__foot{display:none}
+    .clock{display:none}
+  }
+  @media (max-width:560px){
+    .main{padding:18px 16px 30px}
+    .cards{grid-template-columns:1fr}
+    .filters{grid-template-columns:1fr}
+    .page-head .meta{text-align:left}
+    .card__value{font-size:30px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important; transition:none!important}
+    .reveal{opacity:1; transform:none}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand__mark">M</span>
+      <div>
+        <div class="brand__name">The Marginalia</div>
+        <div class="brand__sub">Independent Bookshop · Est. 1998</div>
+      </div>
+    </div>
+    <div class="topbar__right">
+      <span class="clock"><span class="dot"></span><span id="clock">—</span></span>
+      <button class="theme-toggle" id="themeToggle" aria-label="Toggle colour theme">
+        <span class="ico" id="themeIco">☾</span><span id="themeTxt">Dark</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Sidebar -->
+  <nav class="sidebar" aria-label="Primary">
+    <div class="nav-label">Ledger</div>
+    <div class="nav">
+      <a href="#" class="active"><span class="ico">▤</span> Dashboard</a>
+      <a href="#"><span class="ico">▦</span> Inventory <span class="badge">40</span></a>
+      <a href="#"><span class="ico">✎</span> Orders</a>
+      <a href="#"><span class="ico">◈</span> Suppliers</a>
+      <a href="#"><span class="ico">✦</span> Customers</a>
+      <a href="#"><span class="ico">◷</span> Sales</a>
+      <a href="#"><span class="ico">⚙</span> Reports</a>
+      <a href="#"><span class="ico">⚑</span> Settings</a>
+    </div>
+    <div class="sidebar__foot">
+      Shelf count synced<br>
+      <span id="syncTime">just now</span>
+    </div>
+  </nav>
+
+  <!-- Main -->
+  <main class="main">
+    <div class="page-head reveal">
+      <div>
+        <h1>Inventory Ledger</h1>
+        <p class="lede">A live view of the shelves — sort, filter and page through the collection, and watch the stock mix shift in real time.</p>
+      </div>
+      <div class="meta">
+        <b id="totalBooks">40</b> titles on the shelf<br>
+        last audit <span id="audit">today</span>
+      </div>
+    </div>
+
+    <!-- Summary cards -->
+    <section class="cards" aria-label="Summary">
+      <article class="card reveal" style="animation-delay:.05s">
+        <div class="card__label">Titles in stock</div>
+        <div class="card__value" id="cTitles">0</div>
+        <div class="card__foot"><span class="trend up">▲ 4</span> new this month</div>
+      </article>
+      <article class="card reveal" style="animation-delay:.12s">
+        <div class="card__label">Units on shelf</div>
+        <div class="card__value" id="cUnits">0</div>
+        <div class="card__foot"><span class="trend up">▲ 12%</span> vs last week</div>
+      </article>
+      <article class="card reveal" style="animation-delay:.19s">
+        <div class="card__label">Stock value</div>
+        <div class="card__value" id="cValue">$0</div>
+        <div class="card__foot">at current list price</div>
+      </article>
+      <article class="card reveal" style="animation-delay:.26s">
+        <div class="card__label">Low / out of stock</div>
+        <div class="card__value" id="cLow">0</div>
+        <div class="card__foot"><span class="trend down">▼ restock</span> flagged for reorder</div>
+      </article>
+    </section>
+
+    <!-- Filter form -->
+    <section class="panel reveal" style="animation-delay:.3s">
+      <div class="panel__head">
+        <h2>Filter the shelves</h2>
+        <span class="hint">results update live</span>
+      </div>
+      <form class="filters" id="filterForm" autocomplete="off">
+        <div class="field field--search">
+          <label for="fSearch">Search</label>
+          <input type="search" id="fSearch" placeholder="Title or author…">
+        </div>
+        <div class="field">
+          <label for="fGenre">Genre</label>
+          <select id="fGenre">
+            <option value="all">All genres</option>
+            <option>Fiction</option>
+            <option>Non-fiction</option>
+            <option>Science</option>
+            <option>History</option>
+            <option>Poetry</option>
+            <option>Philosophy</option>
+            <option>Children</option>
+            <option>Mystery</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="fYear">From year</label>
+          <input type="number" id="fYear" placeholder="e.g. 1990" min="1900" max="2024">
+        </div>
+        <div class="field">
+          <label for="fStock">Stock</label>
+          <select id="fStock">
+            <option value="all">Any</option>
+            <option value="in">In stock</option>
+            <option value="low">Low (≤5)</option>
+            <option value="out">Out of stock</option>
+          </select>
+        </div>
+        <button type="reset" class="btn">Reset</button>
+      </form>
+    </section>
+
+    <!-- Table -->
+    <section class="panel reveal" style="animation-delay:.34s">
+      <div class="panel__head">
+        <h2>Collection</h2>
+        <span class="hint" id="tableHint">click a column to sort</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th class="sortable" data-key="title">Title <span class="arrow">↕</span></th>
+              <th class="sortable" data-key="author">Author <span class="arrow">↕</span></th>
+              <th class="sortable" data-key="year">Year <span class="arrow">↕</span></th>
+              <th class="sortable" data-key="price">Price <span class="arrow">↕</span></th>
+              <th class="sortable" data-key="stock">Stock <span class="arrow">↕</span></th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <span class="pager__info" id="pagerInfo"></span>
+        <div class="pager__btns" id="pagerBtns"></div>
+      </div>
+    </section>
+
+    <!-- Chart -->
+    <section class="panel reveal" style="animation-delay:.38s">
+      <div class="panel__head">
+        <h2>Stock by genre</h2>
+        <span class="hint">units on shelf</span>
+      </div>
+      <div class="chart-body">
+        <canvas class="chart-canvas" id="chart" width="800" height="230"></canvas>
+      </div>
+      <div class="chart-legend" id="legend"></div>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <p>The Marginalia · 14 Lantern Lane · Open till late</p>
+    <span class="mono">Inventory ledger · v2.4 · <span id="yearNow"></span></span>
+  </footer>
+</div>
+
+<script>
+/* ---------- Data ---------- */
+const BOOKS = [
+  {title:"The Silent Meridian", author:"Elena Voss", year:2019, price:16.50, stock:12, genre:"Fiction"},
+  {title:"A Field Guide to Grief", author:"Marcus Hale", year:2021, price:14.00, stock:3, genre:"Non-fiction"},
+  {title:"The Cartographer's Daughter", author:"Ingrid Solberg", year:2017, price:18.99, stock:0, genre:"Fiction"},
+  {title:"Quantum Lullabies", author:"Dr. Priya Nair", year:2022, price:22.00, stock:7, genre:"Science"},
+  {title:"Salt & Cinder", author:"Tomás Rivera", year:2015, price:12.50, stock:21, genre:"Fiction"},
+  {title:"The Weight of Small Hours", author:"Ada Whitmore", year:2020, price:15.75, stock:5, genre:"Poetry"},
+  {title:"Empires of Dust", author:"Khalid Mansour", year:2018, price:24.00, stock:9, genre:"History"},
+  {title:"The Unfinished Garden", author:"Rosa Delacroix", year:2016, price:13.25, stock:14, genre:"Fiction"},
+  {title:"On the Edge of Knowing", author:"Dr. Felix Brandt", year:2023, price:19.99, stock:2, genre:"Philosophy"},
+  {title:"Little Fox, Big Sky", author:"June Park", year:2014, price:9.99, stock:30, genre:"Children"},
+  {title:"The Glasshouse Murders", author:"Cormac Doyle", year:2021, price:17.50, stock:6, genre:"Mystery"},
+  {title:"Tides of the Inner Sea", author:"Mireille Fontaine", year:2019, price:16.00, stock:11, genre:"Fiction"},
+  {title:"The Last Lighthouse Keeper", author:"Owen Blackwood", year:2013, price:11.00, stock:0, genre:"Fiction"},
+  {title:"A Brief History of Rain", author:"Sofia Andersson", year:2022, price:20.50, stock:8, genre:"Non-fiction"},
+  {title:"The Paper Moon", author:"Hana Sato", year:2018, price:14.50, stock:17, genre:"Fiction"},
+  {title:"Machines That Dream", author:"Dr. Alan Reyes", year:2023, price:26.00, stock:4, genre:"Science"},
+  {title:"The Orchard of Forgotten Names", author:"Beatrice Lang", year:2016, price:15.00, stock:10, genre:"Fiction"},
+  {title:"Notes on a Vanishing City", author:"Viktor Petrov", year:2020, price:18.25, stock:1, genre:"Non-fiction"},
+  {title:"The Clockmaker's Confession", author:"Isabel Moreau", year:2019, price:16.75, stock:13, genre:"Mystery"},
+  {title:"Winter's Quiet Arithmetic", author:"Nils Bergström", year:2017, price:12.00, stock:22, genre:"Poetry"},
+  {title:"The Cartography of Memory", author:"Lena Fischer", year:2021, price:21.00, stock:5, genre:"Non-fiction"},
+  {title:"A Map of Small Wonders", author:"Theo Nakamura", year:2015, price:10.50, stock:28, genre:"Children"},
+  {title:"The Hollow Crown of Ash", author:"Rowan Ashford", year:2022, price:19.50, stock:7, genre:"Fiction"},
+  {title:"Letters to a Stranger", author:"Clara Vane", year:2014, price:13.75, stock:9, genre:"Fiction"},
+  {title:"The Geometry of Longing", author:"Dr. Omar Haddad", year:2020, price:23.00, stock:3, genre:"Philosophy"},
+  {title:"The Nightingale's Ledger", author:"Petra Novak", year:2018, price:15.25, stock:16, genre:"Fiction"},
+  {title:"Saltwater Psalms", author:"Dylan O'Shea", year:2019, price:14.00, stock:0, genre:"Poetry"},
+  {title:"The Inheritance of Light", author:"Amara Okafor", year:2023, price:17.00, stock:12, genre:"Fiction"},
+  {title:"A Short History of Silence", author:"Henrik Lund", year:2016, price:16.25, stock:6, genre:"Non-fiction"},
+  {title:"The Foxglove Case", author:"Margot Ellison", year:2021, price:18.50, stock:4, genre:"Mystery"},
+  {title:"Where the Rivers Remember", author:"Sylvia Chen", year:2017, price:15.50, stock:19, genre:"Fiction"},
+  {title:"The Alchemist's Apprentice", author:"Gabriel Fontaine", year:2015, price:12.75, stock:11, genre:"Fiction"},
+  {title:"On the Nature of Forgetting", author:"Dr. Ines Almeida", year:2022, price:24.50, stock:2, genre:"Philosophy"},
+  {title:"The Little Book of Tides", author:"Freya Holm", year:2013, price:8.99, stock:34, genre:"Children"},
+  {title:"The Cartographer's Ghost", author:"Elias Thorn", year:2020, price:17.25, stock:8, genre:"Mystery"},
+  {title:"A Season of Small Fires", author:"Nadia Rahman", year:2019, price:14.75, stock:15, genre:"Fiction"},
+  {title:"The Weight of Water", author:"Jonas Weber", year:2018, price:16.00, stock:5, genre:"Non-fiction"},
+  {title:"The Last Letter Home", author:"Ruth Calloway", year:2016, price:13.00, stock:20, genre:"Fiction"},
+  {title:"The Unmapped Coast", author:"Diego Marín", year:2021, price:19.00, stock:3, genre:"History"},
+  {title:"Songs for the Drowned", author:"Elif Demir", year:2023, price:15.00, stock:10, genre:"Poetry"}
+];
+
+/* ---------- State ---------- */
+const state = { sortKey:"title", sortDir:1, page:1, perPage:8,
+  search:"", genre:"all", year:"", stock:"all" };
+
+const $ = s => document.querySelector(s);
+const tbody = $("#tbody");
+const money = n => "$" + n.toFixed(2);
+
+/* ---------- Filtering ---------- */
+function getFiltered(){
+  const q = state.search.trim().toLowerCase();
+  return BOOKS.filter(b=>{
+    if(q && !(b.title.toLowerCase().includes(q) || b.author.toLowerCase().includes(q))) return false;
+    if(state.genre !== "all" && b.genre !== state.genre) return false;
+    if(state.year && b.year < +state.year) return false;
+    if(state.stock === "in"  && b.stock <= 0) return false;
+    if(state.stock === "low" && !(b.stock > 0 && b.stock <= 5)) return false;
+    if(state.stock === "out" && b.stock !== 0) return false;
+    return true;
+  });
+}
+
+/* ---------- Sorting ---------- */
+function sortRows(rows){
+  const k = state.sortKey, d = state.sortDir;
+  return rows.slice().sort((a,b)=>{
+    let x = a[k], y = b[k];
+    if(typeof x === "string"){ x = x.toLowerCase(); y = y.toLowerCase(); }
+    return x < y ? -d : x > y ? d : 0;
+  });
+}
+
+/* ---------- Render table ---------- */
+function stockClass(n){ return n === 0 ? "out" : n <= 5 ? "low" : "in"; }
+function renderTable(){
+  const rows = sortRows(getFiltered());
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / state.perPage));
+  if(state.page > pages) state.page = pages;
+  const start = (state.page - 1) * state.perPage;
+  const slice = rows.slice(start, start + state.perPage);
+
+  tbody.innerHTML = slice.length ? slice.map(b=>`
+    <tr>
+      <td class="b-title">${b.title}</td>
+      <td class="b-author">${b.author}</td>
+      <td class="num">${b.year}</td>
+      <td class="num price">${money(b.price)}</td>
+      <td><span class="stock ${stockClass(b.stock)}"><span class="pip"></span>${b.stock === 0 ? "out" : b.stock}</span></td>
+    </tr>`).join("")
+    : `<tr><td colspan="5" class="empty">No titles match your filters.</td></tr>`;
+
+  $("#pagerInfo").textContent = total
+    ? `Showing ${start+1}–${start+slice.length} of ${total}`
+    : "No results";
+  renderPager(pages);
+  updateSortArrows();
+}
+
+/* ---------- Pagination ---------- */
+function renderPager(pages){
+  const wrap = $("#pagerBtns");
+  let html = `<button data-p="prev" ${state.page===1?"disabled":""}>‹</button>`;
+  for(let i=1;i<=pages;i++){
+    html += `<button data-p="${i}" class="${i===state.page?"active":""}">${i}</button>`;
+  }
+  html += `<button data-p="next" ${state.page===pages?"disabled":""}>›</button>`;
+  wrap.innerHTML = html;
+}
+
+/* ---------- Sort arrows ---------- */
+function updateSortArrows(){
+  document.querySelectorAll("th.sortable").forEach(th=>{
+    const on = th.dataset.key === state.sortKey;
+    th.classList.toggle("sorted", on);
+    th.querySelector(".arrow").textContent = on ? (state.sortDir===1?"↑":"↓") : "↕";
+  });
+}
+
+/* ---------- Summary cards ---------- */
+function animateNumber(el, to, fmt){
+  const from = 0, dur = 700, t0 = performance.now();
+  (function step(t){
+    const p = Math.min(1, (t - t0)/dur);
+    const e = 1 - Math.pow(1-p, 3);
+    el.textContent = fmt(from + (to-from)*e);
+    if(p < 1) requestAnimationFrame(step);
+  })(t0);
+}
+function updateCards(){
+  const units = BOOKS.reduce((s,b)=>s+b.stock,0);
+  const value = BOOKS.reduce((s,b)=>s+b.stock*b.price,0);
+  const low = BOOKS.filter(b=>b.stock>0 && b.stock<=5).length;
+  const out = BOOKS.filter(b=>b.stock===0).length;
+  animateNumber($("#cTitles"), BOOKS.length, v=>Math.round(v));
+  animateNumber($("#cUnits"), units, v=>Math.round(v).toLocaleString());
+  animateNumber($("#cValue"), value, v=>"$"+Math.round(v).toLocaleString());
+  animateNumber($("#cLow"), low+out, v=>Math.round(v));
+}
+
+/* ---------- Canvas bar chart ---------- */
+const canvas = $("#chart");
+const ctx = canvas.getContext("2d");
+let chartData = [], chartAnim = 0;
+
+function genreTotals(){
+  const map = {};
+  BOOKS.forEach(b=>{ map[b.genre] = (map[b.genre]||0) + b.stock; });
+  return Object.entries(map).sort((a,b)=>b[1]-a[1]);
+}
+function cssVar(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function drawChart(){
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w*dpr; canvas.height = h*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+
+  const pad = {l:44, r:14, t:16, b:34};
+  const plotW = w - pad.l - pad.r, plotH = h - pad.t - pad.b;
+  const max = Math.max(...chartData.map(d=>d.value), 1);
+  const niceMax = Math.ceil(max/10)*10;
+  const ink = cssVar("--ink"), faint = cssVar("--ink-faint"), line = cssVar("--line");
+  const palette = [cssVar("--accent"), cssVar("--accent-2"), cssVar("--gold"),
+                   cssVar("--ink"), "#7a5aa0", "#3f7fa6", "#a06a3a", "#5a7a3a"];
+
+  // gridlines + y labels
+  ctx.font = "11px 'IBM Plex Mono', monospace";
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for(let i=0;i<=4;i++){
+    const val = niceMax * i/4;
+    const y = pad.t + plotH - (val/niceMax)*plotH;
+    ctx.strokeStyle = line; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w-pad.r, y); ctx.stroke();
+    ctx.fillStyle = faint; ctx.fillText(Math.round(val), pad.l-8, y);
+  }
+
+  const n = chartData.length;
+  const gap = 14;
+  const bw = (plotW - gap*(n-1)) / n;
+  const e = 1 - Math.pow(1-chartAnim, 3);
+
+  chartData.forEach((d,i)=>{
+    const x = pad.l + i*(bw+gap);
+    const bh = (d.value/niceMax)*plotH*e;
+    const y = pad.t + plotH - bh;
+    const col = palette[i % palette.length];
+    ctx.fillStyle = col;
+    roundRect(ctx, x, y, bw, bh, 5); ctx.fill();
+    // value label
+    ctx.fillStyle = ink; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.font = "600 11px 'IBM Plex Mono', monospace";
+    ctx.fillText(Math.round(d.value*e), x+bw/2, y-4);
+    // x label
+    ctx.fillStyle = faint; ctx.textBaseline = "top";
+    ctx.font = "10px 'IBM Plex Mono', monospace";
+    ctx.fillText(d.label, x+bw/2, pad.t+plotH+8);
+  });
+}
+function roundRect(c,x,y,w,h,r){
+  r = Math.min(r, w/2, h/2);
+  c.beginPath();
+  c.moveTo(x+r,y); c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r);
+  c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath();
+}
+function animateChart(){
+  chartAnim = 0;
+  const t0 = performance.now();
+  (function step(t){
+    chartAnim = Math.min(1, (t-t0)/800);
+    drawChart();
+    if(chartAnim < 1) requestAnimationFrame(step);
+  })(t0);
+}
+function buildLegend(){
+  const palette = [cssVar("--accent"), cssVar("--accent-2"), cssVar("--gold"),
+                   cssVar("--ink"), "#7a5aa0", "#3f7fa6", "#a06a3a", "#5a7a3a"];
+  $("#legend").innerHTML = chartData.map((d,i)=>
+    `<span><i style="background:${palette[i%palette.length]}"></i>${d.label} · ${d.value}</span>`).join("");
+}
+
+/* ---------- Theme ---------- */
+function setTheme(t){
+  document.documentElement.setAttribute("data-theme", t);
+  $("#themeIco").textContent = t === "dark" ? "☀" : "☾";
+  $("#themeTxt").textContent = t === "dark" ? "Light" : "Dark";
+  drawChart(); // recolor bars to new palette
+}
+$("#themeToggle").addEventListener("click", ()=>{
+  const cur = document.documentElement.getAttribute("data-theme");
+  setTheme(cur === "dark" ? "light" : "dark");
+});
+
+/* ---------- Events ---------- */
+$("#fSearch").addEventListener("input", e=>{ state.search = e.target.value; state.page = 1; renderTable(); });
+$("#fGenre").addEventListener("change", e=>{ state.genre = e.target.value; state.page = 1; renderTable(); });
+$("#fYear").addEventListener("input", e=>{ state.year = e.target.value; state.page = 1; renderTable(); });
+$("#fStock").addEventListener("change", e=>{ state.stock = e.target.value; state.page = 1; renderTable(); });
+$("#filterForm").addEventListener("reset", ()=>{
+  state.search=""; state.genre="all"; state.year=""; state.stock="all"; state.page=1;
+  renderTable();
+});
+document.querySelectorAll("th.sortable").forEach(th=>{
+  th.addEventListener("click", ()=>{
+    const k = th.dataset.key;
+    if(state.sortKey === k) state.sortDir *= -1;
+    else { state.sortKey = k; state.sortDir = 1; }
+    renderTable();
+  });
+});
+$("#pagerBtns").addEventListener("click", e=>{
+  const b = e.target.closest("button"); if(!b || b.disabled) return;
+  const p = b.dataset.p;
+  if(p === "prev") state.page--;
+  else if(p === "next") state.page++;
+  else state.page = +p;
+  renderTable();
+});
+let rt;
+window.addEventListener("resize", ()=>{ clearTimeout(rt); rt = setTimeout(drawChart, 120); });
+
+/* ---------- Clock ---------- */
+function tick(){
+  const d = new Date();
+  $("#clock").textContent = d.toLocaleDateString(undefined,{weekday:"short",day:"numeric",month:"short"})
+    + " · " + d.toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit"});
+}
+tick(); setInterval(tick, 1000);
+$("#yearNow").textContent = new Date().getFullYear();
+
+/* ---------- Init ---------- */
+chartData = genreTotals();
+buildLegend();
+updateCards();
+renderTable();
+animateChart();
+</script>
+</body>
+</html>
+```
+
+**How the parts fit together:** the semantic shell (`header` / `nav` / `main` / `footer`) is laid out by a single CSS grid with named areas, so the sidebar, content and footer reflow cleanly across the three breakpoints (cards collapse 4→2→1, the sidebar becomes a horizontal strip, and the filter form stacks). All the data lives in one `BOOKS` array plus a `state` object; the filter form, sortable column headers and pagination buttons all just mutate that state and call `renderTable()`, which re-filters, re-sorts and re-slices the rows — so every control stays in sync automatically. The four summary cards and the canvas bar chart are derived from the same data (totals and per-genre stock), and the theme toggle simply flips a `data-theme` attribute that swaps the CSS variables, with the chart redrawing to pick up the new palette.

@@ -1,0 +1,162 @@
+# Database Comparison for a Small Engineering Team
+
+Choosing the right database depends heavily on your data structure, consistency requirements, and operational capacity. The following tables break down the key technical and operational aspects of PostgreSQL, MySQL, SQLite, MongoDB, Redis, and DuckDB to help you make an informed decision.
+
+### Data Model
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Type** | Relational (SQL) | Relational (SQL) | Relational (SQL) | Document (NoSQL) | Key-Value / In-Memory | Columnar (OLAP) |
+| **Schema** | Strict, enforced | Strict, enforced | Strict, enforced | Flexible, schema-on-read | Flexible, schema-on-write | Flexible, schema-on-read |
+| **Data Structure** | Tables, Rows, Columns | Tables, Rows, Columns | Tables, Rows, Columns | Collections, Documents (BSON) | Keys, Values (Strings, Hashes, Sets, etc.) | Tables, Rows, Columns |
+| **Relationships** | Foreign Keys, Joins | Foreign Keys, Joins | Foreign Keys, Joins | Embedded Documents, References | No native relationships | Joins, Window Functions |
+| **Complex Types** | Arrays, JSONB, HStore, Geospatial | JSON, Spatial (via plugins) | JSON1, BLOBs | Nested Documents, Arrays | Nested structures (via serialization) | Nested types (via extensions) |
+| **ACID Compliance** | Full ACID | Full ACID | Full ACID | Full ACID (per document) | Full ACID (per key) | Full ACID (per transaction) |
+| **Concurrency Model** | MVCC | MVCC | MVCC (single writer) | Multi-document transactions | Single-threaded (atomic ops) | Multi-threaded (read-only concurrency) |
+| **Best For** | Complex relational data | Web applications | Embedded, local apps | Flexible, unstructured data | Caching, real-time data | Analytical queries on large datasets |
+
+*PostgreSQL and MySQL offer robust relational integrity, while MongoDB and Redis provide flexibility for unstructured or high-speed access. SQLite is ideal for embedded scenarios, and DuckDB excels in analytical workloads.*
+
+### Transactions and Isolation
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Isolation Levels** | Read Committed, Repeatable Read, Serializable, Read Uncommitted | Read Committed, Repeatable Read, Serializable, Read Uncommitted | Read Committed, Serializable | Read Committed, Snapshot, Repeatable Read, Serializable | N/A (Atomic operations) | Read Committed, Serializable |
+| **Default Level** | Read Committed | Read Committed | Read Committed | Read Committed | N/A | Read Committed |
+| **Multi-Statement Tx** | Yes | Yes | Yes | Yes (multi-document) | Yes (MULTI/EXEC) | Yes |
+| **Deadlock Handling** | Automatic detection, aborts one tx | Automatic detection, aborts one tx | Locks, no automatic detection | Automatic detection, aborts one tx | N/A | Automatic detection, aborts one tx |
+| **Savepoints** | Yes | Yes | Yes | No | No | Yes |
+| **Rollback** | Full transaction rollback | Full transaction rollback | Full transaction rollback | Full transaction rollback | Partial (via scripting) | Full transaction rollback |
+| **Concurrency Control** | MVCC | MVCC | MVCC (single writer) | MVCC | Single-threaded | MVCC (read-only) |
+| **Performance Impact** | High overhead for serializable | Moderate overhead | Low overhead (single writer) | Moderate overhead | Low overhead | Low overhead (read-heavy) |
+
+*PostgreSQL and MySQL provide strong isolation guarantees suitable for financial or critical data. SQLite and DuckDB are simpler but less concurrent, while Redis and MongoDB offer different trade-offs for speed and flexibility.*
+
+### Replication
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Native Replication** | Yes (Streaming) | Yes (Asynchronous/Semi-sync) | No (manual file copy) | Yes (Replica Sets) | Yes (Master-Replica) | No (file-based) |
+| **Replication Type** | Asynchronous, Synchronous | Asynchronous, Semi-synchronous, Synchronous | N/A | Asynchronous, Synchronous | Asynchronous, Synchronous | N/A |
+| **Failover** | Manual or via tools (Patroni) | Manual or via tools (MHA, Orchestrator) | N/A | Automatic (Replica Set) | Manual or via tools (Sentinel) | N/A |
+| **Read Replicas** | Yes | Yes | No | Yes | Yes | No |
+| **Multi-Master** | No (requires extensions) | No (requires Galera/InnoDB Cluster) | No | No (requires sharding) | No (requires Cluster) | No |
+| **Data Consistency** | Strong (sync) or Eventual (async) | Strong (sync) or Eventual (async) | N/A | Strong (sync) or Eventual (async) | Strong (sync) or Eventual (async) | N/A |
+| **Setup Complexity** | Moderate | Moderate | Low | Moderate | Moderate | Low |
+| **Use Case** | High availability, read scaling | High availability, read scaling | N/A | High availability, read scaling | High availability, read scaling | N/A |
+
+*PostgreSQL, MySQL, MongoDB, and Redis support native replication for high availability and read scaling. SQLite and DuckDB rely on file-based distribution, making them unsuitable for distributed systems.*
+
+### Indexing
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Index Types** | B-Tree, Hash, GiST, GIN, BRIN | B-Tree, Hash, Full-Text, Spatial | B-Tree, Hash, Full-Text | B-Tree, Hash, Text, Geospatial | No traditional indexes | B-Tree, Hash, Full-Text |
+| **Composite Indexes** | Yes | Yes | Yes | Yes | N/A | Yes |
+| **Partial Indexes** | Yes | No (via generated columns) | Yes | Yes | N/A | Yes |
+| **Expression Indexes** | Yes | Yes (via generated columns) | Yes | Yes | N/A | Yes |
+| **Index Maintenance** | Automatic | Automatic | Automatic | Automatic | N/A | Automatic |
+| **Index Size** | Moderate | Moderate | Small | Moderate | N/A | Small |
+| **Query Optimization** | Advanced (cost-based) | Advanced (cost-based) | Basic (cost-based) | Basic (cost-based) | N/A | Advanced (cost-based) |
+| **Best For** | Complex queries, full-text search | General purpose | Simple queries | Flexible document queries | N/A | Analytical queries |
+
+*PostgreSQL offers the most diverse indexing options, including GiST and GIN for complex data types. MySQL and SQLite are solid for standard B-Tree and Hash indexes, while MongoDB and DuckDB provide flexible indexing for their respective data models.*
+
+### JSON Support
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Native JSON Type** | JSONB (binary) | JSON | JSON1 (text) | BSON (binary) | N/A (serialize) | JSON (text) |
+| **Querying JSON** | SQL operators, functions | SQL operators, functions | SQL functions | Query operators | N/A | SQL functions |
+| **Indexing JSON** | GIN index on JSONB | Generated columns | No | Yes (on fields) | N/A | No |
+| **Performance** | High (binary format) | Moderate (text format) | Low (text format) | High (native) | N/A | Moderate (text format) |
+| **Schema Enforcement** | Optional (via CHECK) | Optional (via CHECK) | No | Flexible | N/A | No |
+| **Migration Path** | Easy (JSONB to relational) | Easy (JSON to relational) | Hard (JSON to relational) | Hard (BSON to relational) | N/A | Hard (JSON to relational) |
+| **Use Case** | Semi-structured data | Semi-structured data | Simple JSON storage | Document storage | N/A | Analytical JSON data |
+| **Limitations** | Large JSONB can be slow | Large JSON can be slow | No indexing | No relational integrity | N/A | No indexing |
+
+*PostgreSQL’s JSONB is the most powerful for querying and indexing semi-structured data. MongoDB is native to JSON-like documents, while MySQL and SQLite offer basic JSON support. Redis and DuckDB require serialization or text-based handling.*
+
+### Operations and Backup
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Backup Method** | pg_dump, pg_basebackup | mysqldump, xtrabackup | File copy | mongodump, mongorestore | BGSAVE, RDB/AOF | File copy |
+| **Point-in-Time Recovery** | Yes (WAL archiving) | Yes (binlog) | No | Yes (oplog) | No (AOF) | No |
+| **Monitoring** | pg_stat, Prometheus exporters | Performance Schema, Prometheus exporters | No native | mongostat, Prometheus exporters | INFO command, Prometheus exporters | No native |
+| **Configuration** | postgresql.conf, pg_hba.conf | my.cnf | No config file | mongod.conf | redis.conf | No config file |
+| **Upgrade Process** | In-place or logical | In-place or logical | N/A | Rolling upgrade | In-place | N/A |
+| **Resource Usage** | Moderate | Moderate | Low | Moderate | Low (in-memory) | Low (file-based) |
+| **Complexity** | Moderate | Moderate | Low | Moderate | Moderate | Low |
+| **Best For** | Production environments | Production environments | Embedded, local apps | Production environments | Caching, real-time data | Analytical workloads |
+
+*PostgreSQL and MySQL offer robust backup and monitoring tools for production environments. SQLite and DuckDB are simple to back up but lack advanced features. MongoDB and Redis require more operational attention for high availability.*
+
+### Licensing
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **License Type** | PostgreSQL License (BSD-like) | GPL v2 (Community), Proprietary (Enterprise) | Public Domain | SSPL v1 (Community), Proprietary (Enterprise) | BSD (Community), Proprietary (Enterprise) | MIT |
+| **Commercial Use** | Yes | Yes | Yes | Yes (with SSPL) | Yes (with BSD) | Yes |
+| **SaaS Restrictions** | None | None | None | SSPL restricts SaaS | None | None |
+| **Cost** | Free | Free (Community), Paid (Enterprise) | Free | Free (Community), Paid (Enterprise) | Free (Community), Paid (Enterprise) | Free |
+| **Support** | Community, Commercial vendors | Oracle, Commercial vendors | Community | MongoDB Inc., Commercial vendors | Redis Ltd., Commercial vendors | Community |
+| **Fork Availability** | Yes (e.g., Citus) | Yes (e.g., MariaDB) | No | Yes (e.g., FerretDB) | Yes (e.g., KeyDB) | No |
+| **Legal Risk** | Low | Low | None | Moderate (SSPL) | Low | Low |
+| **Best For** | Open-source projects | Open-source projects | Embedded, local apps | Open-source projects (with caution) | Open-source projects | Open-source projects |
+
+*PostgreSQL, SQLite, and DuckDB have permissive licenses with no SaaS restrictions. MySQL and Redis offer free community editions with proprietary enterprise options. MongoDB’s SSPL license may pose legal risks for SaaS providers.*
+
+### Typical Latency Figures
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Simple Read (1 row)** | 0.1 - 1 ms | 0.1 - 1 ms | 0.01 - 0.1 ms | 0.1 - 1 ms | 0.01 - 0.1 ms | 1 - 10 ms |
+| **Simple Write (1 row)** | 0.1 - 1 ms | 0.1 - 1 ms | 0.01 - 0.1 ms | 0.1 - 1 ms | 0.01 - 0.1 ms | 1 - 10 ms |
+| **Complex Query (10k rows)** | 10 - 100 ms | 10 - 100 ms | 1 - 10 ms | 10 - 100 ms | N/A | 100 - 1000 ms |
+| **Aggregation (1M rows)** | 100 - 1000 ms | 100 - 1000 ms | 10 - 100 ms | 100 - 1000 ms | N/A | 1 - 10 s |
+| **Network Overhead** | Moderate | Moderate | None (local) | Moderate | Low | None (local) |
+| **Concurrency Impact** | Low (MVCC) | Low (MVCC) | High (single writer) | Low (MVCC) | None (single-threaded) | Low (read-only) |
+| **Cache Hit Rate** | High (buffer pool) | High (buffer pool) | High (OS cache) | High (WiredTiger cache) | 100% (in-memory) | High (OS cache) |
+| **Best For** | Balanced read/write | Balanced read/write | Low-latency local reads | Flexible document reads | Ultra-low-latency reads | Analytical queries |
+
+*Redis offers the lowest latency for simple operations due to its in-memory nature. SQLite is fast for local reads but limited by single-writer concurrency. PostgreSQL, MySQL, and MongoDB provide balanced performance for general workloads, while DuckDB is optimized for analytical queries.*
+
+### Storage Limits
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Max Database Size** | 32 TB | 48 TB | 281 TB | 16 TB | 512 GB (in-memory) | 281 TB |
+| **Max Table Size** | 32 TB | 48 TB | 281 TB | 16 TB | N/A | 281 TB |
+| **Max Row Size** | 1.6 GB | 1 GB | 1 GB | 16 MB | N/A | 1.6 GB |
+| **Max Index Size** | 32 TB | 48 TB | 281 TB | 16 TB | N/A | 281 TB |
+| **Max Connections** | Configurable | Configurable | 1 (writer) | Configurable | Configurable | Configurable |
+| **File System Limit** | Depends on FS | Depends on FS | Depends on FS | Depends on FS | N/A | Depends on FS |
+| **Compression** | Yes (TOAST) | Yes (InnoDB) | No | Yes (WiredTiger) | No | Yes (columnar) |
+| **Best For** | Large relational data | Large relational data | Large local files | Large document collections | In-memory data | Large analytical datasets |
+
+*PostgreSQL, MySQL, and SQLite have high storage limits suitable for large datasets. MongoDB and Redis have lower limits due to their document and in-memory nature, respectively. DuckDB is optimized for large analytical datasets with columnar compression.*
+
+### Client Libraries per Language
+
+| Feature | PostgreSQL | MySQL | SQLite | MongoDB | Redis | DuckDB |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Python** | psycopg2, asyncpg | mysql-connector-python, PyMySQL | sqlite3 (built-in) | pymongo | redis-py | duckdb |
+| **JavaScript/Node.js** | pg, node-postgres | mysql2, mysql | better-sqlite3 | mongodb | ioredis | duckdb |
+| **Java** | JDBC (postgresql) | JDBC (mysql) | JDBC (sqlite) | MongoDB Driver | Jedis, Lettuce | JDBC (duckdb) |
+| **Go** | lib/pq, pgx | go-sql-driver/mysql | mattn/go-sqlite3 | mongo-go-driver | go-redis | duckdb-go |
+| **Rust** | tokio-postgres, diesel | mysql_async, sqlx | rusqlite | mongodb | redis | duckdb-rs |
+| **C/C++** | libpq | libmysqlclient | sqlite3 | C++ Driver | hiredis | duckdb C API |
+| **Ruby** | pg | mysql2 | sqlite3 | mongo-ruby-driver | redis-rb | duckdb-ruby |
+| **PHP** | PDO (pgsql) | PDO (mysql) | PDO (sqlite) | mongodb | phpredis | duckdb-php |
+
+*All databases have mature client libraries for major programming languages. PostgreSQL and MySQL have the most extensive ecosystem, while SQLite and DuckDB benefit from built-in or lightweight libraries. MongoDB and Redis have well-supported drivers for their respective use cases.*
+
+## Recommendation List
+
+1.  **PostgreSQL**: Best for most small engineering teams needing a robust, feature-rich relational database with strong JSON support and ACID compliance.
+2.  **SQLite**: Ideal for embedded applications, local development, or small-scale projects where simplicity and low resource usage are priorities.
+3.  **DuckDB**: Perfect for analytical workloads, data science, or processing large datasets locally without a dedicated database server.
+4.  **Redis**: Use for caching, session storage, or real-time data where ultra-low latency is critical.
+5.  **MongoDB**: Suitable for flexible, unstructured data or when schema evolution is frequent, but be mindful of the SSPL license for SaaS products.
+6.  **MySQL**: A solid choice for web applications, especially if you are already in the MySQL ecosystem or need compatibility with existing tools.

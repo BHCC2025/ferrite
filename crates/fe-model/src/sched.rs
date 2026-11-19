@@ -137,7 +137,7 @@ pub fn tree_walk(toks: &[u32], par: &[i32], am: &[u32]) -> (Vec<usize>, u32) {
 pub type DrafterFactory = Arc<dyn Fn(&Engine, &SchedOptions) -> Result<Box<dyn Drafter>> + Send + Sync>;
 
 /// Same meaning as fe_server::engine::SamplingParams.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sampling {
     pub max_tokens: usize,
     pub min_tokens: usize,
@@ -179,8 +179,35 @@ pub enum Event {
     Finished { reason: Finish, cached_prompt_tokens: usize },
 }
 
+/// What a request's guard asks for after an accepted token.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GuardAct {
+    None,
+    /// the engine writes this token itself as the next one (the end of the reasoning block); the model goes on after it
+    Force(u32),
+    /// end the request here (finish reason Length)
+    End,
+    /// the tokens after this one are drawn with this sampling (reasoning -> answer, a boosted stretch and its end)
+    Sampling(Box<Sampling>),
+}
+
+/// Per-request protections (the server's reasoning cap and loop breaker). The scheduler feeds it every token the
+/// client gets, one at a time and in order, ACCEPTED tokens only (drafts that were verified, the engine's own forced
+/// token included), and acts at exactly the token where it answers: tokens a verify accepted past that point are
+/// given back (the verify keeps fewer rows), so what a guard does never depends on how many rows a step verified,
+/// and a request whose guard never acts gets the tokens it would get without one. Drafting stays on throughout: a
+/// forced token is absorbed by the drafter like any other kept row.
+pub trait Guard: Send {
+    fn feed(&mut self, tok: u32) -> GuardAct;
+}
+
 pub struct Request {
     pub id: String,
+    /// protections fed with the accepted tokens (None: none)
+    pub guard: Option<Box<dyn Guard>>,
+    /// constrained opening: the reply starts with one of these token sequences, chosen token by token from the
+    /// model's logits among the candidates still possible (tool_choice required with several functions); empty: free
+    pub prefix_choices: Vec<Vec<u32>>,
     pub prompt_ids: Vec<u32>,
     /// snapshot points: ascending positions in prompt_ids where the prompt cache keeps a resumable state (the
     /// server's chat-template boundaries: each reply start, the end of the shared system prompt); empty: none
@@ -352,6 +379,85 @@ struct Active {
     t0: Instant,
     /// seconds from admission to the first token
     ttft: Option<f64>,
+    /// a token the engine writes itself as the next one (GuardAct::Force)
+    force: Option<u32>,
+    /// constrained opening still running: (tokens of it written, the candidates that match them; all longer)
+    opening: Option<(usize, Vec<Vec<u32>>)>,
+}
+
+impl Active {
+    /// The next token is not the model's free choice (a forced token, a constrained opening): this step it decodes
+    /// one plain row, without drafts.
+    fn special(&self) -> bool {
+        self.force.is_some() || self.opening.is_some()
+    }
+    /// The tokens a constrained opening allows next.
+    fn opening_cands(&self) -> Option<Vec<u32>> {
+        self.opening.as_ref().map(|(d, c)| c.iter().map(|s| s[*d]).collect())
+    }
+    fn opening_step(&mut self, t: u32) {
+        if let Some((d, c)) = self.opening.as_mut() {
+            c.retain(|s| s[*d] == t);
+            *d += 1;
+            if c.is_empty() || c.iter().any(|s| s.len() == *d) {
+                self.opening = None;
+            }
+        }
+    }
+}
+
+/// bf16 bits of -infinity (a masked logit).
+const BF16_NEG_INF: u16 = 0xff80;
+
+/// No infinity or NaN in a bf16 logit row (all exponent bits set).
+fn row_finite(row: &[u16]) -> bool {
+    !row.iter().any(|&h| h & 0x7f80 == 0x7f80)
+}
+
+/// Mask a host logit row: only the tokens of `only` stay (when given), the tokens of `ban` go.
+fn mask_row(row: &mut [u16], only: Option<&[u32]>, ban: &[u32]) {
+    if let Some(c) = only {
+        let keep: Vec<(usize, u16)> = c.iter().filter(|&&t| (t as usize) < row.len()).map(|&t| (t as usize, row[t as usize])).collect();
+        row.fill(BF16_NEG_INF);
+        for (i, x) in keep {
+            row[i] = x;
+        }
+    }
+    for &t in ban {
+        if let Some(x) = row.get_mut(t as usize) {
+            *x = BF16_NEG_INF;
+        }
+    }
+}
+
+/// The first largest logit of a host row.
+fn argmax_row(row: &[u16]) -> u32 {
+    row.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &h)| {
+        let x = f32::from_bits((h as u32) << 16);
+        if x > b.1 { (i, x) } else { b }
+    }).0 as u32
+}
+
+/// What a guard asked for, applied after its token went out; true: the request ends here.
+fn apply_act(a: &mut Active, act: GuardAct, copy_hi: usize) -> bool {
+    match act {
+        GuardAct::None => false,
+        GuardAct::End => true,
+        GuardAct::Force(t) => {
+            a.force = Some(t);
+            false
+        }
+        GuardAct::Sampling(s) => {
+            a.req.sampling = *s;
+            // copy rows are for greedy streams (verified as trees)
+            if !a.req.sampling.greedy() {
+                a.copier = None;
+            } else if a.copier.is_none() && copy_hi > 0 {
+                a.copier = Some(crate::copy::Copier::new(COPY_LO, copy_hi));
+            }
+            false
+        }
+    }
 }
 
 /// Milliseconds since the Unix epoch (the step watchdog's clock).
@@ -443,6 +549,15 @@ struct Worker {
     lead_min: usize,
     /// FE_CACHE_TRACE: the queued requests whose wait for a shared prefix was already logged
     wait_said: std::collections::HashSet<String>,
+    /// one host logit row for the picks that need it on a greedy stream (first-token stop ban, constrained opening)
+    scratch: Vec<u16>,
+    /// FE_FINITE_CHECK (default 1): a pick from a logit row that holds an infinity or a NaN ends its request with an
+    /// error instead (sampled rows are scanned on the host; a greedy row never comes to the host: the value at the
+    /// argmax of the row whose token no draft vouches for is read back, one bf16 a stream a step)
+    finite: bool,
+    /// picks so far, and FE_TEST_NONFINITE=n: pick n counts as non-finite (tests the path)
+    picks: u64,
+    test_nonfinite: Option<u64>,
 }
 
 /// FE_COPY_ROWS (default 0 = off): the most copy rows a greedy DFlash2 stream verifies (crate::copy). A copy starts
@@ -652,6 +767,10 @@ impl Worker {
             prefix_max: std::env::var("FE_PREFIX_ENTRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
             lead_min: lead_min(),
             wait_said: std::collections::HashSet::new(),
+            scratch: Vec::new(),
+            finite: std::env::var("FE_FINITE_CHECK").map(|v| v != "0").unwrap_or(true),
+            picks: 0,
+            test_nonfinite: std::env::var("FE_TEST_NONFINITE").ok().and_then(|v| v.parse().ok()),
             o }
     }
 
@@ -940,9 +1059,11 @@ impl Worker {
             // the chunked GDN grid restarts at each cut, so a cut taken in one mode and not in another changes the bits
             let cuts = cut_points(&req, self.tailcut);
             let cap = if wide { self.o.pool_ctx() } else { self.o.max_ctx };
+            let cands: Vec<Vec<u32>> = req.prefix_choices.iter().filter(|c| !c.is_empty()).cloned().collect();
+            let opening = (!cands.is_empty()).then_some((0, cands));
             self.active.push(Active { req, sink, slot, cap, fed: cached, cached, cuts, share: Vec::new(), out: Vec::new(), pending: None,
                 drafts: Vec::new(), tree: None, copier, copied: (0, 0), out_idx: 0, depth, acc_ema: depth as f32, rounds: 0,
-                accepted: 0, rng: seed | 1, t0: Instant::now(), ttft: None });
+                accepted: 0, rng: seed | 1, t0: Instant::now(), ttft: None, force: None, opening });
         }
     }
 
@@ -961,6 +1082,16 @@ impl Worker {
             return Ok(());
         }
         let spec = self.spec > 0;
+        // a stream whose next token is forced or constrained decodes one plain row this step (the draft drawn after
+        // its last step is dropped; the step's kept row is absorbed as always, so drafting goes on right after)
+        for a in self.active.iter_mut().filter(|a| a.pending.is_some() && a.special()) {
+            a.drafts.clear();
+            a.tree = None;
+            a.copied = (0, 0);
+        }
+        // copy rows a stream may be given when a guard switches it to greedy sampling (0: none in this configuration)
+        let copy_hi = if self.copy > 0 && ((self.tree && self.df.is_some()) || (self.df.is_none() && self.e.has_mtp())) {
+            self.copy.max(COPY_LO) } else { 0 };
         // FE_SCHED_PROF=2: this step's phases (from the totals) and per decode stream (rows, accepted, nodes, slot)
         let t_before = self.prof.map(|p| p.0);
         let mut trace: Vec<(usize, usize, Vec<usize>, usize, (usize, usize))> = Vec::new();
@@ -1001,7 +1132,7 @@ impl Worker {
                 else { (self.verify_rows as f32 / wsum).min(1.0) };
             // copy rows: a lone stream whose copies keep landing whole verifies its copy alone, without drafting
             if self.copy > 0 && ndec_now == 1 {
-                for a in self.active.iter_mut().filter(|a| a.pending.is_some()) {
+                for a in self.active.iter_mut().filter(|a| a.pending.is_some() && !a.special()) {
                     let Some(c) = a.copier.as_mut() else { continue };
                     if c.extra <= COPY_LO {
                         continue;
@@ -1023,7 +1154,7 @@ impl Worker {
             let df = self.df.as_mut().unwrap();
             // (active index, slot, anchor, pos, cap, tree budget) of every stream that drafts this step
             let mut want = Vec::new();
-            for (ai, a) in self.active.iter().enumerate().filter(|(_, a)| a.copied.1 == 0) {
+            for (ai, a) in self.active.iter().enumerate().filter(|(_, a)| a.copied.1 == 0 && !a.special()) {
                 if let Some(t) = a.pending {
                     let rows = ((want_rows(a) * scale) as usize).max(2);
                     let cap = (rows - 1).min(self.spec);
@@ -1116,7 +1247,7 @@ impl Worker {
             // copy rows: a lone stream whose copies keep landing whole verifies its copy alone as one chain, without
             // chaining MTP drafts (as with the block drafter)
             if self.copy > 0 && ndec_now == 1 {
-                for a in self.active.iter_mut().filter(|a| a.pending.is_some()) {
+                for a in self.active.iter_mut().filter(|a| a.pending.is_some() && !a.special()) {
                     let Some(c) = a.copier.as_mut() else { continue };
                     if c.extra <= COPY_LO {
                         continue;
@@ -1167,6 +1298,9 @@ impl Worker {
                 let mut total: usize = self.active.iter().filter(|a| a.pending.is_some()).map(|a| 1 + a.drafts.len()).sum();
                 let mut left = self.verify_rows.saturating_sub(total);
                 for a in self.active.iter_mut() {
+                    if a.special() {
+                        continue;
+                    }
                     let (Some(c), Some(t)) = (a.copier.as_mut(), a.pending) else { continue };
                     if a.copied.1 > 0 {
                         continue;
@@ -1363,13 +1497,44 @@ impl Worker {
                 }
                 let complete = a.fed == a.req.prompt_ids.len();
                 let mut first = None;
+                let mut bad = false;
                 if complete {
                     let li = lr_first[si];
                     let hi = host_row[si];
-                    let t = if a.req.sampling.greedy() { am[li] } else {
-                        sample(&self.host[hi * v..(hi + 1) * v], &a.req.sampling, &a.req.prompt_ids, &a.out, &mut a.rng)
+                    // the first token of a reply is never a stop token (an empty reply is never wanted): the best other
+                    // one; a constrained opening picks among its candidates
+                    let cands = a.opening_cands();
+                    let t = if a.req.sampling.greedy() {
+                        let t = am[li];
+                        if cands.is_some() || a.req.sampling.stop_token_ids.contains(&t) {
+                            self.scratch.resize(v, 0);
+                            self.e.logits_host_rows(li, 1, &mut self.scratch)?;
+                            bad = self.finite && !row_finite(&self.scratch);
+                            mask_row(&mut self.scratch, cands.as_deref(), &a.req.sampling.stop_token_ids);
+                            argmax_row(&self.scratch)
+                        } else {
+                            if self.finite {
+                                bad = self.e.logit_bits(li, t)? & 0x7f80 == 0x7f80;
+                            }
+                            t
+                        }
+                    } else {
+                        let row = &mut self.host[hi * v..(hi + 1) * v];
+                        bad = self.finite && !row_finite(row);
+                        mask_row(row, cands.as_deref(), &a.req.sampling.stop_token_ids);
+                        let t = sample(row, &a.req.sampling, &a.req.prompt_ids, &a.out, &mut a.rng);
+                        // (a draw can only land on a masked token through rounding at the tail)
+                        if row[t as usize] == BF16_NEG_INF { argmax_row(row) } else { t }
                     };
-                    first = Some(t);
+                    self.picks += 1;
+                    bad |= self.test_nonfinite == Some(self.picks);
+                    if bad {
+                        eprintln!("ferrite: {}: non-finite logits for the first output token: ending the request", a.req.id);
+                        done.push((ai, Finish::Error("the model produced non-finite logits".into())));
+                    } else {
+                        a.opening_step(t);
+                        first = Some(t);
+                    }
                 }
                 if spec {
                     let p = &a.req.prompt_ids;
@@ -1378,12 +1543,18 @@ impl Worker {
                         let token = if pos + 1 < p.len() { p[pos + 1] } else { first.unwrap_or(0) };
                         MtpRow { slot: a.slot, pos, token, src: MtpSrc::Tap(r0 + i) }
                     }).collect();
-                    absorb.push((ai, rows, complete));
+                    absorb.push((ai, rows, complete && !bad));
                 }
                 if let Some(t) = first {
+                    let act = Self::guard_scan(a, &[t]).map_or(GuardAct::None, |x| x.1);
                     match Self::emit(a, &[t], self.e.slot_len[a.slot], a.cap) {
                         Some(f) => done.push((ai, f)),
-                        None => a.pending = Some(t),
+                        None => {
+                            a.pending = Some(t);
+                            if apply_act(a, act, copy_hi) {
+                                done.push((ai, Finish::Length));
+                            }
+                        }
                     }
                 }
                 continue;
@@ -1394,7 +1565,32 @@ impl Worker {
             let mut emitted: Vec<u32> = Vec::new();
             let mut acc = 0;
             let mut path = None;
-            if let Some(par) = a.tree.take() {
+            let mut bad = false;
+            let forced = a.force.take();
+            let cands = if forced.is_none() { a.opening_cands() } else { None };
+            let free = forced.is_none() && cands.is_none();
+            if let Some(f) = forced {
+                // the engine's own token (the end of the reasoning block): this row's logits are not used
+                emitted.push(f);
+            } else if let Some(c) = cands {
+                // constrained opening: the best (sampled request: a drawn) candidate
+                let t = if a.req.sampling.greedy() {
+                    self.scratch.resize(v, 0);
+                    self.e.logits_host_rows(li, 1, &mut self.scratch)?;
+                    bad = self.finite && !row_finite(&self.scratch);
+                    mask_row(&mut self.scratch, Some(&c), &[]);
+                    argmax_row(&self.scratch)
+                } else {
+                    let hi = host_row[si];
+                    let row = &mut self.host[hi * v..(hi + 1) * v];
+                    bad = self.finite && !row_finite(row);
+                    mask_row(row, Some(&c), &[]);
+                    let t = sample(row, &a.req.sampling, &a.req.prompt_ids, &a.out, &mut a.rng);
+                    if row[t as usize] == BF16_NEG_INF { argmax_row(row) } else { t }
+                };
+                a.opening_step(t);
+                emitted.push(t);
+            } else if let Some(par) = a.tree.take() {
                 // tree verify (greedy only): walk from the root, then the kept rows become consecutive rows
                 let (p, bonus) = tree_walk(&sg.1, &par, &am[li..li + n]);
                 acc = p.len() - 1;
@@ -1410,6 +1606,7 @@ impl Worker {
             } else {
                 // speculative sampling with deterministic drafts: accept d with prob p(d), else sample p without d
                 let hi = host_row[si];
+                bad = self.finite && (0..n).any(|j| !row_finite(&self.host[(hi + j) * v..(hi + j + 1) * v]));
                 let mut hist_out = a.out.clone();
                 let mut bonus = None;
                 for (j, &d) in drafts.iter().enumerate() {
@@ -1434,6 +1631,37 @@ impl Worker {
                     }
                 };
                 emitted.push(b);
+            }
+            // finite check of a greedy pick (its rows never come to the host): the logit at the argmax of the row
+            // whose token no draft vouches for
+            if self.finite && free && a.req.sampling.greedy() {
+                let brow = path.as_ref().map_or(acc, |p: &Vec<usize>| *p.last().unwrap());
+                bad = self.e.logit_bits(li + brow, *emitted.last().unwrap())? & 0x7f80 == 0x7f80;
+            }
+            self.picks += 1;
+            bad |= self.test_nonfinite == Some(self.picks);
+            if bad {
+                // never sample garbage: keep the fed row only (a consistent slot) and end the request below
+                eprintln!("ferrite: {}: non-finite logits at output token {}: ending the request", a.req.id, a.out.len());
+                acc = 0;
+                emitted.truncate(1);
+                if let Some(p) = path.as_mut() {
+                    p.truncate(1);
+                }
+            }
+            // the guard sees the tokens the client will get, one at a time; where it acts the rest is given back
+            let mut act = GuardAct::None;
+            if !bad {
+                if let Some((keep, g)) = Self::guard_scan(a, &emitted) {
+                    if keep < emitted.len() {
+                        emitted.truncate(keep);
+                        acc = keep - 1;
+                        if let Some(p) = path.as_mut() {
+                            p.truncate(keep);
+                        }
+                    }
+                    act = g;
+                }
             }
             lap(&mut self.prof, 4);
             match &path {
@@ -1477,9 +1705,18 @@ impl Worker {
                 absorb.push((ai, rows, true));
             }
             let slot_len = self.e.slot_len[a.slot];
+            if bad {
+                done.push((ai, Finish::Error("the model produced non-finite logits".into())));
+                continue;
+            }
             match Self::emit(a, &emitted, slot_len, a.cap) {
                 Some(f) => done.push((ai, f)),
-                None => a.pending = emitted.last().copied(),
+                None => {
+                    a.pending = emitted.last().copied();
+                    if apply_act(a, act, copy_hi) {
+                        done.push((ai, Finish::Length));
+                    }
+                }
             }
         }
         // 4a. external drafter: absorb the kept rows (their feature taps) per stream
@@ -1570,6 +1807,27 @@ impl Worker {
             self.finish(a, f);
         }
         Ok(())
+    }
+
+    /// Feed the request's guard the tokens of `toks` the client will get (as emit: up to a stop token or the token
+    /// limit), one at a time; Some((tokens to keep, what it asks for)) when it acts.
+    fn guard_scan(a: &mut Active, toks: &[u32]) -> Option<(usize, GuardAct)> {
+        let g = a.req.guard.as_mut()?;
+        let sp = &a.req.sampling;
+        for (i, &t) in toks.iter().enumerate() {
+            let n = a.out.len() + i;
+            if sp.stop_token_ids.contains(&t) && n >= sp.min_tokens {
+                return None;
+            }
+            let act = g.feed(t);
+            if act != GuardAct::None {
+                return Some((i + 1, act));
+            }
+            if n + 1 >= sp.max_tokens {
+                return None;
+            }
+        }
+        None
     }
 
     /// Deliver sampled tokens in order; returns the finish reason if the request ends on one of them.
@@ -1785,6 +2043,8 @@ impl Worker {
             *t = [0.0; 5];
             *n = 0;
         }
+        // (an engine error: the slot's state is not trusted as a prompt cache)
+        let bad = matches!(reason, Finish::Error(_));
         (a.sink)(Event::Finished { reason, cached_prompt_tokens: a.cached });
         self.slot_busy[a.slot] = false;
         // the slot keeps prompt + generated (minus an unfed last token) as its prompt cache
@@ -1793,7 +2053,7 @@ impl Worker {
         if group {
             self.e.group_abort();
         }
-        if group || self.slot_tokens[a.slot].len() != self.e.slot_len[a.slot] {
+        if group || bad || self.slot_tokens[a.slot].len() != self.e.slot_len[a.slot] {
             self.slot_tokens[a.slot].clear();
             let b: Vec<usize> = self.slot_snaps[a.slot].drain(..).map(|x| x.blk).collect();
             self.blocks.release(b);
@@ -2088,5 +2348,133 @@ mod prompt_cut_tests {
         // segments without logit rows (mid-prompt chunks) get none, even when sampled
         let (rows, n) = super::sampled_host_rows(&[0, 0, 1], 1, &[true, true, true]);
         assert_eq!((rows, n), (vec![usize::MAX, 0, usize::MAX], 1));
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn active(sp: Sampling, guard: Option<Box<dyn Guard>>, choices: Vec<Vec<u32>>) -> Active {
+        let req = Request { id: "t".into(), guard, prefix_choices: choices.clone(), prompt_ids: vec![1, 2, 3], snapshots: Vec::new(), sampling: sp,
+            cancel: Arc::new(AtomicBool::new(false)) };
+        let opening = (!choices.is_empty()).then_some((0, choices));
+        Active { req, sink: Box::new(|_| true), slot: 0, cap: 1000, fed: 3, cached: 0, cuts: Vec::new(), share: Vec::new(), out: Vec::new(),
+            pending: None, drafts: Vec::new(), tree: None, copier: None, copied: (0, 0), out_idx: 0, depth: 4, acc_ema: 4.0, rounds: 0, accepted: 0,
+            rng: 1, t0: Instant::now(), ttft: None, force: None, opening }
+    }
+
+    /// Counts what it is fed and acts at the n-th token.
+    struct At(Arc<AtomicUsize>, usize, GuardAct);
+    impl Guard for At {
+        fn feed(&mut self, _t: u32) -> GuardAct {
+            let n = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == self.1 { self.2.clone() } else { GuardAct::None }
+        }
+    }
+
+    fn bits(x: f32) -> u16 {
+        (x.to_bits() >> 16) as u16
+    }
+
+    #[test]
+    fn the_guard_sees_exactly_the_tokens_that_go_out() {
+        let fed = Arc::new(AtomicUsize::new(0));
+        let sp = Sampling { max_tokens: 100, stop_token_ids: vec![9], ..Default::default() };
+        // no action: every token up to the stop token is fed, none after it
+        let mut a = active(sp.clone(), Some(Box::new(At(fed.clone(), 99, GuardAct::End))), Vec::new());
+        assert_eq!(Worker::guard_scan(&mut a, &[5, 6, 9, 7, 8]), None);
+        assert_eq!(fed.load(Ordering::Relaxed), 2);
+        // an action at the third token of a five-token verify: three tokens are kept, the rest is given back
+        let fed = Arc::new(AtomicUsize::new(0));
+        let mut a = active(sp.clone(), Some(Box::new(At(fed.clone(), 3, GuardAct::Force(42)))), Vec::new());
+        assert_eq!(Worker::guard_scan(&mut a, &[5, 6, 7, 8, 5]), Some((3, GuardAct::Force(42))));
+        assert_eq!(fed.load(Ordering::Relaxed), 3);
+        // the token limit: tokens past it never reach the guard
+        let fed = Arc::new(AtomicUsize::new(0));
+        let mut a = active(Sampling { max_tokens: 2, ..sp.clone() }, Some(Box::new(At(fed.clone(), 3, GuardAct::End))), Vec::new());
+        assert_eq!(Worker::guard_scan(&mut a, &[5, 6, 7, 8]), None);
+        assert_eq!(fed.load(Ordering::Relaxed), 2);
+        // min_tokens: a stop token before it is content and is fed
+        let fed = Arc::new(AtomicUsize::new(0));
+        let mut a = active(Sampling { min_tokens: 2, ..sp.clone() }, Some(Box::new(At(fed.clone(), 99, GuardAct::End))), Vec::new());
+        assert_eq!(Worker::guard_scan(&mut a, &[9, 5, 9, 6]), None);
+        assert_eq!(fed.load(Ordering::Relaxed), 2);
+        // no guard: nothing to do
+        let mut a = active(sp, None, Vec::new());
+        assert_eq!(Worker::guard_scan(&mut a, &[5, 6]), None);
+    }
+
+    #[test]
+    fn guard_actions() {
+        let greedy = Sampling::default();
+        let sampled = Sampling { temperature: 0.7, ..Default::default() };
+        let mut a = active(greedy.clone(), None, Vec::new());
+        assert!(!a.special());
+        assert!(!apply_act(&mut a, GuardAct::None, 47));
+        assert!(apply_act(&mut a, GuardAct::End, 47));
+        // a forced token: the next step is a plain row
+        assert!(!apply_act(&mut a, GuardAct::Force(7), 47));
+        assert!(a.special() && a.force == Some(7));
+        // a switch to sampling drops the copy rows, a switch back to greedy brings them back (where the configuration has them)
+        a.copier = Some(crate::copy::Copier::new(COPY_LO, 47));
+        assert!(!apply_act(&mut a, GuardAct::Sampling(Box::new(sampled.clone())), 47));
+        assert!(a.copier.is_none() && a.req.sampling == sampled);
+        assert!(!apply_act(&mut a, GuardAct::Sampling(Box::new(greedy.clone())), 47));
+        assert!(a.copier.is_some() && a.req.sampling == greedy);
+        a.copier = None;
+        apply_act(&mut a, GuardAct::Sampling(Box::new(greedy)), 0);
+        assert!(a.copier.is_none());
+    }
+
+    #[test]
+    fn a_constrained_opening_narrows_to_one_candidate() {
+        let mut a = active(Sampling::default(), None, vec![vec![1, 2, 3], vec![1, 4], vec![5, 6]]);
+        assert!(a.special());
+        assert_eq!(a.opening_cands(), Some(vec![1, 1, 5]));
+        a.opening_step(1);
+        assert_eq!(a.opening_cands(), Some(vec![2, 4]));
+        a.opening_step(2);
+        assert_eq!(a.opening_cands(), Some(vec![3]));
+        a.opening_step(3);
+        assert!(a.opening.is_none() && !a.special());
+        // a candidate that is complete ends the opening at once
+        let mut a = active(Sampling::default(), None, vec![vec![1, 2, 3], vec![1, 4]]);
+        a.opening_step(1);
+        a.opening_step(4);
+        assert!(a.opening.is_none());
+    }
+
+    #[test]
+    fn host_row_helpers() {
+        let mut row: Vec<u16> = [0.5f32, 3.0, -1.0, 2.0, 7.0].iter().map(|&x| bits(x)).collect();
+        assert!(row_finite(&row));
+        assert_eq!(argmax_row(&row), 4);
+        // the first-token stop ban: the best other token
+        let mut r = row.clone();
+        mask_row(&mut r, None, &[4]);
+        assert_eq!(argmax_row(&r), 1);
+        // a constrained pick: only the candidates, the ban on top
+        let mut r = row.clone();
+        mask_row(&mut r, Some(&[0, 2, 3]), &[3]);
+        assert_eq!(argmax_row(&r), 0);
+        assert_eq!(r[1], BF16_NEG_INF);
+        // sampling from a masked row never returns a masked token
+        let sp = Sampling { temperature: 1.0, top_k: 20, top_p: 0.95, ..Default::default() };
+        let mut r = row.clone();
+        mask_row(&mut r, Some(&[2, 3]), &[]);
+        let mut rng = 1u64;
+        for _ in 0..200 {
+            let t = sample(&r, &sp, &[], &[], &mut rng);
+            assert!(t == 2 || t == 3, "{t}");
+        }
+        // an infinity or a NaN anywhere fails the finite check
+        row[2] = bits(f32::NAN);
+        assert!(!row_finite(&row));
+        row[2] = bits(f32::INFINITY);
+        assert!(!row_finite(&row));
+        row[2] = BF16_NEG_INF;
+        assert!(!row_finite(&row));
     }
 }

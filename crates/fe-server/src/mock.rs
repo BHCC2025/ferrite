@@ -70,7 +70,7 @@ impl Engine for MockEngine {
 fn run(tok: &Tok, cfg: &MockConfig, req: GenRequest, sink: TokenSink) {
     let p = &req.params;
     let cached = cfg.cached_prompt_tokens.min(req.prompt_ids.len().saturating_sub(1));
-    let done = |reason: FinishReason| Finish { reason, cached_prompt_tokens: cached, timings: None };
+    let done = |reason: FinishReason| Finish { reason, cached_prompt_tokens: cached, timings: None, events: Default::default() };
     let prompt = match tok.decode(&req.prompt_ids, false) {
         Ok(s) => s,
         Err(e) => return sink.finish(done(FinishReason::Error(format!("mock: {e}")))),
@@ -97,6 +97,16 @@ fn run(tok: &Tok, cfg: &MockConfig, req: GenRequest, sink: TokenSink) {
     // the "eos" this mock samples once the canned text is done
     let eos = p.stop_token_ids.first().copied();
     let mut pending: std::collections::VecDeque<u32> = canned.into();
+    // the protections, as the real engines apply them: the tracker sees every token that goes out; when it closes the reasoning
+    // block the rest of the canned reasoning is dropped and the block's end token written, when it ends the request the mock stops
+    let mut phase = (p.think_end.is_some() || p.loop_breaker).then(|| crate::loopdet::PhaseTracker::new(p));
+    let finish = |reason: FinishReason, phase: &Option<crate::loopdet::PhaseTracker>| {
+        let mut f = done(reason);
+        if let Some(tr) = phase {
+            f.events = tr.events.clone();
+        }
+        f
+    };
     let mut filler_line = 0usize;
     let mut generated = 0usize;
     loop {
@@ -133,24 +143,62 @@ fn run(tok: &Tok, cfg: &MockConfig, req: GenRequest, sink: TokenSink) {
         if !cfg.delay.is_zero() {
             std::thread::sleep(cfg.delay);
         }
+        // the tracker acts at the token where it fires: the rest of the step is given back
+        let mut trig = crate::loopdet::Trig::None;
+        if let Some(tr) = phase.as_mut() {
+            for i in 0..step.len() {
+                trig = tr.feed(&step[i..i + 1]);
+                if trig != crate::loopdet::Trig::None {
+                    for &t in step[i + 1..].iter().rev() {
+                        pending.push_front(t);
+                    }
+                    step.truncate(i + 1);
+                    stop = None;
+                    break;
+                }
+            }
+        }
         generated += step.len();
         if !step.is_empty() && !sink.send_tokens(step) {
-            return sink.finish(done(FinishReason::Cancelled));
+            return sink.finish(finish(FinishReason::Cancelled, &phase));
+        }
+        match (trig, p.think_end) {
+            (crate::loopdet::Trig::EndLoop, _) | (crate::loopdet::Trig::Close, None) => return sink.finish(finish(FinishReason::Length, &phase)),
+            (crate::loopdet::Trig::Close, Some(te)) => {
+                // "the model answers": what the canned reply holds after its own end of the block
+                match pending.iter().position(|&t| t == te) {
+                    Some(i) => drop(pending.drain(..i)),
+                    None => pending.push_front(te),
+                }
+            }
+            _ => {}
         }
         if let Some(t) = stop {
-            return sink.finish(done(FinishReason::Stop(t)));
+            return sink.finish(finish(FinishReason::Stop(t), &phase));
         }
         if generated >= p.max_tokens {
-            return sink.finish(done(FinishReason::Length));
+            return sink.finish(finish(FinishReason::Length, &phase));
+        }
+        // `[[mock:stall]]` in the prompt: the engine goes silent after its first tokens (the watchdog's case)
+        if plan.stall {
+            while !(req.cancel.is_cancelled() || sink.is_closed()) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return sink.finish(finish(FinishReason::Cancelled, &phase));
         }
     }
 }
+
+/// A reasoning block that wanders: candidate lines tried and rejected in shifting order (`[[mock:wander]]` in the prompt).
+pub const WANDER: &str = include_str!("../tests/fixtures/wander_reasoning.txt");
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     pub text: String,
     /// Keep generating filler until max_tokens after `text`.
     pub long: bool,
+    /// Go silent after the first step (until cancelled).
+    pub stall: bool,
 }
 
 /// Choose the canned reply for a rendered prompt.
@@ -164,6 +212,7 @@ pub fn plan_response(prompt: &str) -> Plan {
         return Plan {
             text: format!(" and so the mock engine continues after \"{}\". Ünïcödé: 日本語 🦀.", tail.trim().replace('\n', " ")),
             long: wants_long(prompt),
+            stall: false,
         };
     }
     let thinking = prompt.ends_with("<think>\n");
@@ -181,7 +230,17 @@ pub fn plan_response(prompt: &str) -> Plan {
                 think("The tool answered; summarize its result for the user.")
             ),
             long: false,
+            stall: false,
         };
+    }
+
+    if user.contains("[[mock:wander]]") {
+        // thinking: the wandering block, then an answer; not thinking: the answer itself wanders (three times over)
+        let text = if thinking { format!("{WANDER}</think>\n\nThe closing line: \"The river keeps its silver secrets under stone.\"") } else { WANDER.repeat(3) };
+        return Plan { text, long: false, stall: false };
+    }
+    if user.contains("[[mock:stall]]") {
+        return Plan { text: think("Stalling.") + "First words", long: false, stall: true };
     }
 
     let lower = user.to_lowercase();
@@ -207,7 +266,7 @@ pub fn plan_response(prompt: &str) -> Plan {
             }
             text.push_str("</function>\n</tool_call>");
         }
-        return Plan { text, long: false };
+        return Plan { text, long: false, stall: false };
     }
 
     let reasoning = format!("The user wrote: \"{short}\". This is the mock engine, so I give my fixed reply.");
@@ -217,6 +276,7 @@ pub fn plan_response(prompt: &str) -> Plan {
             think(&reasoning)
         ) + if wants_long(&user) { "\n\n" } else { "" },
         long: wants_long(&user),
+        stall: false,
     }
 }
 

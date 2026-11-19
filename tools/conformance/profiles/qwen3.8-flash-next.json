@@ -1,0 +1,42 @@
+{
+ "model": "qwen3.8-flash-next",
+ "notes": "Qwen3.8-Flash-Next (GSQ-RCO Coder IQ1_M GGUF) on the Ferrite Flash-Next engine (--engine fnext), two RTX PRO 4000 Blackwell 24 GB in tensor parallel, four slots; Qwen XML tool-call format (<tool_call><function=..><parameter=..>), reasoning in reasoning_content. The server closes a reasoning block at 8192 tokens, has a loop breaker (exact cycles and repeated sentences), never returns a stop token first, and applies the model card's per-mode sampling to the fields a client omits (sampling_profiles below; reported in the x-sampling-effective response header); a client that sends temperature 0 gets no penalty from the profile (greedy_keeps_fast_path). Tool requests do not think by default.",
+ "tool_format": "qwen",
+ "thinking_default_with_tools": false,
+ "context": 131072,
+ "long_write_lines": [
+  1000,
+  2500
+ ],
+ "max_gap_s": 20,
+ "stop_prompts_max_fraction": 0.5,
+ "reasoning_cap_tokens": 8192,
+ "cold_prefill_tokens": [
+  8000,
+  48000
+ ],
+ "single_stream": false,
+ "stop_set_max_tokens": 4096,
+ "sampling_profiles": {
+  "thinking": {
+   "temperature": 1.0,
+   "top_p": 0.95,
+   "top_k": 20,
+   "min_p": 0.0,
+   "presence_penalty": 0.0,
+   "repetition_penalty": 1.0
+  },
+  "non_thinking": {
+   "temperature": 0.7,
+   "top_p": 0.8,
+   "top_k": 20,
+   "min_p": 0.0,
+   "presence_penalty": 1.5,
+   "repetition_penalty": 1.0
+  }
+ },
+ "greedy_keeps_fast_path": true,
+ "effective_sampling_header": "x-sampling-effective",
+ "wander_max_tokens": 8000,
+ "wander_stop_tokens": 3600
+}

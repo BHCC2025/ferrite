@@ -83,6 +83,12 @@ mkdir -p "$d/tools/bench"
 cp tools/bench/*.py tools/bench/*.sh tools/bench/README.md "$d/tools/bench/"
 [ -d tools/bench/data ] && cp -r tools/bench/data "$d/tools/bench/"
 cp docs/*.md "$d/docs/"
+[ -d docs/harness ] && cp -r docs/harness "$d/docs/"
+# the per-model sampling files the launchers fall back to (tools/launch-lib.sh, fl_sampling), at their path in the tree
+mkdir -p "$d/crates/fe-server" "$d/tools/conformance"
+cp crates/fe-server/sampling.*.json "$d/crates/fe-server/"
+cp tools/conformance/run.py tools/conformance/README.md "$d/tools/conformance/"
+cp -r tools/conformance/profiles tools/conformance/prompts "$d/tools/conformance/"
 [ -d docs/assets ] && cp -r docs/assets "$d/docs/"
 for f in README.md AGENTS.md CHANGELOG.md LICENSE NOTICE CREDITS.md NON-RUST.md TP2.md; do
   if [ -f "$f" ]; then cp "$f" "$d/"; else echo "package-release: warning: no $f in the repository root" >&2; fi

@@ -1,0 +1,10 @@
+{
+ "description": "Short general chat prompts (no system prompt in set a; set b adds the system prompt). Runaway = finish_reason length at the cap, or an empty answer.",
+ "system": "You are a helpful assistant. Answer briefly.",
+ "prompts": [
+  "Write a haiku about the sea.",
+  "Summarize the plot of Romeo and Juliet in three sentences.",
+  "Say hello in Japanese.",
+  "Translate good morning into French and Spanish."
+ ]
+}

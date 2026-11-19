@@ -710,7 +710,7 @@ fn cmd_sched_test(model: &Path, n: usize) -> Result<()> {
     for i in 0..n {
         let ids = tok.encode(prompts[i % prompts.len()], false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().to_vec();
         let tx = tx.clone();
-        sch.submit(Request { id: format!("req{i}"), prompt_ids: ids, snapshots: Vec::new(), sampling: Sampling { max_tokens: env_usize("FE_MAX_TOKENS", 48),
+        sch.submit(Request { id: format!("req{i}"), prompt_ids: ids, snapshots: Vec::new(), guard: None, prefix_choices: Vec::new(), sampling: Sampling { max_tokens: env_usize("FE_MAX_TOKENS", 48),
             stop_token_ids: vec![248044, 248046], ..Default::default() }, cancel: Default::default() },
             Box::new(move |ev| tx.send((i, ev)).is_ok()));
     }
@@ -746,7 +746,7 @@ fn sched_cache_test(sch: &fe_model::sched::Scheduler, tok: &tokenizers::Tokenize
         let (tx, rx) = std::sync::mpsc::channel::<(usize, Event)>();
         for (i, v) in ids.iter().enumerate() {
             let tx = tx.clone();
-            sch.submit(Request { id: format!("req{i}"), prompt_ids: v.clone(), snapshots: Vec::new(), sampling: Sampling { max_tokens: max,
+            sch.submit(Request { id: format!("req{i}"), prompt_ids: v.clone(), snapshots: Vec::new(), guard: None, prefix_choices: Vec::new(), sampling: Sampling { max_tokens: max,
                 stop_token_ids: vec![248044, 248046], ..Default::default() }, cancel: Default::default() },
                 Box::new(move |ev| tx.send((i, ev)).is_ok()));
         }

@@ -125,6 +125,59 @@ Measured 2026-11-15 with Ferrite 0.6.1 (`tools/bench/sweep.sh` on two Sparks; th
 
 (`tools/bench/agents.py --agents 4` on two Sparks, 2026-11-14.)
 
+## Recommended settings
+
+These are the base model's published settings. Ferrite's server applies them to the fields a request leaves out.
+
+| | Thinking | Non-thinking |
+|---|---|---|
+| temperature | 1.0 | 0.7 |
+| top_p | 0.95 | 0.80 |
+| top_k | 20 | 20 |
+| presence_penalty | 0 | 1.5 |
+| repetition_penalty | 1.0 | 1.0 |
+
+A value the client sends always wins, field by field. One exception to "leaves out": a request that sends
+`temperature: 0` gets no penalty added (below). The values a request ran with are returned in the
+`x-sampling-effective` response header.
+
+The server reads them from `sampling.json` in the model folder. Ferrite's copy for this model is
+`crates/fe-server/sampling.qwen3.8-27b.json`; `scripts/serve.sh` uses it when the folder has none, and
+`FE_SAMPLING_JSON=<file>` names another file.
+
+Notes from testing this quantization with a coding agent (one RTX PRO 4000 Blackwell 24 GB, one request at a time):
+
+- **Temperature 0 works.** Many coding harnesses send `temperature: 0`. In our runs that setting gave valid tool
+  calls and clean stops, and no loops in the loop tests.
+- **Temperature 0 stays on the fast path.** A request that sends `temperature: 0` is decoded greedily and gets no
+  penalty from the settings above: `presence_penalty` stays 0 unless the request sends one itself. Edits then run at
+  about 460 tok/s and code at about 180 on that card. A presence penalty sent together with `temperature: 0` still
+  applies and costs speed (edits about 155 tok/s); it did not change tool-call validity or edit accuracy in a small
+  test set. Requests that leave temperature out get the full non-thinking settings, penalty included.
+  `"greedy_keeps_fast_path": false` in `sampling.json` (or `FE_GREEDY_FAST_PATH=0`) turns this off.
+- **Reasoning is capped.** A reply still reasoning after 8,192 tokens has its thinking block closed by the server
+  and continues with the answer (`FE_MAX_REASONING_TOKENS`, 0 turns it off).
+- **Loops are cut short.** The server ends an exact repeating cycle, and a reply that keeps cycling through the
+  same sentences, without touching code blocks; tool-call arguments are held to a far stricter rule
+  (`FE_LOOP_BREAKER=0` turns it off, `FE_LOOP_RULES` holds the thresholds).
+- **Long writes can overshoot.** Asked for a file of about 2,500 lines in one call, the model wrote about 5,300.
+  Give long single-call writes room in `max_tokens`, or ask for the file in stages.
+
+The server's other protections and their switches:
+
+| Protection | Default | Switch |
+|---|---|---|
+| The first token of a reply is never a stop token | on | none |
+| `tool_choice` `required` / a named function is enforced, limited to the tools offered | on | none |
+| No token for 60 s after the first one ends the reply (`finish_reason: "length"`) | 60 s | `FE_NO_TOKEN_TIMEOUT` (seconds, 0 = off) |
+| Wall-clock limit of a reply | off | `FE_REPLY_WALL_LIMIT` (seconds) |
+| Non-finite logits end the request with an error instead of text | on | `FE_FINITE_CHECK=0` |
+| SSE keep-alive comment every 10 s of silence | on | none |
+| Request capture for replay | off | `FE_DUMP_REQUESTS=<dir>` |
+
+Harness settings that were tested end to end are in Ferrite's
+[docs/harness.md](https://github.com/BHCC2025/ferrite/blob/main/docs/harness.md).
+
 ## How to run
 
 **Ferrite** (DGX Spark). The full guide is in Ferrite's

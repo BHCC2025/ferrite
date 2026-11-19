@@ -3112,6 +3112,16 @@ impl Engine {
         Ok(v)
     }
 
+    /// One logit (bf16 bits) of row `row` of the last forward: the scheduler's finite check on rows that never come
+    /// to the host.
+    pub fn logit_bits(&self, row: usize, tok: u32) -> Result<u16> {
+        let v = self.cfg.vocab;
+        ensure!((row + 1) * v <= self.logits.len() && (tok as usize) < v, "logit_bits: row {row}, token {tok}");
+        let mut x = [0u16; 1];
+        fe_cuda::memcpy_dtoh(&mut x, self.logits.ptr().add::<u16>(row * v + tok as usize))?;
+        Ok(x[0])
+    }
+
     /// Copy logits rows [0, n) to host as bf16 bits.
     pub fn logits_host(&self, n: usize, dst: &mut [u16]) -> Result<()> {
         self.logits_host_rows(0, n, dst)

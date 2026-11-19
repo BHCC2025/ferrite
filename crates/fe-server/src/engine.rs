@@ -46,6 +46,25 @@ pub struct SamplingParams {
     /// When one is sampled the engine finishes with [`FinishReason::Stop`] and does NOT send it
     /// through [`TokenSink::send_tokens`].
     pub stop_token_ids: Vec<u32>,
+    /// Thinking-aware engines only: the id of `</think>`. Set when the prompt opens a reasoning block (the generation starts inside it).
+    pub think_end: Option<u32>,
+    /// Sampling used while inside the reasoning block (None = the request's own); the answer / tool call phase uses the fields above.
+    pub reasoning: Option<Box<SamplingParams>>,
+    /// Reasoning-token cap: at the cap the engine closes the block itself (`</think>`) and continues with the answer. 0 = no cap.
+    pub max_reasoning: usize,
+    /// Detect exact token cycles at the tail of the output (thresholds in `loop_rules`): in reasoning the block is closed, in the answer the
+    /// sampling is boosted once and the request ends cleanly if the cycle builds up again. Token sequences that open a tool call
+    /// (`call_marks`) switch to the far stricter call rule.
+    pub loop_breaker: bool,
+    /// Loop-breaker thresholds (crate::loopdet).
+    pub loop_rules: crate::loopdet::LoopCfg,
+    pub call_marks: Vec<Vec<u32>>,
+    /// The prompt already opened a tool call (tool_choice required / named: the call opener is part of the prompt): the loop breaker
+    /// starts with the tool-call rule.
+    pub call_open: bool,
+    /// Constrained opening: the reply must start with one of these token sequences (tool_choice required: `NAME>\n` of every offered
+    /// function, after the prefilled `<function=`). Engines that support it pick among them by the model's own logits; empty = free.
+    pub prefix_choices: Vec<Vec<u32>>,
 }
 
 impl Default for SamplingParams {
@@ -62,6 +81,14 @@ impl Default for SamplingParams {
             repetition_penalty: 1.0,
             seed: None,
             stop_token_ids: Vec::new(),
+            think_end: None,
+            reasoning: None,
+            max_reasoning: 0,
+            loop_breaker: false,
+            loop_rules: Default::default(),
+            call_marks: Vec::new(),
+            call_open: false,
+            prefix_choices: Vec::new(),
         }
     }
 }
@@ -125,11 +152,13 @@ pub struct Finish {
     pub cached_prompt_tokens: usize,
     /// Engine-side timings for the responses' llama-server-style `timings` object; None (the default) = no such key.
     pub timings: Option<Timings>,
+    /// What the thinking-aware engines' reasoning cap / loop breaker did (all zero for engines without them).
+    pub events: crate::loopdet::PhaseEvents,
 }
 
 impl Finish {
     pub fn new(reason: FinishReason) -> Self {
-        Self { reason, cached_prompt_tokens: 0, timings: None }
+        Self { reason, cached_prompt_tokens: 0, timings: None, events: Default::default() }
     }
 }
 

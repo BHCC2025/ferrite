@@ -75,10 +75,30 @@ impl StepModel for FeModel {
 pub mod sched {
     use std::path::Path;
 
+    use std::sync::{Arc, Mutex};
+
     use anyhow::Result;
-    use fe_model::sched::{Event, Finish as SFinish, Request, SchedOptions, Sampling, Scheduler};
+    use fe_model::sched::{Event, Finish as SFinish, Guard, GuardAct, Request, SchedOptions, Sampling, Scheduler};
 
     use crate::engine::{Engine, EngineInfo, Finish, FinishReason, GenRequest, SamplingParams, TokenSink};
+    use crate::guard::{Act, PhaseGuard};
+    use crate::loopdet::PhaseTracker;
+
+    /// The server's protections (crate::guard::PhaseGuard, the code every engine shares: reasoning cap, loop breaker,
+    /// repeated-sentence rule, the sampling of each phase) as the scheduler's guard. The tracker is shared with the
+    /// request's sink, which reports what fired.
+    struct SchedGuard(PhaseGuard<Sampling>);
+
+    impl Guard for SchedGuard {
+        fn feed(&mut self, t: u32) -> GuardAct {
+            match self.0.feed(t) {
+                Act::None => GuardAct::None,
+                Act::End => GuardAct::End,
+                Act::Force(t) => GuardAct::Force(t),
+                Act::Sampling(s) => GuardAct::Sampling(Box::new(s)),
+            }
+        }
+    }
 
     pub struct FerriteEngine(pub Scheduler);
 
@@ -90,7 +110,7 @@ pub mod sched {
         }
     }
 
-    fn sampling(p: SamplingParams) -> Sampling {
+    fn sampling(p: &SamplingParams) -> Sampling {
         Sampling {
             max_tokens: p.max_tokens,
             min_tokens: p.min_tokens,
@@ -102,7 +122,18 @@ pub mod sched {
             frequency_penalty: p.frequency_penalty,
             repetition_penalty: p.repetition_penalty,
             seed: p.seed,
-            stop_token_ids: p.stop_token_ids,
+            stop_token_ids: p.stop_token_ids.clone(),
+        }
+    }
+
+    /// The request's guard (None when it has no reasoning block and no loop breaker), its tracker, and the sampling it starts with.
+    fn guard(p: &SamplingParams) -> (Option<Box<dyn Guard>>, Option<Arc<Mutex<PhaseTracker>>>, Sampling) {
+        match PhaseGuard::new(p, sampling) {
+            None => (None, None, sampling(p)),
+            Some((g, start)) => {
+                let tr = g.tracker();
+                (Some(Box::new(SchedGuard(g))), Some(tr), start)
+            }
         }
     }
 
@@ -112,6 +143,81 @@ pub mod sched {
             SFinish::Length => FinishReason::Length,
             SFinish::Cancelled => FinishReason::Cancelled,
             SFinish::Error(e) => FinishReason::Error(e),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const TE: u32 = 900;
+
+        /// What the guard asked for and at which token (the scheduler feeds nothing after an End).
+        fn feed_all(g: &mut dyn Guard, toks: &[u32]) -> Vec<(usize, GuardAct)> {
+            let mut out = Vec::new();
+            for (i, &t) in toks.iter().enumerate() {
+                let a = g.feed(t);
+                if a != GuardAct::None {
+                    let end = a == GuardAct::End;
+                    out.push((i + 1, a));
+                    if end {
+                        break;
+                    }
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn no_guard_without_a_reasoning_block_or_the_breaker() {
+            let p = SamplingParams { temperature: 0.0, ..Default::default() };
+            let (g, tr, start) = guard(&p);
+            assert!(g.is_none() && tr.is_none() && start == sampling(&p));
+        }
+
+        #[test]
+        fn the_cap_forces_the_block_end_and_the_phase_sampling_switches_at_its_token() {
+            // greedy answer, the reasoning block sampled (greedy_floor), cap 5
+            let mut p = SamplingParams { temperature: 0.0, think_end: Some(TE), max_reasoning: 5, ..Default::default() };
+            let mut r = p.clone();
+            r.temperature = 1.0;
+            r.think_end = None;
+            p.reasoning = Some(Box::new(r));
+            let (g, tr, start) = guard(&p);
+            let mut g = g.unwrap();
+            assert_eq!(start.temperature, 1.0);
+            let acts = feed_all(g.as_mut(), &[1, 2, 3, 4, 5]);
+            assert_eq!(acts, vec![(5, GuardAct::Force(TE))]);
+            // the forced token ends the block: from the next token on, the answer's sampling
+            match g.feed(TE) {
+                GuardAct::Sampling(s) => assert_eq!(s.temperature, 0.0),
+                x => panic!("{x:?}"),
+            }
+            assert_eq!(feed_all(g.as_mut(), &[6, 7, 8]), vec![]);
+            let ev = tr.unwrap().lock().unwrap().events.clone();
+            assert!(ev.reasoning_capped && ev.reasoning_tokens == 6);
+            // one sampling for both phases: the block's end changes nothing
+            let p = SamplingParams { temperature: 0.0, think_end: Some(TE), max_reasoning: 0, ..Default::default() };
+            let (g, _, _) = guard(&p);
+            assert_eq!(feed_all(g.unwrap().as_mut(), &[1, 2, TE, 3, 4]), vec![]);
+        }
+
+        #[test]
+        fn an_answer_cycle_boosts_a_greedy_request_then_ends_it() {
+            let mut p = SamplingParams { temperature: 0.0, loop_breaker: true, max_tokens: 10_000, ..Default::default() };
+            p.loop_rules.answer = crate::loopdet::LoopRule { min_repeats: 4, min_repeated_tokens: 150 };
+            let (g, tr, _) = guard(&p);
+            let mut g = g.unwrap();
+            let cyc: Vec<u32> = (0..2000u32).map(|i| 10 + i % 5).collect();
+            let acts = feed_all(g.as_mut(), &cyc);
+            // boosted sampling where the cycle is seen, the request's own again 96 tokens later, the end when the cycle is back
+            assert_eq!(acts.len(), 3, "{acts:?}");
+            let (at, GuardAct::Sampling(b)) = &acts[0] else { panic!("{acts:?}") };
+            assert!((b.temperature, b.top_p) == (0.7, 0.95) && *at < 200);
+            let (back, GuardAct::Sampling(s)) = &acts[1] else { panic!("{acts:?}") };
+            assert!(s.temperature == 0.0 && *back == at + crate::loopdet::BOOST_TOKENS);
+            assert_eq!(acts[2].1, GuardAct::End);
+            assert_eq!(tr.unwrap().lock().unwrap().events.loop_breaks, 2);
         }
     }
 
@@ -131,15 +237,17 @@ pub mod sched {
 
         fn submit(&self, r: GenRequest, sink: TokenSink) {
             let mut sink = Some(sink);
-            let req = Request { id: r.id, prompt_ids: r.prompt_ids, snapshots: r.snapshots, sampling: sampling(r.params),
-                cancel: r.cancel.flag() };
+            let (guard, tracker, start) = guard(&r.params);
+            let req = Request { id: r.id, guard, prefix_choices: r.params.prefix_choices, prompt_ids: r.prompt_ids, snapshots: r.snapshots,
+                sampling: start, cancel: r.cancel.flag() };
             self.0.submit(
                 req,
                 Box::new(move |ev| match ev {
                     Event::Tokens(t) => sink.as_ref().is_some_and(|s| s.send_tokens(t)),
                     Event::Finished { reason: f, cached_prompt_tokens } => {
                         if let Some(s) = sink.take() {
-                            s.finish(Finish { reason: reason(f), cached_prompt_tokens, timings: None });
+                            let events = tracker.as_ref().map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).events.clone()).unwrap_or_default();
+                            s.finish(Finish { reason: reason(f), cached_prompt_tokens, timings: None, events });
                         }
                         false
                     }

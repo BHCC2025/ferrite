@@ -4,6 +4,108 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-19
+
+### Added
+
+- **Sampling defaults per mode.** The server reads `sampling.json` from the model folder: one set of values for
+  replies that think and one for replies that do not, applied to the fields a request leaves out. A field the
+  client sends always wins. The files for both models hold the base models' published settings (thinking: temperature
+  1.0, top_p 0.95, top_k 20; non-thinking: 0.7, 0.8, 20 and presence penalty 1.5) and are in `crates/fe-server/`
+  (`sampling.qwen3.8-27b.json`, `sampling.qwen3.8-flash-next.json`); `scripts/serve.sh` and `tools/serve-fnext.sh`
+  use them when the model folder has none, and `FE_SAMPLING_JSON=<file>` names another. The values a request ran with
+  are written to the log and returned in the `x-sampling-effective` response header, with the origin of each.
+- **A `temperature: 0` request keeps the fast greedy path** (`greedy_keeps_fast_path`, on by default;
+  `FE_GREEDY_FAST_PATH=0` turns it off): the defaults add no presence, frequency or repetition penalty to it, and a
+  penalty the client sends itself still applies. Qwen3.8-27B on one RTX PRO 4000 Blackwell 24 GB with the defaults
+  live: code at 2K context 184 tok/s and edits 462 tok/s, the same as without the defaults; with the non-thinking
+  presence penalty applied to such requests they ran at 147-153 and 152-157.
+- **Protections for coding agents, in both engines.** One guard per request, shared by the 27B and the Flash-Next
+  engine, is fed the accepted tokens one at a time:
+  - a reasoning block still open after 8,192 tokens is closed by the engine and the model answers
+    (`FE_MAX_REASONING_TOKENS`, 0 = off);
+  - a loop breaker for exact repeating cycles: it closes a reasoning block; in an answer it boosts the sampling for
+    96 tokens and ends the reply with `finish_reason: "length"` if the cycle returns; tool-call arguments are held
+    to a far stricter rule (`FE_LOOP_BREAKER`, `FE_LOOP_RULES`);
+  - a repeated-sentence rule for replies that keep coming back to the same sentences without a verbatim cycle,
+    never inside a code block or a tool call;
+  - the first token of a reply is never a stop token;
+  - `tool_choice` `required` and named functions are enforced: the reply starts inside the call, and with several
+    tools the name is limited to the ones offered;
+  - a watchdog: a reply that produces no token for 60 s after its first one is ended (`FE_NO_TOKEN_TIMEOUT`), with an
+    optional wall-clock limit (`FE_REPLY_WALL_LIMIT`); a pick from non-finite logits ends the request with an error
+    instead of text (`FE_FINITE_CHECK`).
+
+  A protection acts at the token where it fires: the tokens a verify step accepted past it are given back. With
+  protections firing, greedy replies are identical with drafting on and off, and alone and with four requests at
+  once (both engines, RTX PRO 4000 Blackwell 24 GB: one card for the 27B, two for Flash-Next), and a request on
+  which none fires gets the tokens it got before. Drafting goes on after the cap closes a block: with the cap set to
+  48 tokens and a long code answer after it, the 27B decoded the answer at 612 characters a second against 153 with
+  drafting off, and Flash-Next at 129-131 tok/s against 94, the same text in both.
+- **Tool-call arguments stream as they are written** (Qwen XML calls). On Flash-Next an 86-line file write arrives
+  as 414 argument deltas.
+- **Request capture** for replay (`FE_DUMP_REQUESTS=<dir>`: each chat-completions body and a small `.meta.json`
+  with the outcome), and an **SSE keep-alive** comment every 10 s of silence, from the moment a request is queued.
+- **[docs/harness.md](docs/harness.md)**: agent harness settings that were tested end to end, with a Pi extension
+  that gives the model's shell commands a default and a maximum run time
+  ([docs/harness/pi/bash-timeout.ts](docs/harness/pi/bash-timeout.ts)).
+- **An API conformance suite**, [tools/conformance](tools/conformance/README.md): tool calls, streaming, stopping,
+  loops, sampling defaults, caching and liveness against any OpenAI-compatible server, Python standard library only,
+  one profile file a model. On this release (RTX PRO 4000 Blackwell 24 GB, fresh servers):
+  - Qwen3.8-27B, one card: quick tier 53 runs, 0 failed; heavy tier with six runs a loop case 12 runs, 0 failed.
+  - Qwen3.8-Flash-Next, two cards: quick tier 53 runs, 3 failed, all three the model: two special-content runs
+    with thinking on, where the model ended its reply inside the reasoning block, and one translation prompt that
+    ran to the token limit (see [docs/flash-next.md](docs/flash-next.md#the-coder-file-is-for-code)); heavy tier
+    12 runs, 0 failed.
+- **Recommended settings** in [docs/model-card.md](docs/model-card.md#recommended-settings) and
+  [docs/flash-next.md](docs/flash-next.md#recommended-settings): what the server applies by default, the greedy
+  rule, the protections and their switches.
+
+### Changed
+
+- **Non-thinking replies get the non-thinking settings.** A request that leaves its sampling fields out used to run
+  with the values of `generation_config.json` (temperature 1.0, top_p 0.95, top_k 20) in either mode. With the
+  shipped `sampling.json` a reply that does not think now runs at temperature 0.7, top_p 0.8, top_k 20 and presence
+  penalty 1.5.
+- **Flash-Next applies the same protections and defaults as the 27B**, through the same code. On Flash-Next a
+  sampled request decodes one token a step (about 72 tok/s on two RTX PRO 4000 Blackwell 24 GB, against 173-194
+  for a greedy request with MTP drafting), so a client that wants the drafting speed sends `temperature: 0`.
+- **[docs/flash-next.md](docs/flash-next.md) says what the Coder file is for.** Short coding prompts ended on their
+  own in 176 of 176 runs; general-chat prompts ran to a 1,024-token limit in 39 of 112 (two RTX PRO 4000 Blackwell
+  24 GB).
+- Speed is unchanged where no protection fires. Qwen3.8-27B on one RTX PRO 4000 Blackwell 24 GB: code 184 tok/s at
+  2K context and 160 at 16K, prose 66-78, edits 462, prompt processing 1,599 tok/s at 2K and 2,714 at 16K, first
+  token of a short prompt after 1.19 s. Flash-Next on two: one code request 173-194 tok/s, one prose request
+  132-136, four code requests 206-220 in total, first token after 0.12-0.13 s.
+- **What this release was verified on.**
+  - RTX PRO 4000 Blackwell 24 GB (x86-64), both engines: every gate and figure in this entry, run on this release's
+    changes on top of the 0.6.0 code. The published source also carries the 0.6.1 fixes; that combination was built
+    and unit-tested on x86-64 with both engines and was not run on these cards again.
+  - DGX Spark (aarch64), the published source: build, unit tests and `ferrite selftest` pass. On one node: greedy
+    text identical to 0.6.1 with the sampling file present and absent, with DFlash2 drafting, MTP drafting, drafting
+    off and the prompt cache off; repeated requests identical; four requests at once identical to each alone; with
+    protections firing, the same text with drafting on and off and with one and four slots; the non-finite check;
+    the release gate's API checks; speed as in 0.6.1 (code 160 tok/s, four requests 286, edits 316, prompt
+    processing about 2,500 tok/s at 2K). The conformance quick tier on one node: 53 runs, 2 failed, both at the
+    default sampling: a `special_content` run with thinking on, where the model wrote an example call before the
+    real one, and a `cut_off_call` run, where the model made a short `bash` call instead of the long write the case
+    expects. On two nodes: greedy text identical to 0.6.1, repeated requests identical, four requests at once
+    identical to each alone, speed as in 0.6.1 (code 268 tok/s, four requests 473); the other two-node checks
+    (no sampling file, drafting off, protections firing, the conformance suite, the release gate) were not run.
+  - Intel Arc Pro B70: not rebuilt and not run for this release. Its kernels are unchanged since 0.6.1, and the
+    server code was type-checked with `--features xe` without building them.
+
+### Fixed
+
+- **Flash-Next: a sampled request could read another request's logits.** The copy of the logit row to the host is
+  part of a captured step graph, and a graph captured for a greedy request was reused for sampled ones: a sampled
+  request that followed a greedy one on the same slot drew its first token from the previous request's row (a wrong
+  first token, or an empty one-token reply), and in two cases every token. Step graphs are now kept apart by that
+  copy. Present in 0.6.0, where the regression check fails 82 of 100, 24 of 25 and 2 of 2 cases; all pass now (two
+  RTX PRO 4000 Blackwell 24 GB, fresh servers).
+- **Text that looks like tool-call markup inside a call argument** stays part of the argument when its tags are
+  balanced.
+
 ## [0.6.1] - 2026-11-15
 
 ### Fixed
@@ -307,6 +409,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.7.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.0
 [0.6.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.6.1
 [0.6.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.6.0
 [0.5.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.5.1

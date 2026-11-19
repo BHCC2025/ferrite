@@ -15,6 +15,8 @@ use crate::pyjson;
 const TEMPLATE_NAME: &str = "chat_template";
 
 pub struct ChatTemplate {
+    /// The template writes DeepSeek DSML tool calls (`<｜DSML｜ calls>`)
+    pub dsml: bool,
     env: Environment<'static>,
     /// Special-token variables HF passes to every render (`bos_token`, `eos_token`, ...).
     special_tokens: Map<String, Json>,
@@ -59,8 +61,9 @@ impl ChatTemplate {
         env.add_function("raise_exception", raise_exception);
         env.add_filter("tojson", tojson);
         env.add_function("strftime_now", strftime_now);
+        let dsml = source.contains("｜DSML｜");
         env.add_template_owned(TEMPLATE_NAME, source).context("compiling chat template")?;
-        Ok(Self { env, special_tokens })
+        Ok(Self { dsml, env, special_tokens })
     }
 
     /// Render a conversation. `messages` / `tools` are OpenAI-format JSON, already normalized

@@ -106,6 +106,7 @@ echo "serve-fnext: $([ "$gpus" = 2 ] && echo "two cards, tensor parallel" || ech
 ctx $FNEXT_CTX x $slots slots, drafting $dr"
 fl_net
 fl_take_locks ${ids//,/ }
+fl_sampling "$dir" qwen3.8-flash-next
 fl_banner "${FERRITE_MODEL_ID:-qwen3.8-flash-next}" "loading takes a minute or two"
 exec "$bin" --engine fnext --model-dir "$dir" \
   --host "$FERRITE_HOST" --port "$FERRITE_PORT" --served-model-name "${FERRITE_MODEL_ID:-qwen3.8-flash-next}" \
