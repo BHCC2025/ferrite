@@ -5,7 +5,8 @@
 #   FERRITE_MODELS=/path/to/models scripts/serve.sh [extra fe-server arguments]
 #
 # On a DGX Spark it serves 4 x 128K. On an RTX 5080 / 5060 Ti (16 GB) it hands over to tools/serve-5080.sh, the same
-# script with the small-memory preset (docs/rtx-5080.md). Serves /v1/chat/completions, /v1/completions, /v1/models
+# script with the small-memory preset (docs/rtx-5080.md); on an RTX PRO 4000 Blackwell (24 GB) to
+# tools/serve-pro4000.sh, that preset with the settings for 24 GB (docs/rtx-pro-4000.md). Serves /v1/chat/completions, /v1/completions, /v1/models
 # and /health (streaming, tool calls, thinking via chat_template_kwargs.enable_thinking) at
 # http://<this machine>:$FERRITE_PORT/v1 under the model id $FERRITE_MODEL_ID. It runs in the foreground and its
 # process becomes the server: Ctrl-C or `kill <pid>` stops it. scripts/ferritectl.sh runs it in the background.
@@ -71,7 +72,11 @@ profile=${FERRITE_PROFILE:-}
 if [ -z "$profile" ]; then
   case $cap in
     12.1) profile=spark ;;
-    12.0) fl_say "$gname (compute capability 12.0): starting the RTX preset, tools/serve-5080.sh"
+    12.0) case $gname in
+            *"RTX PRO 4000"*) fl_say "$gname (compute capability 12.0, 24 GB): starting the rtx-pro-4000 preset, tools/serve-pro4000.sh"
+                              exec "$root/tools/serve-pro4000.sh" "$@" ;;
+          esac
+          fl_say "$gname (compute capability 12.0): starting the RTX preset, tools/serve-5080.sh"
           exec "$root/tools/serve-5080.sh" "$@" ;;
     *) fl_die "the GPU is $gname (compute capability $cap); Ferrite's CUDA kernels run on GB10 (12.1) and RTX 50 cards (12.0)" ;;
   esac
@@ -176,7 +181,8 @@ else
   units=$([ "$slots" -gt 1 ] && echo "$slots" || echo 1)
   fit=$(( room > 0 ? room * 1048576 / bpt / units / 256 * 256 : 0 ))
   ctx=${FERRITE_CTX:-}
-  maxctx=$([ "$slots" -gt 1 ] && echo 28160 || echo 131072)
+  # (FERRITE_UNIT_MAX: the most a unit of the SLOTS > 1 pool holds; the 24 GB preset raises it)
+  maxctx=$([ "$slots" -gt 1 ] && echo "${FERRITE_UNIT_MAX:-28160}" || echo 131072)
   if [ -z "$ctx" ]; then
     ctx=$(( fit < maxctx ? fit : maxctx ))
     [ "$ctx" -ge 8192 ] || fl_die "the card has $gfree MiB free; the model needs about $fixed MiB plus the K/V cache, so even an 8K context does not fit: close what else uses the card (nvidia-smi), or FE_KVQ=4"
@@ -189,6 +195,19 @@ else
     fi
   fi
   memline="$avail GB host memory available, $gfree MiB free on the card"
+  # FERRITE_RESIDENT (the 24 GB preset: auto): layers of prompt weights kept on the card for good (FE_PROMPT_RESIDENT,
+  # about 250 MiB a layer), so a prompt's pass moves only the others. auto = what the card has left beside the model,
+  # the K/V cache, the reserve and FERRITE_VRAM_WORK_MIB [1280] of working room (prompt groups, captured graphs).
+  res=${FERRITE_RESIDENT:-}
+  if [ -n "$res" ] && [ "$prompt" = fp4 ] && [ -z "${FE_PROMPT_RESIDENT:-}" ]; then
+    if [ "$res" = auto ]; then
+      left=$(( gfree - fixed - reserve - ctx * units * bpt / 1048576 - ${FERRITE_VRAM_WORK_MIB:-1280} ))
+      res=$(( left > 0 ? left / 256 : 0 ))
+    fi
+    fl_int FERRITE_RESIDENT "$res" 0 64
+    export FE_PROMPT_RESIDENT=$res
+    memline="$memline, $res layers of prompt weights resident"
+  fi
 fi
 
 fl_say "$quant, prompt weights $prompt, drafting $dr, ctx $ctx x $slots slots, prompt cache \

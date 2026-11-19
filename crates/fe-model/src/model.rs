@@ -461,11 +461,23 @@ pub struct Weights {
 
 /// Prompt weights streamed from pinned host memory (small-memory devices; `FE_PROMPT_STREAM`, ring size
 /// `FE_PROMPT_RING`, default 2 layers): every layer's NVFP4/FP8 codes and scales are one pinned blob, copied on
-/// its own stream into slot `layer % ring` of a device ring just before the layer's prompt GEMMs run, while the
+/// its own stream into a slot of a device ring just before the layer's prompt GEMMs run, while the
 /// layers before it compute. A slot is rewritten only after the layer that used it has finished.
+/// `FE_PROMPT_RESIDENT=N` (default 0) keeps N layers' blobs on the device for good, spread evenly over the stack
+/// (0.265 GB a layer for Qwen3.8-27B): a pass then moves only the other layers' bytes, and the bus works on a
+/// streamed layer while its resident neighbours compute. The streamed layers take the ring's slots in their own
+/// order (the j-th streamed layer: slot `j % ring`). Where a layer's bytes live does not change what is computed.
 pub struct PromptStream {
-    blobs: Vec<fe_cuda::HostBuffer<u8>>,
+    /// per layer: its pinned blob (None once the layer is resident on the device)
+    blobs: Vec<Option<fe_cuda::HostBuffer<u8>>>,
+    /// per layer: its index among the streamed layers (None: resident)
+    sidx: Vec<Option<usize>>,
+    /// the streamed layers, in order
+    slayers: Vec<usize>,
     ring: DeviceBuffer<u8>,
+    /// the resident layers' blobs (kept alive here; the layers hold views into it)
+    resident: Option<DeviceBuffer<u8>>,
+    n_res: usize,
     slot: usize,
     n_ring: usize,
     copy: Stream,
@@ -476,26 +488,67 @@ pub struct PromptStream {
 impl PromptStream {
     /// Bytes in host memory, and the device ring's.
     pub fn bytes(&self) -> (usize, usize) {
-        (self.blobs.iter().map(|b| b.len()).sum(), self.ring.len())
+        (self.blobs.iter().flatten().map(|b| b.len()).sum(), self.ring.len())
     }
-    /// Enqueue layer `li`'s upload; stream `s` then waits for it before whatever is launched next.
+    /// Layers resident on the device and their bytes.
+    pub fn resident(&self) -> (usize, usize) {
+        (self.n_res, self.resident.as_ref().map_or(0, |b| b.len()))
+    }
+    /// Enqueue layer `li`'s upload; stream `s` then waits for it before whatever is launched next. A resident
+    /// layer has nothing to fetch.
     fn fetch(&self, li: usize, s: &Stream) -> Result<()> {
-        if li >= self.n_ring {
-            self.copy.wait(&self.done[li - self.n_ring])?;
+        let Some(j) = self.sidx[li] else { return Ok(()) };
+        self.upload(j)?;
+        s.wait(&self.up[j])?;
+        Ok(())
+    }
+    /// Enqueue the upload of the j-th streamed layer on the copy stream: it starts once the layer that used its slot
+    /// (the streamed layer j - ring) is done, so that layer's `release` must already be recorded in this pass.
+    fn upload(&self, j: usize) -> Result<()> {
+        let blob = self.blobs[self.slayers[j]].as_ref().expect("streamed layer without a blob");
+        if j >= self.n_ring {
+            self.copy.wait(&self.done[j - self.n_ring])?;
         }
         // FE_PROMPT_STREAM_DRY=1 (timing only: wrong results) skips the copies, to see the compute alone
         if !self.dry {
             unsafe {
-                self.copy.memcpy_htod(self.ring.ptr().byte_add((li % self.n_ring) * self.slot), self.blobs[li].as_slice())?;
+                self.copy.memcpy_htod(self.ring.ptr().byte_add((j % self.n_ring) * self.slot), blob.as_slice())?;
             }
         }
-        self.copy.record(&self.up[li])?;
-        s.wait(&self.up[li])?;
+        self.copy.record(&self.up[j])?;
         Ok(())
+    }
+    /// Uploads a ring ahead (a caller that synchronises after every layer, with resident layers between the streamed
+    /// ones: the bus then works while the resident layers compute). `ahead_begin` enqueues the first ring of
+    /// uploads; `ready` makes stream `s` wait for layer `li`'s upload before its launches; `ahead_after`, called
+    /// after `release(li)`, enqueues the upload that takes the slot layer `li` leaves. `next`: the caller's cursor.
+    fn ahead_begin(&self) -> Result<usize> {
+        let n = self.n_ring.min(self.slayers.len());
+        for j in 0..n {
+            self.upload(j)?;
+        }
+        Ok(n)
+    }
+    fn ready(&self, li: usize, s: &Stream) -> Result<()> {
+        if let Some(j) = self.sidx[li] {
+            s.wait(&self.up[j])?;
+        }
+        Ok(())
+    }
+    fn ahead_after(&self, li: usize, next: usize) -> Result<usize> {
+        match self.sidx[li] {
+            Some(j) if next == j + self.n_ring && next < self.slayers.len() => {
+                self.upload(next)?;
+                Ok(next + 1)
+            }
+            _ => Ok(next),
+        }
     }
     /// Layer `li`'s launches are all enqueued on `s`: its slot may be reused once they finish.
     fn release(&self, li: usize, s: &Stream) -> Result<()> {
-        s.record(&self.done[li])?;
+        if let Some(j) = self.sidx[li] {
+            s.record(&self.done[j])?;
+        }
         Ok(())
     }
 }
@@ -873,8 +926,9 @@ impl Weights {
                     fk.fp8_bs = crate::lowmem::compute_capability() == 120;
                 }
                 // NVFP4 GEMMs on the mbarrier pipeline on the RTX 5060 Ti (36 SMs): the same bits as the default
-                // (fp4-determinism, the servers' texts), the MLP 17% faster there; FE_FP4_KERNEL overrides
-                if std::env::var("FE_FP4_KERNEL").is_err() && sm_count == 36 {
+                // (fp4-determinism, the servers' texts), the MLP 17% faster there; FE_FP4_KERNEL overrides.
+                // Also on the RTX PRO 4000 Blackwell (70 SMs, 145 W): 16K / 56K / 110K prompts 4.4 / 3.0 / 1.9% faster.
+                if std::env::var("FE_FP4_KERNEL").is_err() && (sm_count == 36 || sm_count == 70) {
                     fk.variant = 2;
                 }
                 let t = std::time::Instant::now();
@@ -885,6 +939,10 @@ impl Weights {
                     let (hb, rb) = ps.bytes();
                     eprintln!("ferrite: prompt weights streamed from host memory ({:.1} GB pinned, a {}-layer ring of {:.2} GB on the device)",
                         hb as f64 / 1e9, ps.n_ring, rb as f64 / 1e9);
+                    let (nr, bytes) = ps.resident();
+                    if nr > 0 {
+                        eprintln!("ferrite: {nr} layers of prompt weights resident on the device ({:.2} GB)", bytes as f64 / 1e9);
+                    }
                 }
                 Some(fk)
             }
@@ -989,11 +1047,45 @@ fn attach_fp4(ck: &fe_fp4::Checkpoint, pfx: &str, cfg: &Config, layers: &mut [La
     if !stream {
         return Ok(None);
     }
-    let n_ring = std::env::var("FE_PROMPT_RING").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).clamp(1, layers.len());
-    let slot = blobs.iter().map(|b| b.len()).max().unwrap_or(0).div_ceil(4096) * 4096;
-    let ring = DeviceBuffer::<u8>::alloc(n_ring * slot)?;
+    // FE_PROMPT_RESIDENT layers stay on the device, spread evenly: layer l is one when the running count steps at it
+    let nl = layers.len();
+    let n_res = std::env::var("FE_PROMPT_RESIDENT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(nl);
+    let is_res = |l: usize| (l + 1) * n_res / nl > l * n_res / nl;
+    let mut sidx: Vec<Option<usize>> = Vec::with_capacity(nl);
+    let mut res_off: Vec<usize> = Vec::with_capacity(nl);
+    let mut slayers: Vec<usize> = Vec::with_capacity(nl);
+    let (mut n_str, mut res_bytes) = (0usize, 0usize);
+    for (l, b) in blobs.iter().enumerate() {
+        res_off.push(res_bytes);
+        if is_res(l) {
+            sidx.push(None);
+            res_bytes += b.len().div_ceil(4096) * 4096;
+        } else {
+            sidx.push(Some(n_str));
+            slayers.push(l);
+            n_str += 1;
+        }
+    }
+    let n_ring = std::env::var("FE_PROMPT_RING").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).clamp(1, n_str.max(1));
+    let slot = blobs.iter().zip(&sidx).filter(|(_, j)| j.is_some()).map(|(b, _)| b.len()).max().unwrap_or(0).div_ceil(4096) * 4096;
+    let ring = DeviceBuffer::<u8>::alloc((n_ring * slot).max(4096))?;
+    let resident = if res_bytes > 0 { Some(DeviceBuffer::<u8>::alloc(res_bytes)?) } else { None };
+    let mut blobs: Vec<Option<fe_cuda::HostBuffer<u8>>> = blobs.into_iter().map(Some).collect();
+    if let Some(rb) = &resident {
+        // upload once and give the pinned host copies back
+        for l in 0..nl {
+            if sidx[l].is_none() {
+                let b = blobs[l].take().expect("resident layer without a blob");
+                fe_cuda::memcpy_htod(rb.ptr().byte_add(res_off[l]), b.as_slice())?;
+            }
+        }
+    }
     for (l, layer) in layers.iter_mut().enumerate() {
-        let base = ring.ptr().byte_add((l % n_ring) * slot);
+        let base = match (sidx[l], &resident) {
+            (Some(j), _) => ring.ptr().byte_add((j % n_ring) * slot),
+            (None, Some(rb)) => rb.ptr().byte_add(res_off[l]),
+            (None, None) => unreachable!(),
+        };
         let mut it = offs[l].iter();
         let mut set = |lin: Option<&mut PromptLinear>| {
             if let Some(lin) = lin {
@@ -1017,7 +1109,7 @@ fn attach_fp4(ck: &fe_fp4::Checkpoint, pfx: &str, cfg: &Config, layers: &mut [La
         ensure!(it.next().is_none(), "layer {l}: blob pieces left over");
     }
     let mk = |n: usize| -> Result<Vec<fe_cuda::Event>> { (0..n).map(|_| Ok(fe_cuda::Event::new_no_timing()?)).collect() };
-    Ok(Some(PromptStream { up: mk(blobs.len())?, done: mk(blobs.len())?, blobs, ring, slot, n_ring, copy: Stream::new()?,
+    Ok(Some(PromptStream { up: mk(n_str)?, done: mk(n_str)?, blobs, sidx, slayers, ring, resident, n_res, slot, n_ring, copy: Stream::new()?,
         dry: std::env::var("FE_PROMPT_STREAM_DRY").is_ok_and(|v| v == "1") }))
 }
 
@@ -2240,10 +2332,17 @@ impl Engine {
         {
             let s = &self.stream;
             let ps = self.w.pstream.as_ref();
+            // with resident layers the streamed ones upload a ring ahead of the layer at work (PromptStream::ahead_begin);
+            // without, the next layer's upload starts as each layer is enqueued, as before
+            let ahead = ps.is_some_and(|ps| ps.n_res > 0);
+            let mut up_next = 0;
             if let Some(ps) = ps {
-                ps.fetch(0, s)?;
+                if ahead { up_next = ps.ahead_begin()?; } else { ps.fetch(0, s)?; }
             }
             for (li, layer) in self.w.layers.iter().enumerate() {
+                if let (Some(ps), true) = (ps, ahead) {
+                    ps.ready(li, s)?;
+                }
                 // a GDN layer with the overlap: chunk c + 1's norm and projection run on the second stream while chunk
                 // c is at work (the chunked GDN kernel leaves SMs idle when its head blocks outnumber them), into a
                 // buffer chunk c + 1 then reads. The same kernels on the same inputs: the bits do not change.
@@ -2279,7 +2378,9 @@ impl Engine {
                 if let Some(ps) = ps {
                     ps.release(li, s)?;
                     // the next layer's upload starts before the wait below, so it runs beside this layer's launches
-                    if li + 1 < self.w.layers.len() {
+                    if ahead {
+                        up_next = ps.ahead_after(li, up_next)?;
+                    } else if li + 1 < self.w.layers.len() {
                         ps.fetch(li + 1, s)?;
                     }
                 }
@@ -2306,12 +2407,14 @@ impl Engine {
 
     /// The second stream and buffers of a prompt group's GDN overlap, when it pays and fits: the chunked GDN kernel
     /// launches one block a value head, so with fewer SMs than heads its last wave leaves SMs idle (48 heads on 36
-    /// SMs: a second wave of 12 blocks). FE_GDN_OVERLAP=0 turns it off, =1 forces it.
+    /// SMs: a second wave of 12 blocks). On 70 SMs (RTX PRO 4000 Blackwell) the one wave of 48 blocks leaves 22 SMs
+    /// idle and the overlap measured 2.3% on 16K to 110K prompts, so it is on there too; other cards with at least as
+    /// many SMs as heads keep it off (not measured there). FE_GDN_OVERLAP=0 turns it off, =1 forces it.
     fn gdn_overlap_on(&self) -> bool {
         let on = match std::env::var("FE_GDN_OVERLAP").ok().as_deref() {
             Some("0") => false,
             Some("1") => true,
-            _ => self.w.sm_count < self.cfg.lin_v_heads as u32,
+            _ => self.w.sm_count < self.cfg.lin_v_heads as u32 || self.w.sm_count == 70,
         };
         on && self.w.fp4.is_some() && self.gdn.is_some() && self.tp.is_none()
     }

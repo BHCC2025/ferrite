@@ -265,6 +265,13 @@ pub struct EngineInfo {
 pub trait Engine: Send + Sync + 'static {
     fn info(&self) -> EngineInfo;
 
+    /// A request has arrived and is being prepared (parsed, rendered, tokenized): the returned value is held until
+    /// it has been submitted. An engine that batches requests sent together uses it to wait for them (the ferrite
+    /// scheduler: Scheduler::incoming); None: nothing to tell.
+    fn incoming(&self) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+
     /// Start generating for `req`; must return quickly (do the work on engine threads).
     /// Results go to `sink`: zero or more `send_tokens`, then exactly one `finish`.
     fn submit(&self, req: GenRequest, sink: TokenSink);

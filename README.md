@@ -12,10 +12,12 @@ An experimental second target serves the same model on one **Intel Arc Pro B70**
 SPIR-V and loaded through Level Zero: see [Intel Arc Pro B70](#intel-arc-pro-b70).
 The same CUDA engine also runs on one **RTX 5080** (16 GB) with a quantized K/V cache and the prompt weights
 streamed from host memory: see [docs/rtx-5080.md](docs/rtx-5080.md).
+On one **RTX PRO 4000 Blackwell** (24 GB) the `rtx-pro-4000` preset also keeps part of the prompt weights on the
+card: see [docs/rtx-pro-4000.md](docs/rtx-pro-4000.md).
 A second, experimental engine serves **Qwen3.8-Flash-Next** (the ISTA-DASLab IQ1_M GGUF) on one or two
 **RTX 5060 Ti 16 GB** with the experts mostly in host memory: see [docs/flash-next.md](docs/flash-next.md).
 
-> **Status: experimental.** Qwen3.8-27B on DGX Spark (the main target), RTX 5080 / 5060 Ti and Arc B70, and
+> **Status: experimental.** Qwen3.8-27B on DGX Spark (the main target), RTX 5080 / 5060 Ti, RTX PRO 4000 Blackwell and Arc B70, and
 > Qwen3.8-Flash-Next on RTX 5060 Ti. At most 4 requests run at once; more wait in a queue. It works, but expect rough
 > edges. Issues and measurements from other machines are welcome.
 
@@ -27,6 +29,7 @@ A second, experimental engine serves **Qwen3.8-Flash-Next** (the ISTA-DASLab IQ1
 |---|---|---|---|---|
 | NVIDIA DGX Spark, one or two | DGX OS (Ubuntu 24.04) | aarch64 | GB10, NVIDIA driver 580+, CUDA 13 | Prebuilt package, or from source |
 | NVIDIA RTX 5080 or RTX 5060 Ti 16 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas` and cuBLASLt | From source: [docs/rtx-5080.md](docs/rtx-5080.md) |
+| NVIDIA RTX PRO 4000 Blackwell 24 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 24 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas` and cuBLASLt | From source: [docs/rtx-pro-4000.md](docs/rtx-pro-4000.md) |
 | Qwen3.8-Flash-Next on RTX 5060 Ti, one or two (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas`; 32 GB of memory | From source: [docs/flash-next.md](docs/flash-next.md) |
 | Intel Arc Pro B70 (experimental) | Linux with the `xe` kernel driver; tested on Arch Linux | x86_64 | 32 GB, Level Zero loader 1.32+ | From source: [docs/arc-b70.md](docs/arc-b70.md) |
 
@@ -98,7 +101,7 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.7.1` pins one) and the models into
+It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.7.2` pins one) and the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the
 models, and `--source` builds from source. Run again over an older release, the same command upgrades it.

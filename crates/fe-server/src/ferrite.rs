@@ -235,6 +235,10 @@ pub mod sched {
             self.0.prompt_reserve()
         }
 
+        fn incoming(&self) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+            Some(Box::new(self.0.incoming()))
+        }
+
         fn submit(&self, r: GenRequest, sink: TokenSink) {
             let mut sink = Some(sink);
             let (guard, tracker, start) = guard(&r.params);

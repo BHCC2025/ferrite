@@ -223,8 +223,17 @@ enum Cmd {
     Shutdown,
 }
 
+/// See Scheduler::incoming. Dropping it says the request was submitted (or given up).
+pub struct Incoming(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub struct Scheduler {
     tx: mpsc::Sender<Cmd>,
+    incoming: Arc<std::sync::atomic::AtomicUsize>,
     max_batch: usize,
     max_ctx: usize,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -250,6 +259,8 @@ impl Scheduler {
         let dead_t = dead.clone();
         let step_t0 = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let step_t0_w = step_t0.clone();
+        let incoming = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let incoming_w = incoming.clone();
         let thread = std::thread::Builder::new().name("ferrite-engine".into()).spawn(move || {
             let built = (|| -> Result<(Arc<fe_cuda::Context>, Engine)> {
                 // whole model, or TP rank 0 (FE_TP_*: rank 1 runs `ferrite <model> follow`)
@@ -275,6 +286,7 @@ impl Scheduler {
                     };
                     let mut w = Worker::new(e, o);
                     w.step_t0 = step_t0_w;
+                    w.incoming = incoming_w;
                     w.df = df;
                     if let Err(err) = w.cache_init() {
                         let _ = rtx.send(Err(err));
@@ -302,7 +314,7 @@ impl Scheduler {
             }
         })?;
         let (max_batch, spec) = rrx.recv()??;
-        Ok(Scheduler { tx, max_batch, max_ctx: opts.pool_ctx(), thread: Some(thread), dead, spec, step_t0, step_timeout: step_timeout_ms() })
+        Ok(Scheduler { tx, max_batch, max_ctx: opts.pool_ctx(), thread: Some(thread), dead, spec, step_t0, incoming, step_timeout: step_timeout_ms() })
     }
     /// Some(reason) once the engine thread has stopped serving for good (it then fails every request): the server
     /// reports it on /health and exits so that a supervisor can restart it.
@@ -326,6 +338,14 @@ impl Scheduler {
     /// DF_PASS_STREAMS when DFlash2 is the only drafter) and the tokens a request may hold
     pub fn info(&self) -> (usize, usize) {
         (self.max_batch, self.max_ctx)
+    }
+    /// A request is on its way (the server holds this from the moment it has the body until it has submitted the
+    /// request: rendering and tokenizing a long prompt takes tens of milliseconds). A worker woken from idle does
+    /// not start its first forward while one is held (at most FE_ARRIVAL_MAX_MS), so requests sent together start
+    /// together whatever their prompts take to tokenize, and the text they share is computed once.
+    pub fn incoming(&self) -> Incoming {
+        self.incoming.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Incoming(self.incoming.clone())
     }
     /// Non-blocking. `sink` runs on the engine thread; returning false cancels the request.
     pub fn submit(&self, req: Request, sink: Sink) {
@@ -476,6 +496,8 @@ struct Worker {
     test_panic_step: Option<u64>,
     /// when the running step started (now_ms), 0 between steps (Scheduler::dead's hang check)
     step_t0: Arc<std::sync::atomic::AtomicU64>,
+    /// requests the server is still preparing (Scheduler::incoming): a worker woken from idle waits for them
+    incoming: Arc<std::sync::atomic::AtomicUsize>,
     e: Engine,
     o: SchedOptions,
     spec: usize,
@@ -503,6 +525,7 @@ struct Worker {
     /// FE_ARRIVAL_MS (default 5, 0 = off): an idle worker woken by a request waits until no other has arrived for
     /// this long (at most 4x in all), so requests sent together start (prefill) in the same forward
     arrival: std::time::Duration,
+    arrival_max: std::time::Duration,
     /// FE_TREE (default 0 until the GDN tree kernels land): greedy streams verify the drafter's trees
     tree: bool,
     /// FE_SCHED_PROF=1: wall time of the step's phases (draft, target forward + argmax, commit, drafter absorb,
@@ -743,7 +766,8 @@ impl Worker {
         if want_cache && !cache {
             eprintln!("ferrite: FE_CACHE off with the MTP head loaded (FE_CACHE_MTP=0): no prompt reuse");
         }
-        Worker { steps_run: 0, test_panic_step: std::env::var("FE_TEST_PANIC_STEP").ok().and_then(|v| v.parse().ok()), step_t0: Arc::new(std::sync::atomic::AtomicU64::new(0)), e, spec, slot_tokens: vec![Vec::new(); n], slot_busy: vec![false; n], slot_used: vec![0; n], tick: 0,
+        Worker { steps_run: 0, test_panic_step: std::env::var("FE_TEST_PANIC_STEP").ok().and_then(|v| v.parse().ok()), step_t0: Arc::new(std::sync::atomic::AtomicU64::new(0)), incoming: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            arrival_max: std::time::Duration::from_millis(std::env::var("FE_ARRIVAL_MAX_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(250)), e, spec, slot_tokens: vec![Vec::new(); n], slot_busy: vec![false; n], slot_used: vec![0; n], tick: 0,
             waiting: VecDeque::new(), active: Vec::new(), host: vec![0; verify_rows(n).max(DECODE_ROWS).max(n) * v], df: None,
             t_pre: 0.0, t_dec: 0.0,
             decode_share: std::env::var("FE_DECODE_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3f64).clamp(0.0, 0.95),
@@ -785,12 +809,17 @@ impl Worker {
                     Ok(c) => cmds.push(c),
                     Err(_) => return None,
                 }
-                // woken from idle: give the requests sent together a moment to arrive (one prefill forward)
+                // woken from idle: give the requests sent together a moment to arrive (one prefill forward), and wait
+                // for those the server is still preparing (Scheduler::incoming; at most FE_ARRIVAL_MAX_MS, default 250)
                 let cap = Instant::now() + 4 * self.arrival;
+                let hard = Instant::now() + self.arrival_max;
                 while !self.arrival.is_zero() {
-                    let left = self.arrival.min(cap.saturating_duration_since(Instant::now()));
+                    let coming = self.incoming.load(std::sync::atomic::Ordering::SeqCst) > 0 && Instant::now() < hard;
+                    let left = if coming { self.arrival.min(hard.saturating_duration_since(Instant::now())) }
+                        else { self.arrival.min(cap.saturating_duration_since(Instant::now())) };
                     match rx.recv_timeout(left) {
                         Ok(c) => cmds.push(c),
+                        Err(_) if coming => continue,
                         Err(_) => break,
                     }
                 }

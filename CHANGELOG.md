@@ -4,6 +4,85 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-11-19
+
+### Added
+
+- **The `rtx-pro-4000` preset: Qwen3.8-27B on one RTX PRO 4000 Blackwell (24 GB).** New `tools/serve-pro4000.sh`
+  and [docs/rtx-pro-4000.md](docs/rtx-pro-4000.md). `scripts/serve.sh` and `scripts/ferritectl.sh start` pick it by
+  the card's name, and `scripts/ferritectl.sh start rtx-pro-4000` names it. It is the arrangement of the 16 GB
+  preset (`tools/serve-5080.sh`, unchanged) with the extra memory put to use:
+  - **Prompt-weight layers stay on the card** (`FERRITE_RESIDENT`, default `auto`; `FE_PROMPT_RESIDENT` in the
+    engine, default 0). With a 128K context 27 of the 64 layers are resident, so a prompt's pass over the bus moves
+    only the others, and the streamed layers upload a ring ahead of the layer at work. On the card, against the
+    16 GB preset with 0.7.0: the first token of a short prompt comes after 0.70 s instead of 1.19 s, a 2K prompt is
+    processed at about 2,700 tokens/s instead of 1,599, and a 2,118-token prompt reaches its first token in 0.79 s
+    instead of 1.23 s. The server uses 22.2 GB of the card. Where a layer's bytes are kept does not change what is
+    computed.
+  - `SLOTS` 2-4 share one pool of 4 x 32,768 tokens and keep 47 copy rows a request.
+- **Decode plans for 70-SM cards** (`crates/fe-exl3/src/plans.rs`, tuned on the RTX PRO 4000 Blackwell at its
+  145 W limit). Such a card used the DGX Spark's table before. Same binary, old table against new: plain decoding
+  36.5 to 40.3 tokens/s, code at 2K context 183 to 197, a 500-token edit 464 to 484. With the whole preset, against
+  the 16 GB preset with 0.7.0: code at 2K / 16K / 56K context 184 / 160 / 137 to 200 / 171 / 143 tokens/s, edits
+  462 to 501, plain decoding 40.1. **This changes numerics, on 70-SM cards only**: the plans fix the order of the
+  sums. KL divergence against 0.7.0 on the card is 0.0004 (code), 0.0010 (text) and 0.0005 (16K context), and
+  against BF16 it is 0.0208 / 0.0427 / 0.0229 (0.7.0: 0.0207 / 0.0427 / 0.0230). A greedy reply can differ from
+  0.7.0's at a token whose two best candidates are nearly tied (4 of 10 test requests did). `FE_EXL3_TABLE=gb10`
+  selects the 0.7.0 numerics. Cards with 84, 36 or 48 SMs keep their tables.
+- **Prompt kernels for 70 SMs.** The NVFP4 GEMMs take the mbarrier pipeline and prompt groups run the next chunk's
+  GDN projection beside the recurrence. A 16K / 56K / 110K prompt takes 5.06 / 25.49 / 71.92 s instead of
+  5.41 / 26.85 / 74.62 s, with the same bits.
+- **A 262,144-token context starts on the 24 GB card** (`CTX=262144`: 13 resident layers, 22.2 GB in use). A
+  10-fact needle test over a 240,524-token prompt found 10 of 10; the prompt took 279 s (863 tokens/s) and each
+  further question 3 s from the prompt cache. This is a feasibility measurement: the default stays 131,072.
+
+### Changed
+
+- A correction to the 0.7.1 entry, which says the Arc B70 protections were each tested "with greedy and sampled
+  requests": that holds for the reasoning cap, the forced repetition and `tool_choice` `required`. The
+  named-function call was confirmed to return a valid call; the request modes of that check were not recorded.
+- **What this release was verified on.**
+  - One RTX PRO 4000 Blackwell 24 GB, on a build of these changes on top of 0.7.0 (the 0.7.2 source itself, which
+    also holds the 0.7.1 changes, was not rebuilt on the card). Unit and end-to-end tests: 141 pass, 1 ignored; the
+    scheduler's 12 pass; `ferrite selftest` passes. With `FE_EXL3_TABLE=gb10` ten greedy requests give the text of
+    the 0.7.0 build, with this preset and with the 16 GB preset: resident layers, the ring ahead, the prompt
+    kernels and the arrival fix change no text. With the card's table 6 of the 10 are identical. Drafting on and
+    off give the same text, a repeated request the same text, one slot and four slots the same text
+    (`tools/bench/lanes.py --gate`: 0 mismatches). A 5-fact needle test over 120,287 tokens found 5 of 5. The
+    protections fire.
+  - The conformance suite on that build with the card's table: quick tier 53 runs, 1 failed (`special_content`,
+    streamed with thinking); heavy tier 12 runs, 1 failed (`long_write_big`). Both cases sample their reasoning,
+    and both also fail with the 0.7.0 numerics under other seeds. `long_write_big` was then run with 20 seeds a
+    table on three cards: 18 of 20 passed with the card's table and 16 of 20 with the 0.7.0 numerics (Fisher exact
+    test, two-sided p = 0.66); with 6 earlier runs a table it is 21 of 26 for each. The failures are of the same
+    two kinds with either table (a staged write left open after 6 turns; an edit call with a malformed argument).
+    The cards reached 88-90 C with no thermal slowdown.
+  - DGX Spark (aarch64), the published source: build and unit tests pass. One node: the package gives the same
+    greedy text as the 0.7.1 package on four prompts. `tools/bench/lanes.py --gate` passes with 0 mismatches over
+    1, 2 and 4 requests and 2K and 16K shared prefixes, and its texts equal those of the 0.7.1 package. The
+    arrival fix makes no difference there: the prefix was shared in every set before and after, four requests
+    with a 16K shared prefix total 114-116 tokens/s (0.7.1: 114-115; series of 5 sets, alternating), and the last
+    first token comes after 7.2 s with both. Two nodes, started with `tools/serve-tp2.sh`: a greedy reply is
+    identical to the 0.7.1 package's, and a request without sampling fields runs with its mode's profile. The
+    speed runs, the long gates and the conformance suite were not run again on the Sparks.
+  - Not built and not run for this release: the RTX 5080 and RTX 5060 Ti 16 GB (their preset and decode tables are
+    unchanged; they get the arrival fix), the Intel Arc Pro B70 and Flash-Next. The shared code that changed is
+    the arrival fix: the server now tells an engine when a request arrives (`Engine::incoming`), which the Arc
+    and Flash-Next engines ignore, and the 27B scheduler waits on it.
+
+### Fixed
+
+- **Requests sent together share their prefix.** A worker woken from idle started its first forward once no
+  request had arrived for 5 ms (20 ms at most). Rendering and tokenizing a 16K-token prompt takes longer than
+  that, so of several requests sent at the same moment the first could start alone, and the others then computed
+  the text they share again. On the RTX PRO 4000, two requests with a 16K shared prefix: in 2 of 5 sets nothing
+  was shared and the last first token came after 22.5 s instead of 7.0-7.4 s. The server now holds a marker from
+  the moment it has a request's body until the request is submitted, and a worker woken from idle waits while one
+  is held, 250 ms at most (`FE_ARRIVAL_MAX_MS`). A lone request is not delayed. After the fix 5 of 5 sets of two
+  and of four requests share the prefix. Four requests with a 2K shared prefix on that card total 255 tokens/s
+  with this release's preset; the 16 GB preset gave 186 (measured with 0.6.0), and the difference includes the
+  preset's other gains. This is in the scheduler every Qwen3.8-27B target uses.
+
 ## [0.7.1] - 2026-11-19
 
 ### Added
@@ -456,6 +535,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.7.2]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.2
 [0.7.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.1
 [0.7.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.0
 [0.6.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.6.1

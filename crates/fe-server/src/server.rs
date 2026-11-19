@@ -388,6 +388,8 @@ struct Prepared {
     /// the sampling this request runs with and where each value came from (client / profile / default): logged, and sent in the
     /// `x-sampling-effective` response header
     effective: Json,
+    /// Engine::incoming's token, held from the request's arrival until it is submitted (start)
+    incoming: std::sync::Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>,
 }
 
 /// An f32 setting as JSON without the float32 tail (0.95, not 0.949999988079071).
@@ -723,6 +725,7 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
         include_usage: stream && req.stream_options.and_then(|o| o.include_usage).unwrap_or(false),
         echo: None,
         effective,
+        incoming: std::sync::Mutex::new(None),
     })
 }
 
@@ -785,6 +788,7 @@ fn prepare_completion(s: &AppState, req: CompletionRequest) -> Result<Prepared, 
         include_usage: stream && req.stream_options.and_then(|o| o.include_usage).unwrap_or(false),
         echo,
         effective,
+        incoming: std::sync::Mutex::new(None),
     })
 }
 
@@ -834,6 +838,8 @@ async fn start(s: &Arc<AppState>, p: &Prepared) -> Running {
     let cancel = CancelToken::new();
     let req = GenRequest { id: p.id.clone(), prompt_ids: p.prompt_ids.clone(), snapshots: p.snapshots.clone(),
         params: p.params.clone(), cancel: cancel.clone() };
+    // given back before the submit: the worker this request wakes must not wait for the request itself
+    drop(p.incoming.lock().unwrap_or_else(|e| e.into_inner()).take());
     s.engine.submit(req, TokenSink::with_slot(tx, Box::new(slot)));
     Running { rx, cancel }
 }
@@ -1384,7 +1390,8 @@ async fn full_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> R
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let t_start = Instant::now();
-    let prepared = parse_body::<ChatRequest>(&body).and_then(|r| prepare_chat(&state, r));
+    let incoming = state.engine.incoming();
+    let prepared = parse_body::<ChatRequest>(&body).and_then(|r| prepare_chat(&state, r)).map(|p| Prepared { incoming: std::sync::Mutex::new(incoming), ..p });
     if state.dump_dir.get().is_some() {
         match &prepared {
             Ok(p) => state.capture_body(&p.id, &body),
@@ -1401,7 +1408,8 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Re
 
 async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let t_start = Instant::now();
-    let prepared = parse_body::<CompletionRequest>(&body).and_then(|r| prepare_completion(&state, r));
+    let incoming = state.engine.incoming();
+    let prepared = parse_body::<CompletionRequest>(&body).and_then(|r| prepare_completion(&state, r)).map(|p| Prepared { incoming: std::sync::Mutex::new(incoming), ..p });
     run(state, prepared, t_start).await
 }
 
@@ -1449,6 +1457,7 @@ mod tests {
             include_usage,
             echo: None,
             effective: Json::Null,
+            incoming: std::sync::Mutex::new(None),
         }
     }
 

@@ -8,6 +8,7 @@
 #   spark   scripts/serve.sh        Qwen3.8-27B on one DGX Spark
 #   tp2     tools/serve-tp2.sh      Qwen3.8-27B on two DGX Sparks (run on node A; FERRITE_PEER = node B)
 #   rtx     tools/serve-5080.sh     Qwen3.8-27B on one RTX 5080 / RTX 5060 Ti 16 GB
+#   rtx-pro-4000  tools/serve-pro4000.sh  Qwen3.8-27B on one RTX PRO 4000 Blackwell 24 GB
 #   fnext   tools/serve-fnext.sh    Qwen3.8-Flash-Next on one or two RTX 5060 Ti / 16 GB cards
 #   b70     scripts/serve-xe.sh     Qwen3.8-27B on one Intel Arc Pro B70
 # Every launcher setting applies (FERRITE_HOST [0.0.0.0], FERRITE_PORT [8000], FERRITE_CTX, ...: the launcher's
@@ -35,6 +36,7 @@ launcher_of() {
     spark) echo scripts/serve.sh ;;
     tp2) echo tools/serve-tp2.sh ;;
     rtx|5080|5060ti) echo tools/serve-5080.sh ;;
+    rtx-pro-4000|pro4000) echo tools/serve-pro4000.sh ;;
     fnext) echo tools/serve-fnext.sh ;;
     b70|xe) echo scripts/serve-xe.sh ;;
     auto)
@@ -42,13 +44,17 @@ launcher_of() {
       cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2> /dev/null | head -n 1 | tr -d ' ' || true)
       case $cap in
         12.1) echo scripts/serve.sh; return ;;
-        12.0) echo tools/serve-5080.sh; return ;;
+        12.0) case $(nvidia-smi --query-gpu=name --format=csv,noheader 2> /dev/null | head -n 1) in
+                *"RTX PRO 4000"*) echo tools/serve-pro4000.sh ;;
+                *) echo tools/serve-5080.sh ;;
+              esac
+              return ;;
       esac
       for d in /sys/class/drm/card*/device/driver; do
         [ "$(basename "$(readlink -f "$d" 2> /dev/null)")" = xe ] && { echo scripts/serve-xe.sh; return; }
       done
-      die "no DGX Spark, RTX 50 or Arc B70 GPU found; name the target (ferritectl.sh start spark|tp2|rtx|fnext|b70)" ;;
-    *) die "unknown target '$1': spark, tp2, rtx, fnext or b70" ;;
+      die "no DGX Spark, RTX 50 or Arc B70 GPU found; name the target (ferritectl.sh start spark|tp2|rtx|rtx-pro-4000|fnext|b70)" ;;
+    *) die "unknown target '$1': spark, tp2, rtx, rtx-pro-4000, fnext or b70" ;;
   esac
 }
 
