@@ -27,6 +27,8 @@
 #                     holder (FERRITE_LOCK_WAIT=1 waits) [/var/tmp/ferrite-gpu.lock, shared, + the card's own lock]
 #   FERRITE_PLAIN     1 = plain decoding, no speculation (the "plain decoding" row of docs/arc-b70.md) [0]
 #   FERRITE_BIN       fe-server binary built with --features xe [bin/fe-server, else target/release/fe-server]
+# Sampling defaults and protections: sampling.json of the XQ folder, else Ferrite's copy for this model
+# (crates/fe-server/sampling.qwen3.8-27b-xq.json); FE_SAMPLING_JSON=<file> names another one (docs/arc-b70.md).
 # The first start quantizes the drafter's linears on the CPU (under a minute) and caches them as ferrite-xq*.bin in the
 # drafter folder (FE_DF_CACHE names another file when that folder is read-only).
 set -euo pipefail
@@ -100,6 +102,7 @@ mapfile -t xe < <(for d in /sys/class/drm/card[0-9]*; do [ "$(basename "$(readli
 fl_net
 fl_take_locks "${xe[@]:-card0}"
 fl_say "$xq, drafting $dr, prompt GEMM ${FERRITE_PREFILL:-i8}, ctx $ctx, requests at once $slots"
+fl_sampling "$xq" qwen3.8-27b-xq
 fl_banner "${FERRITE_MODEL_ID:-qwen3.8-27b}" "loading takes a few minutes from a hard disk; the first request after a new build compiles the GPU kernels, about 30 s"
 exec "$bin" --engine xe --model-dir "$xq" \
   --host "$FERRITE_HOST" --port "$FERRITE_PORT" --served-model-name "${FERRITE_MODEL_ID:-qwen3.8-27b}" \

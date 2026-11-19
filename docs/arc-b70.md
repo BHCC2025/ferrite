@@ -179,6 +179,41 @@ from; each lane's drafter pass, state update and cache append run on their own. 
 exactly as with `FERRITE_SLOTS=1`. Prompt processing takes the whole card: while one request processes its prompt
 the other lanes wait, and between two prompts that are waiting the decoding lanes get `FE_XE_QUANTUM` (8) windows.
 
+## Recommended settings
+
+The same as on the other targets ([model card](model-card.md#recommended-settings)): the base model's published
+values, which the server applies to the fields a request leaves out.
+
+| | Thinking | Non-thinking |
+|---|---|---|
+| temperature | 1.0 | 0.7 |
+| top_p | 0.95 | 0.80 |
+| top_k | 20 | 20 |
+| presence_penalty | 0 | 1.5 |
+| repetition_penalty | 1.0 | 1.0 |
+
+A value the client sends always wins, field by field. A request that sends `temperature: 0` gets no penalty added
+and stays on the greedy path (the device argmax with drafting). The values a request ran with are returned in the
+`x-sampling-effective` response header.
+
+The server reads them from `sampling.json` in the XQ folder. Ferrite's copy for this model is
+`crates/fe-server/sampling.qwen3.8-27b-xq.json`; `scripts/serve-xe.sh` uses it when the folder has none, and
+`FE_SAMPLING_JSON=<file>` names another file.
+
+The protections are the ones of the other engines, through the same code, with the same switches (the table in the
+[model card](model-card.md#recommended-settings)): reasoning capped at 8,192 tokens (`FE_MAX_REASONING_TOKENS`), the
+loop breaker and the repeated-sentence rule (`FE_LOOP_BREAKER`, `FE_LOOP_RULES`), never a stop token as the first
+token, `tool_choice` `required` limited to the offered names, the no-token timeout, and the non-finite check
+(`FE_FINITE_CHECK`). A protection acts at the token where it fires: the rows a verify window accepted past that
+token are not kept. On this engine:
+
+- The non-finite check covers the rows the host picks from (sampled requests, the first token when a stop token is
+  banned, constrained openings). Rows of a plain greedy request are decided on the device and are not checked.
+- The loop breaker reads every token of a chat reply. Where nothing fires the reply is unchanged; on a reply that
+  repeats its prompt almost verbatim it costs about 4% of decode speed, and nothing measurable on code.
+- With `FERRITE_DRAFT=mtp`, a first token the engine replaces (a banned stop token) leaves the MTP head's first
+  drafts made for the model's own choice; they are verified like any draft, so the text is not affected.
+
 ## How it gets its speed
 
 - **XQ decode at the memory bound.** The matrix-vector kernels decode packed 4 to 8-bit codes straight into the

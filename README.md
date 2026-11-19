@@ -98,7 +98,7 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.7.0` pins one) and the models into
+It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.7.1` pins one) and the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the
 models, and `--source` builds from source. Run again over an older release, the same command upgrades it.

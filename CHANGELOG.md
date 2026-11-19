@@ -4,6 +4,53 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-11-19
+
+### Added
+
+- **The Intel Arc Pro B70 engine has the protections of the other engines.** `--engine xe` now uses the guard the
+  27B and Flash-Next engines share: the reasoning cap, with the block closed by the engine
+  (`FE_MAX_REASONING_TOKENS`), the loop breaker and the repeated-sentence rule (`FE_LOOP_BREAKER`, `FE_LOOP_RULES`),
+  never a stop token as the first token of a reply, `tool_choice` `required` or a named function limited to the
+  offered names, and a non-finite check on the logit rows the host picks from (`FE_FINITE_CHECK`). A protection acts
+  at the token where it fires: the rows a verify window accepted past that token are not kept. What fired is
+  reported as on the other engines (the request-capture meta file). In 0.7.0 this engine ignored these settings.
+- **Sampling defaults per mode on the Arc B70.** New `crates/fe-server/sampling.qwen3.8-27b-xq.json`, with the
+  values of the 27B file. `scripts/serve-xe.sh` uses it when the XQ folder has no `sampling.json`
+  (`FE_SAMPLING_JSON=<file>` names another). A request that leaves its sampling fields out now gets the profile of
+  its mode, `x-sampling-effective` reports it, and `temperature: 0` keeps the greedy path with no penalty added.
+- **[docs/arc-b70.md](docs/arc-b70.md#recommended-settings)** has a "Recommended settings" section.
+
+### Changed
+
+- The Arc engine crates take a per-request gate from the server (`fe_xe::specgen::Spec` and `fe_xdf::spec::DfSpec`
+  have a `gate` field; `None`, the default, is the 0.7.0 behaviour).
+- **What this release was verified on.**
+  - One Intel Arc Pro B70 32 GB at the documented settings (180 W cap, 2000 MHz), XQ 5.0 bpw, DFlash2 drafting,
+    128K context, one request at a time: greedy replies to a six-prompt set (code, prose, chat, edit, tool call,
+    thinking) are byte-identical to 0.7.0. Code at 2K context is 168.8 tok/s before and after. A reply that repeats
+    its prompt went from 257.8 to 248.5 tok/s, the loop detector's own cost on repetitive text. The protections
+    fire: with `FE_MAX_REASONING_TOKENS=48` the block is closed at 48 reasoning tokens and the answer follows, a
+    forced repetition is ended by the loop breaker, and `tool_choice` `required` and a named function return a
+    call to an offered function, each with greedy and sampled requests. `x-sampling-effective` shows the profile.
+    The conformance suite's quick tier: 53 runs, 0 failed. The 100 unit tests of the Arc build pass.
+  - Not exercised on the Arc B70 with protections firing: more than one slot (`FERRITE_SLOTS` above 1), MTP
+    drafting (`FERRITE_DRAFT=mtp`) and plain decoding (`FERRITE_PLAIN=1`). The heavy conformance tier, a soak and
+    KL divergence were not run for this release.
+  - DGX Spark (aarch64), the published source: build and unit tests pass. The package on one node gives the same
+    greedy text as the 0.7.0 package on four prompts. On two nodes, started with `tools/serve-tp2.sh` at its
+    defaults and no `sampling.json` in the model folder: a request without sampling fields and with thinking off
+    runs with the non-thinking profile, a `temperature: 0` request gets no presence penalty, and a greedy reply is
+    identical to the 0.7.0 package's on two nodes. The speed runs, the long gates and the conformance suite were
+    not run again on the Sparks.
+  - RTX cards and Flash-Next: not built and not run for this release. Their engine code is unchanged since 0.7.0.
+
+### Fixed
+
+- **The two-node DGX Spark launcher loads the sampling file.** `tools/serve-tp2.sh` now calls `fl_sampling` like
+  `scripts/serve.sh`. In 0.7.0 a two-node server whose model folder had no `sampling.json` ran with the built-in
+  defaults; it now gets the 27B profiles and protections from `crates/fe-server/sampling.qwen3.8-27b.json`.
+
 ## [0.7.0] - 2026-11-19
 
 ### Added
@@ -409,6 +456,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.7.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.1
 [0.7.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.0
 [0.6.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.6.1
 [0.6.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.6.0

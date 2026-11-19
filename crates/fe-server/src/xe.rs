@@ -13,6 +13,15 @@
 //! `--engine xe-batch`: [`XeModel`], fe-xe's forward as a [`StepModel`] for fe-server's [`crate::batch::BatchEngine`] (one slot,
 //! prompt windows, plain one-row decode, reuse only when the cached sequence is a prefix of the next prompt).
 //!
+//! Protections: the code the other engines use (crate::guard::PhaseGuard over crate::loopdet::PhaseTracker), see [`Ctl`]. The guard is
+//! fed the tokens the client gets one at a time, accepted tokens only, inside the walk of every verify window (the `gate` of the
+//! drafting state): the walk ends at the token where the guard answers, so the rows a verify accepted past it are not kept and what a
+//! protection does never depends on how many rows a window verified. The reasoning cap and a reasoning cycle close the block (the
+//! engine writes `</think>` itself in a one-row step without drafts), an answer / tool-call cycle boosts the sampling for a stretch
+//! and ends the request if it comes back, the first token of a reply is never a stop token, a tool_choice-constrained reply opens
+//! with an offered name (one-row steps that choose among the candidates), and a host pick from a non-finite logit row ends its
+//! request with an error (FE_FINITE_CHECK). A request on which nothing fires gets the tokens it got without them.
+//!
 //! Kernels: fe-xe's sources (FE_XE_KERNELS / FE_XE_RUST_SPV; the reference SPIR-V only in the test-only `xe-ref` build).
 use std::path::Path;
 
@@ -87,8 +96,7 @@ impl StepModel for XeModel {
 // ------------------------------------------------------------------------------------------------------------------------------
 // XeEngine
 
-use std::cell::Cell;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use fe_xe::engine::Engine as XeDev;
@@ -98,7 +106,9 @@ use fe_xe::specgen::{Pick, Spec, SpecCfg, SpecStats};
 use fe_xdf::draft::DFlash;
 use fe_xdf::spec::{DfCfg, DfSpec};
 
-use crate::engine::{EngineInfo, Finish, FinishReason, GenRequest, Timings, TokenSink};
+use crate::engine::{EngineInfo, Finish, FinishReason, GenRequest, SamplingParams, Timings, TokenSink};
+use crate::guard::{Act, PhaseGuard};
+use crate::loopdet::PhaseEvents;
 use crate::sampler::Sampler;
 
 /// Options of [`XeEngine`].
@@ -402,8 +412,8 @@ impl Worker {
             }
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.serve(&req, &sink)));
             let msg = match res {
-                Ok(Ok((reason, cached, timings))) => {
-                    sink.finish(Finish { reason, cached_prompt_tokens: cached, timings: Some(timings), events: Default::default() });
+                Ok(Ok((reason, cached, timings, events))) => {
+                    sink.finish(Finish { reason, cached_prompt_tokens: cached, timings: Some(timings), events });
                     continue;
                 }
                 Ok(Err(e)) => format!("xe engine: {e:#}"),
@@ -537,7 +547,7 @@ impl Worker {
 
     /// One request: (finish reason, cached prompt tokens, timings: prompt = from the request's start on the engine thread to the
     /// first token and its drafts, generation = the steps after it, as arc-engine's worker reports them).
-    fn serve(&mut self, req: &GenRequest, sink: &TokenSink) -> Result<(FinishReason, usize, Timings)> {
+    fn serve(&mut self, req: &GenRequest, sink: &TokenSink) -> Result<(FinishReason, usize, Timings, PhaseEvents)> {
         let spec_k = self.opts.spec.k;
         let ids = &req.prompt_ids;
         let n = ids.len();
@@ -545,7 +555,7 @@ impl Worker {
         ensure!(n >= 2 && n + 32 < self.opts.ctx, "a prompt of {n} tokens does not fit the {}-token context", self.opts.ctx);
         let max_new = p.max_tokens.min(self.opts.ctx - n - 32);
         if max_new == 0 {
-            return Ok((FinishReason::Length, 0, Timings::default()));
+            return Ok((FinishReason::Length, 0, Timings::default(), PhaseEvents::default()));
         }
         let t0 = Instant::now();
         let pool = self.choose_pool(ids, max_new)?;
@@ -571,31 +581,21 @@ impl Worker {
         cuts.sort_unstable();
         cuts.dedup();
 
-        // host sampling (any non-greedy request, and greedy ones while min_tokens bans the stop ids); else the device argmax
-        let mut sampler = Sampler::new(p, ids);
-        let greedy = sampler.is_plain_greedy();
+        // the request's token choice and protections ([`Ctl`]): host sampling for any non-greedy phase, for greedy ones while
+        // min_tokens bans the stop ids and for the tokens the engine chooses itself; else the device argmax
+        let mut ctl = Ctl::new(req, self.e.cfg.vocab);
         let stops = p.stop_token_ids.clone();
-        let picked = Cell::new(0usize);
-        let host = |picked: usize| !greedy || (picked < p.min_tokens && !stops.is_empty());
-        let mut row16 = vec![0u16; self.e.cfg.vocab];
-        let mut pick_fn = |row: &[f32]| -> u32 {
-            for (d, &x) in row16.iter_mut().zip(row) {
-                *d = fe_xe::eval::to_bf16(x);
-            }
-            let banned: &[u32] = if picked.get() < p.min_tokens { &stops } else { &[] };
-            let t = sampler.sample_bf16_banning(&row16, banned);
-            sampler.accept(t);
-            picked.set(picked.get() + 1);
-            t
-        };
         let Worker { e, mt, df, ckpts, clock, opts, cur, .. } = self;
         let cur = *cur;
         let mut spec = match df {
             Some(_) => Drafting::Df(DfSpec::new(DfCfg { rows: opts.rcap, k: opts.spec.k, ..Default::default() })),
             None => Drafting::Mtp(Spec::new(opts.spec.clone())),
         };
+        spec.set_gate(ctl.gate());
+        let hosted = ctl.host();
         let first = {
-            let pick: Pick = if host(0) { Some(&mut pick_fn) } else { None };
+            let mut f = |row: &[f32]| ctl.pick(row);
+            let pick: Pick = if hosted { Some(&mut f) } else { None };
             match (&mut spec, df.as_mut()) {
                 (Drafting::Df(sp), Some(d)) => {
                     let dp: *const DFlash = d;
@@ -608,15 +608,15 @@ impl Worker {
                 _ => unreachable!(),
             }
         };
-        if !host(0) {
-            picked.set(1);
-        }
+        let first = ctl.first(e, spec.hist_mut(), first, hosted)?;
         let prefill_s = t0.elapsed().as_secs_f64();
         let mut reason = FinishReason::Length;
         if stops.contains(&first) {
             reason = FinishReason::Stop(first);
         } else if !sink.send_tokens(vec![first]) {
             reason = FinishReason::Cancelled;
+        } else if let Some(r) = ctl.after(spec.hist_mut(), n) {
+            reason = r;
         } else {
             let mut generated = 1;
             while generated < max_new {
@@ -624,18 +624,21 @@ impl Worker {
                     reason = FinishReason::Cancelled;
                     break;
                 }
-                let before = picked.get();
+                let before = ctl.picked;
+                let hosted = ctl.host();
+                // a token the engine chooses itself (the forced block end, a constrained opening): one row, no drafts
+                let left = if ctl.special() { 1 } else { max_new - generated };
                 let (kept, send, hit) = {
-                    let pick: Pick = if host(before) { Some(&mut pick_fn) } else { None };
+                    let mut f = |row: &[f32]| ctl.pick(row);
+                    let pick: Pick = if hosted { Some(&mut f) } else { None };
                     match (&mut spec, df.as_mut()) {
-                        (Drafting::Df(sp), Some(d)) => sp.step(e, d, max_new - generated, &stops, pick)?,
-                        (Drafting::Mtp(sp), _) => sp.step(e, mt.as_mut().context("MTP drafting without the MTP head")?, max_new - generated, &stops, pick)?,
+                        (Drafting::Df(sp), Some(d)) => sp.step(e, d, left, &stops, pick)?,
+                        (Drafting::Mtp(sp), _) => sp.step(e, mt.as_mut().context("MTP drafting without the MTP head")?, left, &stops, pick)?,
                         _ => unreachable!(),
                     }
                 };
-                if picked.get() == before {
-                    picked.set(before + kept.len());
-                }
+                ctl.count(before, kept.len());
+                ensure!(!ctl.bad, NONFINITE);
                 let mut out: Vec<u32> = kept[..send].to_vec();
                 if hit {
                     let t = out.pop().unwrap();
@@ -650,8 +653,13 @@ impl Worker {
                     reason = FinishReason::Cancelled;
                     break;
                 }
+                if let Some(r) = ctl.after(spec.hist_mut(), n) {
+                    reason = r;
+                    break;
+                }
             }
         }
+        let events = ctl.events();
         // keep the sequence and checkpoint its end: the next turn of a conversation resumes here
         let pos = e.pos as usize;
         self.hist = std::mem::take(spec.hist_mut());
@@ -689,7 +697,222 @@ impl Worker {
             tracing::info!("{}: {r}", req.id);
             self.e.kx.profile_reset()?;
         }
-        Ok((reason, c0, timings))
+        Ok((reason, c0, timings, events))
+    }
+}
+
+// ------------------------------------------------------------------------------------------------------------------------------
+// Protections (crate::guard: the code the 27B and the Flash-Next engines use)
+
+/// A phase's sampling as this engine keeps it: the request's parameters with that phase's values (crate::guard).
+#[derive(Clone, PartialEq)]
+struct Mode(SamplingParams);
+
+const NONFINITE: &str = "the model produced non-finite logits";
+
+/// FE_FINITE_CHECK (default on): a host pick from a logit row that holds an infinity or a NaN ends its request with an error.
+/// Rows the device argmax decides (plain greedy) never come to the host and are not checked.
+fn finite_check() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FE_FINITE_CHECK").map(|v| v != "0").unwrap_or(true))
+}
+
+/// FE_TEST_NONFINITE=n: host pick n of this process counts as non-finite (tests the path).
+fn test_nonfinite() -> bool {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static PICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = *N.get_or_init(|| std::env::var("FE_TEST_NONFINITE").ok().and_then(|v| v.parse().ok()));
+    let k = PICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    n == Some(k)
+}
+
+/// The request's guard as the drafting state's gate sees it: fed every kept token of a window in order.
+struct Gate {
+    guard: Option<PhaseGuard<Mode>>,
+    stops: Vec<u32>,
+    /// a stop token was kept in this step: the tokens after it are not the client's and are not fed
+    ended: bool,
+    /// what the guard asked for at the last token it was fed
+    act: Act<Mode>,
+}
+
+impl Gate {
+    /// One kept token; false: the guard acts at this token, the walk ends here. A stop token ends the request in the
+    /// caller and leaves the walk alone (as without a guard).
+    fn feed(&mut self, t: u32) -> bool {
+        if self.ended {
+            return true;
+        }
+        if self.stops.contains(&t) {
+            self.ended = true;
+            return true;
+        }
+        if let Some(g) = self.guard.as_mut() {
+            self.act = g.feed(t);
+        }
+        self.act == Act::None
+    }
+}
+
+/// One request's token choice on the host and its protections: the sampler of the current phase (reasoning / answer /
+/// boosted stretch), the guard, and the tokens the engine chooses itself (the forced block end, a constrained opening).
+struct Ctl {
+    gate: Arc<Mutex<Gate>>,
+    guarded: bool,
+    sampler: Sampler,
+    /// the current phase decodes plain greedy (the device argmax)
+    greedy: bool,
+    row16: Vec<u16>,
+    /// tokens chosen so far (the stop ban counts them)
+    picked: usize,
+    min_tokens: usize,
+    stops: Vec<u32>,
+    /// a token the engine writes itself as the next one instead of the model's (the forced `</think>`)
+    force: Option<u32>,
+    /// constrained opening (tool_choice required): the offered sequences still possible and the tokens chosen so far
+    cands: Vec<Vec<u32>>,
+    depth: usize,
+    /// a host pick read a non-finite row
+    bad: bool,
+}
+
+impl Ctl {
+    fn new(req: &GenRequest, vocab: usize) -> Ctl {
+        let p = &req.params;
+        let (guard, mode) = match PhaseGuard::new(p, |q| Mode(q.clone())) {
+            Some((g, s)) => (Some(g), s),
+            None => (None, Mode(p.clone())),
+        };
+        let sampler = Sampler::new(&mode.0, &req.prompt_ids);
+        let greedy = sampler.is_plain_greedy();
+        let guarded = guard.is_some();
+        let gate = Arc::new(Mutex::new(Gate { guard, stops: p.stop_token_ids.clone(), ended: false, act: Act::None }));
+        let cands = p.prefix_choices.iter().filter(|c| !c.is_empty()).cloned().collect();
+        Ctl { gate, guarded, sampler, greedy, row16: vec![0u16; vocab], picked: 0, min_tokens: p.min_tokens, stops: p.stop_token_ids.clone(), force: None, cands,
+            depth: 0, bad: false }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Gate> {
+        self.gate.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The gate of the request's drafting state; None without a guard (the walks are then exactly the unguarded ones).
+    fn gate(&self) -> Option<Box<dyn FnMut(u32) -> bool + Send>> {
+        let g = self.gate.clone();
+        self.guarded.then(|| Box::new(move |t: u32| g.lock().unwrap_or_else(|e| e.into_inner()).feed(t)) as Box<dyn FnMut(u32) -> bool + Send>)
+    }
+
+    /// The reply still has to open with one of the offered sequences.
+    fn opening(&self) -> bool {
+        !self.cands.is_empty() && !self.cands.iter().any(|c| c.len() == self.depth)
+    }
+
+    /// The next token is the engine's own choice (the forced block end, a constrained opening): a one-row step without drafts.
+    fn special(&self) -> bool {
+        self.force.is_some() || self.opening()
+    }
+
+    /// The next pick needs the logit row on the host.
+    fn host(&self) -> bool {
+        self.special() || !self.greedy || (self.picked < self.min_tokens && !self.stops.is_empty())
+    }
+
+    /// The next token from a host logit row.
+    fn pick(&mut self, row: &[f32]) -> u32 {
+        if let Some(t) = self.force.take() {
+            self.sampler.accept(t);
+            self.picked += 1;
+            return t;
+        }
+        if test_nonfinite() || (finite_check() && !row.iter().all(|x| x.is_finite())) {
+            self.bad = true;
+        }
+        let t = if self.opening() {
+            // among the candidates still possible, by the model's own logits
+            let mut lg = vec![f32::NEG_INFINITY; row.len()];
+            for c in &self.cands {
+                let t = c[self.depth] as usize;
+                if t < lg.len() {
+                    lg[t] = row[t];
+                }
+            }
+            let t = if self.greedy { crate::sampler::argmax(&lg) } else { self.sampler.sample(&mut lg) };
+            self.cands.retain(|c| c[self.depth] == t);
+            self.depth += 1;
+            t
+        } else {
+            for (d, &x) in self.row16.iter_mut().zip(row) {
+                *d = fe_xe::eval::to_bf16(x);
+            }
+            // the first token of a reply is never a stop token (an empty reply is never wanted)
+            let banned: &[u32] = if self.picked < self.min_tokens.max(1) { &self.stops } else { &[] };
+            self.sampler.sample_bf16_banning(&self.row16, banned)
+        };
+        self.sampler.accept(t);
+        self.picked += 1;
+        t
+    }
+
+    /// A step whose tokens the device argmax chose counts them here.
+    fn count(&mut self, before: usize, kept: usize) {
+        if self.picked == before {
+            self.picked = before + kept;
+        }
+    }
+
+    /// The first token of the reply, as the prompt's last window chose it (`hosted`: through [`Ctl::pick`]). A stop token the
+    /// device argmax chose is replaced by the best other token of the same row (`hist` ends with the token, not yet fed).
+    fn first(&mut self, e: &XeDev, hist: &mut [u32], first: u32, hosted: bool) -> Result<u32> {
+        let mut first = first;
+        if !hosted {
+            if self.stops.contains(&first) {
+                let mut lg = vec![0f32; MAX_ROWS as usize * self.row16.len()];
+                e.fetch_logits(&mut lg)?;
+                first = self.pick(&lg[..self.row16.len()]);
+                if let Some(l) = hist.last_mut() {
+                    *l = first;
+                }
+            } else {
+                self.picked = 1;
+            }
+        }
+        ensure!(!self.bad, NONFINITE);
+        if !self.stops.contains(&first) {
+            self.lock().feed(first);
+        }
+        Ok(first)
+    }
+
+    /// After a step's tokens went to the client: what the guard asked for at the last of them. Some(reason): the request ends.
+    /// `hist`: the prompt (`n` tokens) and everything generated.
+    fn after(&mut self, hist: &[u32], n: usize) -> Option<FinishReason> {
+        let act = {
+            let mut g = self.lock();
+            g.ended = false;
+            std::mem::replace(&mut g.act, Act::None)
+        };
+        match act {
+            Act::None => {}
+            // an answer-phase cycle that came back after the boost: end cleanly (as the token limit would)
+            Act::End => return Some(FinishReason::Length),
+            // the engine closes the reasoning block: `</think>` follows this token
+            Act::Force(t) => self.force = Some(t),
+            Act::Sampling(m) => {
+                let n = n.min(hist.len());
+                let mut s = Sampler::new(&m.0, &hist[..n]);
+                for &t in &hist[n..] {
+                    s.accept(t);
+                }
+                self.greedy = s.is_plain_greedy();
+                self.sampler = s;
+            }
+        }
+        None
+    }
+
+    /// What fired so far.
+    fn events(&self) -> PhaseEvents {
+        self.lock().guard.as_ref().map(|g| g.events()).unwrap_or_default()
     }
 }
 
@@ -710,6 +933,12 @@ impl Drafting {
         match self {
             Drafting::Mtp(s) => &s.st,
             Drafting::Df(s) => &s.st,
+        }
+    }
+    fn set_gate(&mut self, g: Option<Box<dyn FnMut(u32) -> bool + Send>>) {
+        match self {
+            Drafting::Mtp(s) => s.gate = g,
+            Drafting::Df(s) => s.gate = g,
         }
     }
 }
@@ -749,10 +978,8 @@ struct Run {
     req: GenRequest,
     sink: TokenSink,
     sp: DfSpec,
-    sampler: Sampler,
-    row16: Vec<u16>,
-    picked: usize,
-    greedy: bool,
+    /// the request's token choice and protections
+    ctl: Ctl,
     stops: Vec<u32>,
     max_new: usize,
     generated: usize,
@@ -847,6 +1074,11 @@ impl Worker {
             Ok(Ok(done)) => {
                 let go = done.is_empty();
                 for (li, reason) in done {
+                    if let FinishReason::Error(m) = &reason {
+                        // (non-finite logits on one lane: its state cannot be kept)
+                        self.fail_lane(li, format!("xe engine: {m}"));
+                        continue;
+                    }
                     if let Err(e) = self.finish_run(li, reason) {
                         tracing::error!("xe lane {li}: {e:#}");
                         self.fail_lane(li, format!("xe engine: {e:#}"));
@@ -902,7 +1134,9 @@ impl Worker {
             d.select_ring(li);
             let pos = lanes[li].pos;
             let run = lanes[li].run.as_mut().unwrap();
-            let plan = run.sp.plan(e, d, pos, run.max_new - run.generated, per)?;
+            // a token the engine chooses itself (the forced block end, a constrained opening): one row, no drafts
+            let left = if run.ctl.special() { 1 } else { run.max_new - run.generated };
+            let plan = run.sp.plan(e, d, pos, left, per)?;
             row0s.push(tokens.len());
             tokens.extend_from_slice(&plan.win);
             seqs.push(fe_xe::engine::ForestSeq { pos: pos as u32, ctx: lanes[li].cap as u32, par: plan.par.clone(),
@@ -920,35 +1154,25 @@ impl Worker {
             let lane = &mut lanes[li];
             let lpos = &mut lane.pos;
             let run = lane.run.as_mut().unwrap();
-            let Run { req, sink, sp, sampler, row16, picked, greedy, stops, max_new, generated, .. } = &mut **run;
-            let p = &req.params;
-            let greedy = *greedy;
+            let Run { req, sink, sp, ctl, stops, max_new, generated, .. } = &mut **run;
             let stops: &[u32] = stops;
-            let pk = Cell::new(*picked);
-            let before = pk.get();
-            let host = !greedy || (before < p.min_tokens && !stops.is_empty());
-            let mut pick_fn = |row: &[f32]| -> u32 {
-                for (d, &x) in row16.iter_mut().zip(row) {
-                    *d = fe_xe::eval::to_bf16(x);
-                }
-                let banned: &[u32] = if pk.get() < p.min_tokens { stops } else { &[] };
-                let t = sampler.sample_bf16_banning(row16, banned);
-                sampler.accept(t);
-                pk.set(pk.get() + 1);
-                t
-            };
+            let before = ctl.picked;
+            let host = ctl.host();
+            let left = if ctl.special() { 1 } else { *max_new - *generated };
             let (row0, rows) = (row0s[k], plans[k].win.len());
             let seq = &seqs[k];
             let mut commit = |e: &mut XeDev, path: &[usize]| e.commit_forest(k, seq, path);
             let (kept, send, hit) = {
-                let pick: Pick = if host { Some(&mut pick_fn) } else { None };
-                sp.settle(e, d, &plans[k], row0, &am[row0..row0 + rows], *max_new - *generated, stops, pick, &mut commit, 0.0)?
+                let mut f = |row: &[f32]| ctl.pick(row);
+                let pick: Pick = if host { Some(&mut f) } else { None };
+                sp.settle(e, d, &plans[k], row0, &am[row0..row0 + rows], left, stops, pick, &mut commit, 0.0)?
             };
-            if pk.get() == before {
-                pk.set(before + kept.len());
-            }
-            *picked = pk.get();
+            ctl.count(before, kept.len());
             *lpos += kept.len();
+            if ctl.bad {
+                done.push((li, FinishReason::Error(NONFINITE.into())));
+                continue;
+            }
             let mut out: Vec<u32> = kept[..send].to_vec();
             if hit {
                 let t = out.pop().unwrap();
@@ -960,6 +1184,8 @@ impl Worker {
                 *generated += out.len();
                 if !sink.send_tokens(out) {
                     done.push((li, FinishReason::Cancelled));
+                } else if let Some(r) = ctl.after(&sp.hist, req.prompt_ids.len()) {
+                    done.push((li, r));
                 } else if *generated >= *max_new {
                     done.push((li, FinishReason::Length));
                 }
@@ -1179,19 +1405,18 @@ impl Worker {
         cuts.extend(hints);
         cuts.sort_unstable();
         cuts.dedup();
-        let sampler = Sampler::new(p, ids);
-        let greedy = sampler.is_plain_greedy();
+        let ctl = Ctl::new(&job.req, self.e.cfg.vocab);
         let stops = p.stop_token_ids.clone();
-        let sp = DfSpec::new(DfCfg { rows: self.opts.rcap, k: self.opts.spec.k, ..Default::default() });
+        let mut sp = DfSpec::new(DfCfg { rows: self.opts.rcap, k: self.opts.spec.k, ..Default::default() });
+        sp.gate = ctl.gate();
         self.clock += 1;
         let l = &mut self.lanes[t];
         l.hist.clear();
         l.pos = c0;
         l.saved = false;
         l.stamp = self.clock;
-        let row16 = vec![0u16; self.e.cfg.vocab];
         let XeJob { req, sink } = job;
-        l.run = Some(Box::new(Run { req, sink, sp, sampler, row16, picked: 0, greedy, stops, max_new, generated: 0, c0, cuts, hints: hints_all, tailcut, clean,
+        l.run = Some(Box::new(Run { req, sink, sp, ctl, stops, max_new, generated: 0, c0, cuts, hints: hints_all, tailcut, clean,
             started: false, t0: Instant::now(), prefill_s: 0.0 }));
         Ok(())
     }
@@ -1203,25 +1428,12 @@ impl Worker {
         let Worker { e, df, ckpts, clock, lanes, .. } = self;
         let d = df.as_mut().context("lanes need the DFlash2 drafter")?;
         let run = lanes[li].run.as_mut().context("no request on the lane")?;
-        let Run { req, sink, sp, sampler, row16, picked, greedy, stops, max_new, generated, c0, cuts, hints, tailcut, clean, started, t0, prefill_s } = &mut **run;
+        let Run { req, sink, sp, ctl, stops, max_new, generated, c0, cuts, hints, tailcut, clean, started, t0, prefill_s } = &mut **run;
         if *max_new == 0 {
             return Ok(Some(FinishReason::Length));
         }
-        let p = &req.params;
-        let greedy = *greedy;
         let stops: &[u32] = stops;
-        let pk = Cell::new(*picked);
-        let host = |picked: usize| !greedy || (picked < p.min_tokens && !stops.is_empty());
-        let mut pick_fn = |row: &[f32]| -> u32 {
-            for (d, &x) in row16.iter_mut().zip(row) {
-                *d = fe_xe::eval::to_bf16(x);
-            }
-            let banned: &[u32] = if pk.get() < p.min_tokens { stops } else { &[] };
-            let t = sampler.sample_bf16_banning(row16, banned);
-            sampler.accept(t);
-            pk.set(pk.get() + 1);
-            t
-        };
+        let n = req.prompt_ids.len();
         let out = if !*started {
             let ids = &req.prompt_ids;
             let (run_clean, tc, pool) = (*clean, *tailcut, li as u8);
@@ -1237,13 +1449,13 @@ impl Worker {
                 }
                 Ok(())
             };
+            let hosted = ctl.host();
             let first = {
-                let pick: Pick = if host(0) { Some(&mut pick_fn) } else { None };
+                let mut f = |row: &[f32]| ctl.pick(row);
+                let pick: Pick = if hosted { Some(&mut f) } else { None };
                 sp.prefill(e, d, ids, *c0, cuts, &mut on_cut, pick)?
             };
-            if !host(0) {
-                pk.set(1);
-            }
+            let first = ctl.first(e, &mut sp.hist, first, hosted)?;
             *started = true;
             *prefill_s = t0.elapsed().as_secs_f64();
             if stops.contains(&first) {
@@ -1252,19 +1464,22 @@ impl Worker {
                 Some(FinishReason::Cancelled)
             } else {
                 *generated = 1;
-                (*generated >= *max_new).then_some(FinishReason::Length)
+                ctl.after(&sp.hist, n).or((*generated >= *max_new).then_some(FinishReason::Length))
             }
         } else if req.cancel.is_cancelled() || sink.is_closed() {
             Some(FinishReason::Cancelled)
         } else {
-            let before = pk.get();
+            let before = ctl.picked;
+            let hosted = ctl.host();
+            // a token the engine chooses itself (the forced block end, a constrained opening): one row, no drafts
+            let left = if ctl.special() { 1 } else { *max_new - *generated };
             let (kept, send, hit) = {
-                let pick: Pick = if host(before) { Some(&mut pick_fn) } else { None };
-                sp.step(e, d, *max_new - *generated, stops, pick)?
+                let mut f = |row: &[f32]| ctl.pick(row);
+                let pick: Pick = if hosted { Some(&mut f) } else { None };
+                sp.step(e, d, left, stops, pick)?
             };
-            if pk.get() == before {
-                pk.set(before + kept.len());
-            }
+            ctl.count(before, kept.len());
+            ensure!(!ctl.bad, NONFINITE);
             let mut out: Vec<u32> = kept[..send].to_vec();
             if hit {
                 let t = out.pop().unwrap();
@@ -1277,11 +1492,10 @@ impl Worker {
                 if !sink.send_tokens(out) {
                     Some(FinishReason::Cancelled)
                 } else {
-                    (*generated >= *max_new).then_some(FinishReason::Length)
+                    ctl.after(&sp.hist, n).or((*generated >= *max_new).then_some(FinishReason::Length))
                 }
             }
         };
-        *picked = pk.get();
         Ok(out)
     }
 
@@ -1289,9 +1503,10 @@ impl Worker {
     fn finish_run(&mut self, li: usize, reason: FinishReason) -> Result<()> {
         let mut run = self.lanes[li].run.take().context("no request on the lane")?;
         let sink = run.sink;
+        let events = run.ctl.events();
         if !run.started {
             // ended before its prompt was processed (cancelled, or nothing to generate): nothing new is in the caches
-            sink.finish(Finish { reason, cached_prompt_tokens: 0, timings: None, events: Default::default() });
+            sink.finish(Finish { reason, cached_prompt_tokens: 0, timings: None, events });
             return Ok(());
         }
         let r = (|| -> Result<()> {
@@ -1313,7 +1528,7 @@ impl Worker {
             draft: Some((s.drafted, s.accepted)) };
         match r {
             Ok(()) => {
-                sink.finish(Finish { reason, cached_prompt_tokens: run.c0, timings: Some(timings), events: Default::default() });
+                sink.finish(Finish { reason, cached_prompt_tokens: run.c0, timings: Some(timings), events });
                 Ok(())
             }
             Err(e) => {
@@ -1321,5 +1536,95 @@ impl Worker {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::CancelToken;
+
+    const TE: u32 = 30;
+    const STOP: u32 = 7;
+    const V: usize = 64;
+
+    fn ctl(p: SamplingParams) -> Ctl {
+        let req = GenRequest { id: "t".into(), prompt_ids: vec![1, 2, 3], snapshots: vec![], params: p, cancel: CancelToken::new() };
+        Ctl::new(&req, V)
+    }
+
+    fn greedy() -> SamplingParams {
+        SamplingParams { temperature: 0.0, max_tokens: 100, stop_token_ids: vec![STOP], ..Default::default() }
+    }
+
+    #[test]
+    fn a_request_without_a_guard_has_no_gate_and_stays_on_the_device() {
+        let c = ctl(greedy());
+        assert!(c.gate().is_none() && !c.host() && !c.special());
+        assert_eq!(c.events(), PhaseEvents::default());
+    }
+
+    #[test]
+    fn the_gate_ends_the_walk_at_the_cap_and_the_engine_writes_the_block_end() {
+        let mut c = ctl(SamplingParams { think_end: Some(TE), max_reasoning: 3, ..greedy() });
+        let mut gate = c.gate().unwrap();
+        // five verified rows: the walk ends at the third token
+        let fed: Vec<bool> = [10u32, 11, 12].iter().map(|&t| gate(t)).collect();
+        assert_eq!(fed, vec![true, true, false]);
+        let hist = [1, 2, 3, 10, 11, 12];
+        assert!(c.after(&hist, 3).is_none() && c.force == Some(TE) && c.special() && c.host());
+        // the forced token is the next pick whatever the row holds, and is fed like any other
+        let row = vec![0f32; V];
+        assert_eq!(c.pick(&row), TE);
+        assert!(gate(TE) && !c.special() && !c.host());
+        assert!(c.after(&[1, 2, 3, 10, 11, 12, TE], 3).is_none());
+        let ev = c.events();
+        assert!(ev.reasoning_capped && ev.reasoning_tokens == 4);
+        // a stop token is the caller's: not fed, the walk goes on as without a guard
+        assert!(gate(STOP) && gate(12));
+        assert_eq!(c.events().reasoning_tokens, 4);
+    }
+
+    #[test]
+    fn a_sampled_reasoning_block_hands_over_to_a_greedy_answer_at_the_block_end() {
+        let mut p = SamplingParams { think_end: Some(TE), ..greedy() };
+        let mut r = p.clone();
+        r.temperature = 1.0;
+        r.think_end = None;
+        p.reasoning = Some(Box::new(r));
+        let mut c = ctl(p);
+        assert!(!c.greedy && c.host());
+        let mut gate = c.gate().unwrap();
+        assert!(gate(10) && !gate(TE));
+        assert!(c.after(&[1, 2, 3, 10, TE], 3).is_none() && c.greedy && !c.host());
+    }
+
+    #[test]
+    fn the_first_token_is_never_a_stop_token_and_an_opening_is_one_of_the_offered() {
+        let mut c = ctl(SamplingParams { temperature: 0.7, seed: Some(1), ..greedy() });
+        let mut row = vec![-30f32; V];
+        row[STOP as usize] = 30.0;
+        row[20] = 5.0;
+        assert_eq!(c.pick(&row), 20);
+        // after the first token the model's own choice stands
+        assert_eq!(c.pick(&row), STOP);
+        assert!(!c.bad);
+        row[5] = f32::NAN;
+        c.pick(&row);
+        assert!(c.bad);
+        // tool_choice required: `NAME>\n` of an offered function, token by token from the model's logits
+        let mut c = ctl(SamplingParams { prefix_choices: vec![vec![40, 41], vec![40, 42, 43], vec![44]], ..greedy() });
+        assert!(c.opening() && c.special() && c.host());
+        let mut row = vec![0f32; V];
+        row[9] = 9.0;
+        row[40] = 1.0;
+        row[42] = 2.0;
+        row[41] = 1.5;
+        assert_eq!(c.pick(&row), 40);
+        assert!(c.opening());
+        assert_eq!(c.pick(&row), 42);
+        assert_eq!(c.pick(&row), 43);
+        // the opening is complete: the model goes on freely
+        assert!(!c.opening() && !c.host());
     }
 }

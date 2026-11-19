@@ -62,6 +62,9 @@ pub struct Spec {
     drafts: [u32; 16],
     nd: usize,
     logits: Vec<f32>,
+    /// Called with every kept token of a window, in order (the server's per-request protections): false ends the walk at
+    /// that token, so the rows a verify accepted after it are not kept. None: every agreeing row is kept.
+    pub gate: Option<Box<dyn FnMut(u32) -> bool + Send>>,
 }
 
 impl Spec {
@@ -69,11 +72,16 @@ impl Spec {
         let k = cfg.k.min(15);
         let mut adapt = Adapt::new(k.max(1));
         adapt.step = cfg.dstep;
-        Spec { cfg, st: SpecStats::default(), hist: Vec::new(), adapt, gram: GramIndex::default(), copy: [0; 16], nc: 0, drafts: [0; 16], nd: 0, logits: Vec::new() }
+        Spec { cfg, st: SpecStats::default(), hist: Vec::new(), adapt, gram: GramIndex::default(), copy: [0; 16], nc: 0, drafts: [0; 16], nd: 0, logits: Vec::new(), gate: None }
     }
 
     fn k(&self) -> usize {
         self.cfg.k.min(15)
+    }
+
+    /// The gate's answer for a kept token (true without a gate).
+    fn pass(&mut self, t: u32) -> bool {
+        self.gate.as_mut().is_none_or(|f| f(t))
     }
 
     fn pick_row(&mut self, e: &Engine, rows: usize, pick: &mut Pick, row: usize, am: &[i32]) -> Result<u32> {
@@ -196,6 +204,7 @@ impl Spec {
                 e.argmax(&mut am)?;
             }
             g[0] = self.pick_row(e, 1, &mut pick, 0, &am)?;
+            self.pass(g[0]);
             self.st.plain += 1;
         } else {
             win[0] = lastt;
@@ -205,7 +214,8 @@ impl Spec {
             }
             loop {
                 g[a] = self.pick_row(e, kd + 1, &mut pick, a, &am)?;
-                if a < kd && win[1 + a] == g[a] {
+                let go = self.pass(g[a]);
+                if go && a < kd && win[1 + a] == g[a] {
                     a += 1;
                 } else {
                     break;

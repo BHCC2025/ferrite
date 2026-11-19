@@ -65,6 +65,7 @@ ENVS="$ENVS FE_CACHE=$CACHEV"   # prompt cache (turn snapshots, parking, shared 
 if [ $DRY = 0 ]; then
   fl_net
   fl_say "rank 0 here, rank 1 on ${FERRITE_PEER:-<FERRITE_PEER unset>}; drafting $DRAFT, prompt weights $PROMPT, ctx $CTXV x $SLOTS slots, prompt cache $([ "$CACHEV" = 1 ] && echo on || echo off)"
+  root=$PWD fl_sampling "$M" qwen3.8-27b   # the server (rank 0) reads it; as scripts/serve.sh
   fl_banner "${FERRITE_MODEL_ID:-qwen3.8-27b}" "two nodes, loading takes about a minute"
 else
   FERRITE_HOST=${FERRITE_HOST:-0.0.0.0}; FERRITE_PORT=${FERRITE_PORT:-8000}

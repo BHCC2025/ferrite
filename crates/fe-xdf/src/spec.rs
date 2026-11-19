@@ -85,6 +85,9 @@ pub struct DfSpec {
     adapt: fe_xe::spec::Adapt,
     /// EMA of the accepted drafts a window (trees below cfg.tree_below)
     acc_ema: f32,
+    /// Called with every kept token of a window, in order (the server's per-request protections): false ends the walk at
+    /// that token, so the rows a verify accepted after it are not kept. None: every agreeing row is kept.
+    pub gate: Option<Box<dyn FnMut(u32) -> bool + Send>>,
 }
 
 impl DfSpec {
@@ -95,7 +98,12 @@ impl DfSpec {
     fn with_copy(cfg: DfCfg) -> DfSpec {
         DfSpec { cfg, st: SpecStats::default(), tm: DfTimes::default(), hist: Vec::new(), logits: Vec::new(),
             rounds: std::env::var("FE_DF_TREESIM").is_ok().then(Vec::new), gram: Default::default(), copy: [0; 16],
-            adapt: { let mut a = fe_xe::spec::Adapt::new(15); a.step = 0.0; a.absorb = 0.0; a }, acc_ema: 3.0 }
+            adapt: { let mut a = fe_xe::spec::Adapt::new(15); a.step = 0.0; a.absorb = 0.0; a }, acc_ema: 3.0, gate: None }
+    }
+
+    /// The gate's answer for a kept token (true without a gate).
+    fn pass(&mut self, t: u32) -> bool {
+        self.gate.as_mut().is_none_or(|f| f(t))
     }
 
     fn pick_row(&mut self, e: &Engine, rows: usize, pick: &mut Pick, row: usize, am: &[i32]) -> Result<u32> {
@@ -258,6 +266,7 @@ impl DfSpec {
                 e.argmax(&mut am)?;
             }
             g[0] = self.pick_row(e, 1, &mut pick, 0, &am)?;
+            self.pass(g[0]);
             self.st.plain += 1;
         } else {
             e.forward_rows(&win, (kd + 1) as u32, false)?;
@@ -270,7 +279,8 @@ impl DfSpec {
             self.tm.verify = acc;
             loop {
                 g[a] = self.pick_row(e, kd + 1, &mut pick, a, &am)?;
-                if a < kd && win[1 + a] == g[a] {
+                let go = self.pass(g[a]);
+                if go && a < kd && win[1 + a] == g[a] {
                     a += 1;
                 } else {
                     break;
@@ -336,8 +346,9 @@ impl DfSpec {
             let row = *path.last().unwrap();
             let g = self.pick_row(e, rows, pick, row, &am)?;
             kept.push(g);
+            let go = self.pass(g);
             match (row + 1..rows).find(|&c| par[c] == row as i32 && win[c] == g) {
-                Some(c) if kept.len() < left => path.push(c),
+                Some(c) if go && kept.len() < left => path.push(c),
                 _ => break,
             }
         }
@@ -442,8 +453,9 @@ impl DfSpec {
                 }
             };
             kept.push(g);
+            let go = self.pass(g);
             match (row + 1..rows).find(|&c| plan.par[c] == row as i32 && plan.win[c] == g) {
-                Some(c) if kept.len() < left => path.push(c),
+                Some(c) if go && kept.len() < left => path.push(c),
                 _ => break,
             }
         }

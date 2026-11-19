@@ -22,7 +22,7 @@
 # it, and there is no API key. FERRITE_HOST=127.0.0.1 keeps it on this machine.
 #
 # Options:
-#   --version V    install release V (e.g. 0.7.0) instead of the latest one
+#   --version V    install release V (e.g. 0.7.1) instead of the latest one
 #   --source       build from source even when a release tarball exists
 #   --no-serve     stop after the models (step 4)
 #   -h, --help     this text
@@ -31,13 +31,13 @@
 #   FERRITE_MODELS       the model folder [/var/tmp/models]; the other settings of scripts/serve.sh (FERRITE_PORT,
 #                        FERRITE_HOST, FERRITE_CTX, FERRITE_SLOTS, ...) apply to the server it starts
 #   FERRITE_MIN_FREE_GB  memory that must be available before it starts the server [95]
-#   FERRITE_VERSION      the release to install [the latest published release; 0.7.0 when GitHub cannot be asked]
+#   FERRITE_VERSION      the release to install [the latest published release; 0.7.1 when GitHub cannot be asked]
 #   FERRITE_RELEASE_URL  the release tarball [the GitHub release of that version]; its .sha256 is checked
 #   FERRITE_REPO_URL     the repository to clone for a source build [https://github.com/BHCC2025/ferrite.git]
 set -euo pipefail
 
 REPO=BHCC2025/ferrite
-DEFAULT_VERSION=0.7.0   # the release this installer comes with: used when GitHub cannot be asked for the latest one
+DEFAULT_VERSION=0.7.1   # the release this installer comes with: used when GitHub cannot be asked for the latest one
 REPO_URL=${FERRITE_REPO_URL:-https://github.com/$REPO.git}
 VERSION=${FERRITE_VERSION:-}
 source_build=0
@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --source) source_build=1 ;;
     --no-serve) serve=0 ;;
-    --version) VERSION=${2:-}; [ -n "$VERSION" ] || { echo "install: --version needs a version (e.g. 0.7.0)" >&2; exit 1; }; shift ;;
+    --version) VERSION=${2:-}; [ -n "$VERSION" ] || { echo "install: --version needs a version (e.g. 0.7.1)" >&2; exit 1; }; shift ;;
     --version=*) VERSION=${1#--version=} ;;
     -h|--help)
       if [ -f "${BASH_SOURCE[0]:-}" ]; then sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
