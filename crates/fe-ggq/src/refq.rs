@@ -92,6 +92,24 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     }
 }
 
+/// ggml's GGML_E8M0_TO_FP32_HALF: 2^(x - 128).
+#[inline]
+pub fn e8m0_half(x: u8) -> f32 {
+    f32::from_bits(if x < 2 { 0x0020_0000u32 << x } else { (x as u32 - 1) << 23 })
+}
+
+/// MXFP4 (17-byte blocks) -> 18-byte aligned blocks (`GgmlType::RepMxfp4`): [e, 0, 16 nibble bytes].
+pub fn repack_mxfp4(src: &[u8]) -> Vec<u8> {
+    assert!(src.len() % 17 == 0);
+    let mut out = Vec::with_capacity(src.len() / 17 * 18);
+    for b in src.chunks_exact(17) {
+        out.push(b[0]);
+        out.push(0);
+        out.extend_from_slice(&b[1..]);
+    }
+    out
+}
+
 /// Dequantize one block (`ty.block().1` bytes) into `ty.block().0` floats.
 pub fn dequant_block(ty: GgmlType, b: &[u8], y: &mut [f32]) {
     use GgmlType::*;
@@ -187,6 +205,77 @@ pub fn dequant_block(ty: GgmlType, b: &[u8], y: &mut [f32]) {
                 }
             }
         }
+        IQ2XXS => {
+            // block: d f16, then 8 x (4 grid-index bytes, u32 of 4 x 7 sign-index bits + 4-bit scale)
+            let d = h(b, 0);
+            for ib in 0..8 {
+                let q = &b[2 + 8 * ib..10 + 8 * ib];
+                let aux = u32::from_le_bytes([q[4], q[5], q[6], q[7]]);
+                let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+                for l in 0..4 {
+                    let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                    let g = IQ2XXS_GRID[q[l] as usize].to_le_bytes();
+                    for j in 0..8 {
+                        y[ib * 32 + l * 8 + j] = db * g[j] as f32 * if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                    }
+                }
+            }
+        }
+        IQ1M => {
+            // block: qs[32] (grid index low 8 bits), qh[16] (3 high bits + delta sign for two groups of 8),
+            // scales[8] = 4 x u16 (two 3-bit scales per 32 values); the f16 d is spread over the top nibbles
+            let sc = [rd16(b, 48), rd16(b, 50), rd16(b, 52), rd16(b, 54)];
+            let du = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            let d = f16_to_f32(du);
+            for ib in 0..8 {
+                let dl1 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2))) & 7) + 1) as f32;
+                let dl2 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 7) + 1) as f32;
+                let qs = &b[4 * ib..4 * ib + 4];
+                let qh = [b[32 + 2 * ib] as usize, b[32 + 2 * ib + 1] as usize];
+                let idx = [qs[0] as usize | ((qh[0] << 8) & 0x700), qs[1] as usize | ((qh[0] << 4) & 0x700),
+                    qs[2] as usize | ((qh[1] << 8) & 0x700), qs[3] as usize | ((qh[1] << 4) & 0x700)];
+                let dlt = |bit: usize| if bit != 0 { -0.125f32 } else { 0.125f32 };
+                let delta = [dlt(qh[0] & 0x08), dlt(qh[0] & 0x80), dlt(qh[1] & 0x08), dlt(qh[1] & 0x80)];
+                for l in 0..4 {
+                    let dl = if l < 2 { dl1 } else { dl2 };
+                    let g = IQ1S_GRID[idx[l]].to_le_bytes();
+                    for j in 0..8 {
+                        y[ib * 32 + l * 8 + j] = dl * (g[j] as i8 as f32 + delta[l]);
+                    }
+                }
+            }
+        }
+        MXFP4 => {
+            // block: e (E8M0) then 16 bytes of nibbles (low = values 0..16, high = 16..32), value = kvalues * 2^(e - 128)
+            let d = e8m0_half(b[0]);
+            for j in 0..16 {
+                y[j] = KVALUES_MXFP4[(b[1 + j] & 0xf) as usize] as f32 * d;
+                y[j + 16] = KVALUES_MXFP4[(b[1 + j] >> 4) as usize] as f32 * d;
+            }
+        }
+        RepMxfp4 => {
+            let d = e8m0_half(b[0]);
+            for j in 0..16 {
+                y[j] = KVALUES_MXFP4[(b[2 + j] & 0xf) as usize] as f32 * d;
+                y[j + 16] = KVALUES_MXFP4[(b[2 + j] >> 4) as usize] as f32 * d;
+            }
+        }
+        IQ2XS => {
+            // block: d f16, qs[32] u16 (9-bit grid index | 7-bit sign index << 9), scales[8] (two 4-bit per 32)
+            let d = h(b, 0);
+            for ib in 0..8 {
+                let sc = b[66 + ib];
+                let db = [d * (0.5 + (sc & 0xf) as f32) * 0.25, d * (0.5 + (sc >> 4) as f32) * 0.25];
+                for l in 0..4 {
+                    let q = rd16(b, 2 + 8 * ib + 2 * l) as usize;
+                    let g = IQ2XS_GRID[q & 511].to_le_bytes();
+                    let signs = KSIGNS_IQ2XS[q >> 9];
+                    for j in 0..8 {
+                        y[ib * 32 + l * 8 + j] = db[l / 2] * g[j] as f32 * if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                    }
+                }
+            }
+        }
         IQ2S => {
             let d = h(b, 0);
             let qs = &b[2..34];
@@ -255,7 +344,7 @@ pub fn dequant_block(ty: GgmlType, b: &[u8], y: &mut [f32]) {
 /// Whether [`dequant_block`] (and the GPU/CPU kernels) handle this type.
 pub fn supported(ty: GgmlType) -> bool {
     use GgmlType::*;
-    matches!(ty, F32 | F16 | BF16 | Q8_0 | Q2_0 | IQ4NL | IQ4XS | Q4K | Q5K | Q6K | IQ2S | IQ3XXS | IQ3S)
+    matches!(ty, F32 | F16 | BF16 | Q8_0 | Q2_0 | IQ4NL | IQ4XS | Q4K | Q5K | Q6K | IQ2S | IQ3XXS | IQ3S | IQ2XXS | IQ1M | IQ2XS | MXFP4 | RepMxfp4)
 }
 
 /// Dequantize `n` values (a whole number of blocks) from `src`.

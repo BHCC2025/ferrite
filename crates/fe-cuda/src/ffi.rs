@@ -91,6 +91,7 @@ unsafe extern "C" {
     pub fn cuMemFree_v2(p: CUdeviceptr) -> CUresult;
     pub fn cuMemAllocHost_v2(p: *mut *mut c_void, bytes: usize) -> CUresult;
     pub fn cuMemHostAlloc(p: *mut *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
+    pub fn cuCtxEnablePeerAccess(peer: CUcontext, flags: c_uint) -> CUresult;
     pub fn cuMemcpyPeerAsync(dst: CUdeviceptr, dst_ctx: CUcontext, src: CUdeviceptr, src_ctx: CUcontext, bytes: usize,
         s: CUstream) -> CUresult;
     pub fn cuMemFreeHost(p: *mut c_void) -> CUresult;
@@ -113,6 +114,8 @@ unsafe extern "C" {
         smem: c_uint, s: CUstream, params: *mut *mut c_void, extra: *mut *mut c_void) -> CUresult;
 
     pub fn cuStreamCreate(s: *mut CUstream, flags: c_uint) -> CUresult;
+    pub fn cuStreamCreateWithPriority(s: *mut CUstream, flags: c_uint, priority: c_int) -> CUresult;
+    pub fn cuCtxGetStreamPriorityRange(least: *mut c_int, greatest: *mut c_int) -> CUresult;
     pub fn cuStreamDestroy_v2(s: CUstream) -> CUresult;
     pub fn cuStreamSynchronize(s: CUstream) -> CUresult;
     pub fn cuStreamWaitEvent(s: CUstream, e: CUevent, flags: c_uint) -> CUresult;

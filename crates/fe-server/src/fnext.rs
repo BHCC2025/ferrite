@@ -279,7 +279,7 @@ fn apply(a: &mut Active, sc: Scan) -> Option<FinishReason> {
         return Some(FinishReason::Cancelled);
     }
     match sc.act {
-        Act::None => {}
+        Act::None | Act::Rewind(..) => {}
         // an answer-phase cycle that came back after the boost: end cleanly (as the token limit would)
         Act::End => return Some(FinishReason::Length),
         // the engine closes the reasoning block: `</think>` follows this token

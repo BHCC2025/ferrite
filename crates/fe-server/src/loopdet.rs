@@ -31,6 +31,12 @@ pub struct LoopCfg {
     pub call: LoopRule,
     /// the repeated-sentence rule on the decoded text (wandering loops the exact cycle misses)
     pub sentence: SentCfg,
+    /// tool-call rule, first firing, engines that can take tokens back (the DeepSeek engine): the tokens generated since the cycle was
+    /// first seen are held back from the client; at the firing they are dropped, the engine rewinds to that point and samples with
+    /// `recover_temperature` / `recover_top_p` (the profile's values) for a bounded stretch. A second firing ends the request as before.
+    pub call_recover: bool,
+    pub recover_temperature: f32,
+    pub recover_top_p: f32,
 }
 
 /// Repeated-sentence rule (`loop_rules.sentence` in sampling.json). The decoded text is cut into units (lines, and sentences inside a
@@ -247,6 +253,9 @@ impl Default for LoopCfg {
             answer: LoopRule { min_repeats: 8, min_repeated_tokens: 400 },
             call: LoopRule { min_repeats: 30, min_repeated_tokens: 3000 },
             sentence: SentCfg::default(),
+            call_recover: false,
+            recover_temperature: 0.7,
+            recover_top_p: 0.95,
         }
     }
 }
@@ -274,6 +283,9 @@ impl LoopCfg {
             }
         }
         c.sentence = SentCfg::from_json(v.get("sentence"));
+        if let Some(b) = v.get("call_recover").and_then(Json::as_bool) {
+            c.call_recover = b;
+        }
         c
     }
 
@@ -397,6 +409,10 @@ pub enum Trig {
     None,
     /// close the reasoning block (cap or cycle) and let the model answer
     Close,
+    /// a tool-call cycle, first firing, with the recovery on: rewind the sequence by the first number of tokens (to where the cycle
+    /// began); the second number is how many of them were held back from the client (the rest, the two occurrences that showed the
+    /// cycle, were sent: the text after them continues as the text before them did, so what follows the rewind joins on)
+    Rewind(usize, usize),
     /// an answer-phase cycle that came back after the sampling boost: end the request cleanly
     EndLoop,
 }
@@ -412,6 +428,8 @@ pub struct PhaseEvents {
     pub loop_breaks: u32,
     /// of them, firings of the repeated-sentence rule
     pub sentence_breaks: u32,
+    /// tool-call cycles answered by taking the held tokens back
+    pub rewinds: u32,
 }
 
 /// A detokenizer for one tracker (tests; the server's is registered once with [`set_detok`]).
@@ -442,6 +460,11 @@ pub struct PhaseTracker {
     generated: Vec<u32>,
     boost_until: usize,
     boosts: usize,
+    /// tool-call recovery: switched on by the engine, `generated.len()` when the cycle was first seen (tokens after it are held back),
+    /// the stretch after the rewind
+    recover_on: bool,
+    hold_from: Option<usize>,
+    recovering: bool,
     det: LoopDet,
     /// the repeated-sentence rule (None: off, or no detokenizer), the tokens whose text is not complete yet (a split UTF-8
     /// sequence), a hit not acted on yet
@@ -465,6 +488,9 @@ impl PhaseTracker {
             generated: Vec::new(),
             boost_until: 0,
             boosts: 0,
+            recover_on: false,
+            hold_from: None,
+            recovering: false,
             det: LoopDet::new(),
             sent: (p.loop_breaker && p.loop_rules.sentence.enabled && DETOK.get().is_some()).then(|| SentDet::new(p.loop_rules.sentence)),
             pend: Vec::new(),
@@ -543,6 +569,21 @@ impl PhaseTracker {
         self.in_call
     }
 
+    /// The engine can hold tokens back and rewind: use the tool-call recovery (`force`: whatever loop_rules.call_recover says).
+    pub fn enable_recover(&mut self, force: bool) {
+        self.recover_on = self.breaker && (force || self.rules.call_recover);
+    }
+
+    /// The tokens fed from now on must not go to the client yet (a cycle is building inside a tool call).
+    pub fn holding(&self) -> bool {
+        self.hold_from.is_some()
+    }
+
+    /// The stretch after a rewind (sampled with the recovery values).
+    pub fn recovering(&self) -> bool {
+        self.recovering && self.boosting()
+    }
+
     /// Count a batch of generated tokens; the rules are judged on the state after the whole batch.
     pub fn feed(&mut self, toks: &[u32]) -> Trig {
         for &t in toks {
@@ -565,6 +606,15 @@ impl PhaseTracker {
             }
             if self.breaker {
                 self.det.push(t);
+                if self.recover_on && !self.in_reasoning && self.boosts == 0 {
+                    if self.in_call && self.det.cycle().is_some() {
+                        if self.hold_from.is_none() {
+                            self.hold_from = Some(self.generated.len());
+                        }
+                    } else {
+                        self.hold_from = None;
+                    }
+                }
                 if self.sent.is_some() {
                     // (a mark can only have just completed when this token ends one)
                     if !self.in_reasoning && !self.in_call && self.call_marks.iter().any(|m| m.last() == Some(&t))
@@ -613,6 +663,38 @@ impl PhaseTracker {
                 let place = if self.in_call { "tool-call" } else { "answer" };
                 let text = cycle_text(self.det.cycle_ids());
                 self.sent_hit = None;
+                if self.in_call && self.boosts == 0 {
+                    if let Some(h) = self.hold_from.take().filter(|&h| h < self.generated.len()) {
+                        let held = self.generated.len() - h;
+                        // back to the start of the cycle's first occurrence
+                        let mut n = (c.repeated_tokens + c.period).min(self.generated.len()).max(held);
+                        // a short unit repeated many times right before the cycle (the cycle is made of it: a selector or a path that
+                        // repeats one piece without end) is part of the loop: go back to where that run began
+                        let at0 = self.generated.len() - n;
+                        let mut lead = 0usize;
+                        for p in 1..=16usize.min(at0) {
+                            let mut k = 0usize;
+                            while at0 - k > p && self.generated[at0 - 1 - k] == self.generated[at0 - 1 - k - p] {
+                                k += 1;
+                            }
+                            if k >= 8 * p && k + p > lead {
+                                lead = k + p;
+                            }
+                        }
+                        n += lead;
+                        let win = (4 * c.period + 256).clamp(512, 2048);
+                        self.events.loop_breaks += 1;
+                        self.events.rewinds += 1;
+                        self.boosts = 1;
+                        self.recovering = true;
+                        let at = self.generated.len() - n;
+                        self.generated.truncate(at);
+                        self.boost_until = at + win;
+                        self.det.restart();
+                        tracing::warn!("loop breaker: tool-call cycle, period {} tokens x {} repeats ({} repeated tokens), cycle {text:?}: rewinding {n} tokens to the start of the cycle ({held} of them were held back, {lead} are a repeated lead-in before it) and sampling for {win} tokens", c.period, c.repeats, c.repeated_tokens);
+                        return Trig::Rewind(n, held);
+                    }
+                }
                 return self.answer_fire(&format!("{place} cycle, period {} tokens x {} repeats ({} repeated tokens), cycle {text:?}", c.period, c.repeats, c.repeated_tokens), false);
             }
             if let Some(hit) = self.sent_hit.take().filter(|_| !self.in_call) {
@@ -895,6 +977,71 @@ mod tests {
         }
         assert_eq!(first, Some(Trig::None));
         assert!(tr.boosting());
+    }
+
+    /// The recovery (engines that hold tokens back): nothing is held while the text does not repeat; a short repeat is held and released;
+    /// a runaway is taken back to where the cycle was first seen, sampled for a stretch, and ends the request if it builds up again.
+    #[test]
+    fn tool_call_recovery_holds_takes_back_then_ends() {
+        let mut v = Vocab::new();
+        let mut toks = call_prefix(&mut v);
+        let same = v.enc(".grid > .cell { border: 1px solid var(--line); padding: 4px 8px; }\n");
+        // three identical rules, then different text: held for a while, released, nothing fires
+        let mut legit = toks.clone();
+        for _ in 0..3 {
+            legit.extend_from_slice(&same);
+        }
+        legit.extend(v.enc(".footer { margin: 0 auto; color: var(--ink); }\n"));
+        let mut tr = PhaseTracker::new(&params(8192));
+        tr.enable_recover(true);
+        let mut held_some = false;
+        for &t in &legit {
+            assert_eq!(tr.feed(&[t]), Trig::None);
+            held_some |= tr.holding();
+        }
+        assert!(held_some && !tr.holding() && tr.events.loop_breaks == 0);
+        // the runaway
+        let start = toks.len();
+        for _ in 0..700 {
+            toks.extend_from_slice(&same);
+        }
+        let mut tr = PhaseTracker::new(&params(8192));
+        tr.enable_recover(true);
+        let mut fed = 0usize;
+        let mut hold_at = None;
+        let mut rewound = None;
+        let mut ended = false;
+        for (i, &t) in toks.iter().enumerate() {
+            let was = tr.holding();
+            let g = tr.feed(&[t]);
+            fed += 1;
+            if !was && tr.holding() && hold_at.is_none() {
+                hold_at = Some(fed);
+            }
+            match g {
+                Trig::Rewind(n, held) => {
+                    assert!(rewound.is_none(), "one rewind only");
+                    // held: exactly the tokens fed since the hold began; the rewind goes on to the start of the cycle
+                    assert_eq!(held, fed - hold_at.unwrap());
+                    assert!(n > held && fed - n <= start && fed - n + 8 >= start, "rewind to {} (cycle starts at {start})", fed - n);
+                    assert!(i + 1 - start >= 3000 && !tr.holding() && tr.boosting() && tr.recovering());
+                    rewound = Some(n);
+                    fed -= n;
+                }
+                Trig::EndLoop => {
+                    ended = true;
+                    break;
+                }
+                g => assert_eq!(g, Trig::None),
+            }
+        }
+        let n = rewound.expect("rewind");
+        assert!(hold_at.unwrap() - start <= 2 * same.len() + LoopDet::N, "hold began at {:?}", hold_at);
+        assert!(n >= 3000 - same.len() && ended && !tr.recovering());
+        assert_eq!((tr.events.loop_breaks, tr.events.rewinds), (2, 1));
+        // without the engine's opt-in nothing changes
+        let mut tr = PhaseTracker::new(&params(8192));
+        assert!(toks.iter().all(|&t| { let g = tr.feed(&[t]); !tr.holding() && !matches!(g, Trig::Rewind(..)) && g != Trig::Close }));
     }
 
     #[test]

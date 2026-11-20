@@ -96,6 +96,8 @@ pub mod sched {
                 Act::End => GuardAct::End,
                 Act::Force(t) => GuardAct::Force(t),
                 Act::Sampling(s) => GuardAct::Sampling(Box::new(s)),
+                // never asked for (the recovery is not enabled on this engine)
+                Act::Rewind(..) => GuardAct::None,
             }
         }
     }

@@ -163,6 +163,7 @@ fn run(tok: &Tok, cfg: &MockConfig, req: GenRequest, sink: TokenSink) {
             return sink.finish(finish(FinishReason::Cancelled, &phase));
         }
         match (trig, p.think_end) {
+            (crate::loopdet::Trig::Rewind(..), _) => {}
             (crate::loopdet::Trig::EndLoop, _) | (crate::loopdet::Trig::Close, None) => return sink.finish(finish(FinishReason::Length, &phase)),
             (crate::loopdet::Trig::Close, Some(te)) => {
                 // "the model answers": what the canned reply holds after its own end of the block

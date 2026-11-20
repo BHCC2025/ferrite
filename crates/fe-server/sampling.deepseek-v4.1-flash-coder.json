@@ -1,0 +1,53 @@
+{
+  "_doc": "fe-server sampling profiles and protections for DeepSeek-V4.1-Flash Coder (read at start). profiles: what a request of that mode gets for the fields its client does not send (a field the client sends always wins). Source of the values: the only vendor recommendation known for DeepSeek V4.1 is temperature 1.0 / top_p 0.95 (benchmark settings); the Coder GGUF ships no generation_config and its card (README.md) names no sampling values, so the non-thinking profile uses the same values. greedy_keeps_fast_path: a client that sends temperature 0 gets greedy decoding with no profile penalty. greedy_floor (off): a client temperature of 0 would become the thinking profile's temperature inside the reasoning block only. call_marks: the DSML mark token followed by ' calls' / ' invoke' (the opening '<' and the closing '>' merge with their neighbours in the tokenizer, so they are not part of the mark). Env overrides: FE_GREEDY_FAST_PATH, FE_GREEDY_FLOOR, FE_MAX_REASONING_TOKENS, FE_LOOP_BREAKER, FE_LOOP_RULES, FE_NO_TOKEN_TIMEOUT, FE_REPLY_WALL_LIMIT. loop_rules.call_recover (DeepSeek engine): at the first firing of the tool-call rule the tokens generated since the cycle was first seen (held back from the client meanwhile) are dropped, the sequence is rewound to the start of the cycle and sampled with the thinking profile's temperature / top_p for a bounded stretch; a second firing ends the request as before. Env DSC_CALL_RECOVER=1 / 0 forces it on / off.",
+  "profiles": {
+    "thinking": {
+      "temperature": 1.0,
+      "top_p": 0.95
+    },
+    "non_thinking": {
+      "temperature": 1.0,
+      "top_p": 0.95
+    }
+  },
+  "greedy_keeps_fast_path": true,
+  "greedy_floor": false,
+  "think_start": "<think>",
+  "think_end": "</think>",
+  "max_reasoning_tokens": 8192,
+  "loop_breaker": true,
+  "loop_rules": {
+    "min_period": 1,
+    "max_period": 512,
+    "reasoning": {
+      "min_repeats": 4,
+      "min_repeated_tokens": 400
+    },
+    "answer": {
+      "min_repeats": 8,
+      "min_repeated_tokens": 400
+    },
+    "call": {
+      "min_repeats": 30,
+      "min_repeated_tokens": 3000
+    },
+    "sentence": {
+      "enabled": true,
+      "window": 64,
+      "min_chars": 16,
+      "min_count": 3,
+      "min_fraction": 0.7,
+      "min_tokens": 600,
+      "answer_min_tokens": 1200
+    },
+    "call_recover": true
+  },
+  "watchdog": {
+    "no_token_timeout_s": 60,
+    "reply_wall_limit_s": 0
+  },
+  "call_marks": [
+    "｜DSML｜ calls",
+    "｜DSML｜ invoke"
+  ]
+}

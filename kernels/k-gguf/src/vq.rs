@@ -155,6 +155,44 @@ impl Vq for Iq4Nl {
         Sb { w, base: d, ia: 1, ib: 1, m: 0.0 }
     }
 }
+/// ggml GGML_E8M0_TO_FP32_HALF.
+#[inline(always)]
+pub fn e8m0_half(x: u32) -> f32 {
+    f32::from_bits(if x < 2 { 0x0020_0000u32 << x } else { (x - 1) << 23 })
+}
+/// 16 nibble -> int8 table lookups through `prmt` for any 16-entry int8 table (as `iq4_lut`).
+#[inline(always)]
+pub unsafe fn nib_lut(q: u32, tab: *const i8) -> (u32, u32) {
+    let t = tab as *const u32;
+    let (t0, t1, t2, t3) = (*t, *t.add(1), *t.add(2), *t.add(3));
+    let sel = 0x3210_3210 | ((q & 0x8888_8888) >> 1);
+    let q7 = q & 0x7777_7777;
+    let lo0 = prmt(t0, t1, q7);
+    let hi0 = prmt(t2, t3, q7);
+    let a = prmt(lo0, hi0, sel & 0xffff);
+    let lo1 = prmt(t0, t1, q7 >> 16);
+    let hi1 = prmt(t2, t3, q7 >> 16);
+    let b = prmt(lo1, hi1, (sel >> 16) & 0xffff);
+    (prmt(a, b, 0x6420), prmt(a, b, 0x7531))
+}
+/// MXFP4 repacked to 18-byte blocks ([e, 0, 16 nibble bytes]): the IQ4_NL layout with an E8M0 scale and the FP4 table.
+pub struct Mxfp4R;
+impl Vq for Mxfp4R {
+    const QK: u32 = 32;
+    const BYTES: u32 = 18;
+    #[inline(always)]
+    unsafe fn sb(row: *const u8, j: u32) -> Sb {
+        let b = row.add(18 * j as usize);
+        let d = e8m0_half(ld_u8(b) as u32);
+        let mut w = [0u32; 8];
+        for k in 0..4 {
+            let (lo, hi) = nib_lut(ld_u32_a2(b.add(2 + 4 * k)), KVALUES_MXFP4.as_ptr());
+            w[k] = lo;
+            w[k + 4] = hi;
+        }
+        Sb { w, base: d, ia: 1, ib: 1, m: 0.0 }
+    }
+}
 pub struct Iq4Xs;
 impl Vq for Iq4Xs {
     const QK: u32 = 256;
@@ -343,5 +381,117 @@ impl Vq for Iq3S {
         }
         let db = d * (1 + 2 * ls) as f32;
         Sb { w, base: db, ia: 1, ib: 1, m: 0.0 }
+    }
+}
+pub struct Iq2Xxs;
+impl Vq for Iq2Xxs {
+    const QK: u32 = 256;
+    const BYTES: u32 = 66;
+    #[inline(always)]
+    unsafe fn sb(row: *const u8, j: u32) -> Sb {
+        let b = row.add(66 * (j / 8) as usize);
+        let ib = (j % 8) as usize;
+        let d = ldh(b);
+        let q0 = ld_u32_a2(b.add(2 + 8 * ib));
+        let aux = ld_u32_a2(b.add(6 + 8 * ib));
+        let grid = IQ2XXS_GRID.as_ptr();
+        let mut w = [0u32; 8];
+        for l in 0..4u32 {
+            let v = (aux >> (7 * l)) & 127;
+            let s = v | ((popc(v) & 1) << 7);
+            let g = *grid.add(((q0 >> (8 * l)) & 0xff) as usize);
+            w[2 * l as usize] = sign4(g as u32, s);
+            w[2 * l as usize + 1] = sign4((g >> 32) as u32, s >> 4);
+        }
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+        Sb { w, base: db, ia: 1, ib: 1, m: 0.0 }
+    }
+}
+/// Per-byte (a + b) mod 256, no carries between bytes.
+#[inline(always)]
+fn add8(a: u32, b: u32) -> u32 {
+    ((a & 0x7f7f_7f7f).wrapping_add(b & 0x7f7f_7f7f)) ^ ((a ^ b) & 0x8080_8080)
+}
+
+const fn add8_c(a: u32, b: u32) -> u32 {
+    ((a & 0x7f7f_7f7f).wrapping_add(b & 0x7f7f_7f7f)) ^ ((a ^ b) & 0x8080_8080)
+}
+const fn build_iq1m_w() -> [u64; 4096] {
+    let mut t = [0u64; 4096];
+    let mut i = 0;
+    while i < 4096 {
+        let g = IQ1S_GRID[i & 2047];
+        let neg = (i >> 11) as u32 & 1;
+        let dd = 0x0101_0101u32 | (0u32.wrapping_sub(neg) & 0xfefe_fefe);
+        let lo = add8_c(((g as u32) << 3) & 0xf8f8_f8f8, dd);
+        let hi = add8_c((((g >> 32) as u32) << 3) & 0xf8f8_f8f8, dd);
+        t[i] = lo as u64 | ((hi as u64) << 32);
+        i += 1;
+    }
+    t
+}
+pub static IQ1M_W: [u64; 4096] = build_iq1m_w();
+/// IQ1_M: grid values g in {-1, 0, 1} plus a per-8 delta of +-1/8: value = d (2 s + 1) (g + delta)
+/// = d / 8 (2 s + 1) (8 g +- 1), so the int8 weights are 8 g +- 1 and the scale is exact.
+pub struct Iq1M;
+impl Vq for Iq1M {
+    const QK: u32 = 256;
+    const SAME: bool = false;
+    const BYTES: u32 = 56;
+    #[inline(always)]
+    unsafe fn sb(row: *const u8, j: u32) -> Sb {
+        let b = row.add(56 * (j / 8) as usize);
+        let ib = (j % 8) as usize;
+        let v = *(b.add(48) as *const u64);
+        let du = (((v as u32) >> 12) & 0xf) | (((v >> 24) as u32) & 0xf0) | (((v >> 36) as u32) & 0xf00) | (((v >> 48) as u32) & 0xf000);
+        let d = f16_to_f32(du as u16);
+        let scw = ((v >> (16 * (ib / 2) as u32)) as u32) & 0xffff;
+        let sh = 6 * (ib as u32 % 2);
+        let s1 = (scw >> sh) & 7;
+        let s2 = (scw >> (sh + 3)) & 7;
+        let qs = ld_u32_a2(b.add(4 * ib));
+        let qh = ld_u16(b.add(32 + 2 * ib)) as u32;
+        // the int8 weights (8 g +- 1) of a grid entry and sign are one table row: no decode arithmetic in the loop
+        let tab = IQ1M_W.as_ptr();
+        let mut w = [0u32; 8];
+        for l in 0..4u32 {
+            let hi = match l {
+                0 => (qh << 8) & 0x700,
+                1 => (qh << 4) & 0x700,
+                2 => qh & 0x700,
+                _ => (qh >> 4) & 0x700,
+            };
+            let neg = (qh >> (4 * l + 3)) & 1;
+            let e = *tab.add(((((qs >> (8 * l)) & 0xff) | hi) | (neg << 11)) as usize);
+            w[2 * l as usize] = e as u32;
+            w[2 * l as usize + 1] = (e >> 32) as u32;
+        }
+        Sb { w, base: d * 0.125, ia: (2 * s1 + 1) as i32, ib: (2 * s2 + 1) as i32, m: 0.0 }
+    }
+}
+pub struct Iq2Xs;
+impl Vq for Iq2Xs {
+    const QK: u32 = 256;
+    const SAME: bool = false;
+    const BYTES: u32 = 74;
+    #[inline(always)]
+    unsafe fn sb(row: *const u8, j: u32) -> Sb {
+        let b = row.add(74 * (j / 8) as usize);
+        let ib = (j % 8) as usize;
+        let d = ldh(b);
+        let q0 = ld_u32_a2(b.add(2 + 8 * ib));
+        let q1 = ld_u32_a2(b.add(6 + 8 * ib));
+        let sc = ld_u8(b.add(66 + ib)) as u32;
+        let grid = IQ2XS_GRID.as_ptr();
+        let mut w = [0u32; 8];
+        for l in 0..4u32 {
+            let q = (if l < 2 { q0 >> (16 * l) } else { q1 >> (16 * (l - 2)) }) & 0xffff;
+            let s = *KSIGNS_IQ2XS.as_ptr().add((q >> 9) as usize) as u32;
+            let g = *grid.add((q & 511) as usize);
+            w[2 * l as usize] = sign4(g as u32, s);
+            w[2 * l as usize + 1] = sign4((g >> 32) as u32, s >> 4);
+        }
+        // d * (0.5 + ls) * 0.25 = d / 8 * (2 ls + 1)
+        Sb { w, base: d * 0.125, ia: (2 * (sc & 0xf) + 1) as i32, ib: (2 * (sc >> 4) + 1) as i32, m: 0.0 }
     }
 }

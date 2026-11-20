@@ -239,6 +239,11 @@ impl TokenSink {
         self.tx.send(GenEvent::Tokens(ids)).is_ok()
     }
 
+    /// The engine is working on the request without tokens to send (tokens held back, a long rewind): resets the no-token watchdog.
+    pub fn ping(&self) -> bool {
+        self.tx.send(GenEvent::Tokens(Vec::new())).is_ok()
+    }
+
     /// True once the receiving side is gone.
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()

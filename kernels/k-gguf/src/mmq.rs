@@ -13,6 +13,8 @@ use kcommon::mma::*;
 use kcommon::smem::*;
 use kcommon::*;
 
+/// Default tile rows (the Flash-Next launches); the grouped prompt path can also use 64 and 32 (`ggq_mmq_*_bm64`, `_bm32`):
+/// every output element is summed in the same k order whatever BM, so the bits do not depend on the tile rows.
 const BM: u32 = 128;
 /// Bench-only ablation switches (see `mmq`); 0 in normal builds.
 const DBG: u32 = 0;
@@ -23,22 +25,37 @@ const BN: u32 = 64;
 const SB: u32 = 4; // sub-blocks per stage
 const BK: u32 = 32 * SB; // 128
 const LDB: u32 = BK + 16; // bytes per smem row (conflict-free ldmatrix)
-const TA: u32 = BM * LDB; // A tile bytes
 const TB: u32 = BN * LDB;
-const NT: u32 = 2 * BM; // consumer threads (BM / 32 x 2 warps of 32 x 32)
 const NP: u32 = 128; // producer threads (4 warps)
-const TSA: u32 = BM * SB * 4; // f32 [BM][SB] activation scales
 const TSB: u32 = BN * SB * 4; // f32 [BN][SB] weight scales
-/// stage layout: A | B | ad | as | base | m | iab (2 x i32)
-const OFF_AD: u32 = TA + TB;
-const OFF_AS: u32 = OFF_AD + TSA;
-const OFF_BASE: u32 = OFF_AS + TSA;
-const OFF_M: u32 = OFF_BASE + TSB;
-const OFF_IAB: u32 = OFF_M + TSB;
-const STAGE: u32 = OFF_IAB + 2 * TSB;
+/// stage layout: A | B | ad | as | base | m | iab (2 x i32); A and ad / as scale with the tile rows
+const fn off_ad(bm: u32) -> u32 {
+    bm * LDB + TB
+}
+const fn off_as(bm: u32) -> u32 {
+    off_ad(bm) + bm * SB * 4
+}
+const fn off_base(bm: u32) -> u32 {
+    off_as(bm) + bm * SB * 4
+}
+const fn off_m(bm: u32) -> u32 {
+    off_base(bm) + TSB
+}
+const fn off_iab(bm: u32) -> u32 {
+    off_m(bm) + TSB
+}
+pub const fn stage_bytes(bm: u32) -> u32 {
+    off_iab(bm) + 2 * TSB
+}
 /// Stage buffers of the producer/consumer pipeline.
 const NSTAGE: u32 = 2;
-pub const MMQ_SMEM: u32 = NSTAGE * STAGE;
+pub const fn nstage(_bm: u32) -> u32 {
+    NSTAGE
+}
+pub const fn mmq_smem(bm: u32) -> u32 {
+    nstage(bm) * stage_bytes(bm)
+}
+pub const MMQ_SMEM: u32 = mmq_smem(128);
 
 #[inline(always)]
 pub fn mma_s8_16832(d: &mut [i32; 4], a: [u32; 4], b: [u32; 2]) {
@@ -72,14 +89,18 @@ struct Ctx {
 }
 
 #[inline(always)]
-pub unsafe fn mmq<V: Vq>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, as_: *const f32, w: *const u8,
+#[allow(non_snake_case)]
+pub unsafe fn mmq_bm<V: Vq, const BM: u32>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, as_: *const f32, w: *const u8,
     row_bytes: u64, m: u32, k: u32, xidx: *const u32, yidx: *const u32, segw: *const u64, seg_off: *const u32,
-    tiles: *const u32, ntiles: *const u32, add: u32, segw2: *const u64, hq: *mut i8, wts: *const f32) {
+    tiles: *const u32, ntiles: *const u32, add: u32, segw2: *const u64, hq: *mut i8, wts: *const f32, lim: f32) {
     // weighted token accumulation (wts non-null, expert tiles): output row of sorted row r is the token yidx[r] / m
     // (m = topk), value scaled by wts[yidx[r]] and added with red.global.add (the MoE combine fused into down).
     // gate/up fusion (hq non-null, expert tiles only): the 64-row weight tile is 32 gate rows + the same 32 up rows
     // (`segw2`); the epilogue forms h = silu(g) * u for the tile's 32 h columns and writes them as one q8 block per
     // activation row: q to hq [yrow][nff], d to `y` [yrow][nff / 32], s to `w` (as f32) [yrow][nff / 32]; nff = ldy.
+    // two stages; barriers 1, 2 = stage full, 3, 4 = stage free, 5 = the gate/up exchange
+    let NT: u32 = 2 * BM; // consumer threads (BM / 32 x 2 warps of 32 x 32)
+    let (TA, OFF_AD, OFF_AS, OFF_BASE, OFF_M, OFF_IAB, STAGE) = (BM * LDB, off_ad(BM), off_as(BM), off_base(BM), off_m(BM), off_iab(BM), stage_bytes(BM));
     let gu = !hq.is_null();
     let (hd, hs, nff) = (y, w as *mut f32, ldy);
     // ablation bits (bench only, compile-time): 1 no weight decode, 2 no float epilogue, 4 no mma
@@ -119,9 +140,11 @@ pub unsafe fn mmq<V: Vq>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, a
         let mut arow = [0u32; 8];
         let mut aok = [false; 8];
         unroll!(i in 8 => {
-            let (r, ok) = src_row(r0 + tp / 8 + (NP / 8) * i as u32);
-            arow[i] = r;
-            aok[i] = ok;
+            if (i as u32) * (NP / 8) < BM {
+                let (r, ok) = src_row(r0 + tp / 8 + (NP / 8) * i as u32);
+                arow[i] = r;
+                aok[i] = ok;
+            }
         });
         let (srow, sok) = src_row(r0 + tp % BM);
         let wrow = if gu {
@@ -131,14 +154,34 @@ pub unsafe fn mmq<V: Vq>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, a
         } else {
             [wb.add((n0 + tp / SB) as usize * row_bytes as usize), wb.add((n0 + (tp + NP) / SB) as usize * row_bytes as usize)]
         };
-        for kt in 0..nst {
-            let bsel = kt % NSTAGE;
-            if kt >= NSTAGE {
-                bar_sync(1 + NSTAGE + bsel, NT + NP);
+        // two stage buffers, unrolled by hand so every barrier id is a compile-time constant
+        macro_rules! pstep {
+            ($kt:expr, $bsel:literal) => {{
+                let kt: u32 = $kt;
+                if kt >= 2 {
+                    bar_sync_c::<{ 3 + $bsel }>(NT + NP);
+                }
+            if BM < 128 {
+                // small tiles are latency bound (few rows to hide the weight loads behind): pull the weight rows' lines of
+                // the next stages into L2 ahead of their decode
+                let off = (((kt + 6) * SB) as u64 * V::BYTES as u64 * 32 / V::QK as u64) as usize;
+                if kt + 6 < nst {
+                    core::arch::asm!("prefetch.global.L2 [{a}];", a = in(reg64) wrow[0].add(off), options(nostack, readonly));
+                    core::arch::asm!("prefetch.global.L2 [{a}];", a = in(reg64) wrow[1].add(off), options(nostack, readonly));
+                }
             }
-            produce::<V>(stg[bsel as usize], &c, kt * SB, &arow, &aok, srow, sok, &wrow);
+            produce::<V, BM>(stg[$bsel as usize], &c, kt * SB, &arow, &aok, srow, sok, &wrow);
             cp_async_wait_all();
-            bar_arrive(1 + bsel, NT + NP);
+                bar_arrive_c::<{ 1 + $bsel }>(NT + NP);
+            }};
+        }
+        let mut kt0 = 0;
+        while kt0 < nst {
+            pstep!(kt0, 0);
+            if kt0 + 1 < nst {
+                pstep!(kt0 + 1, 1);
+            }
+            kt0 += 2;
         }
         return;
     }
@@ -150,10 +193,11 @@ pub unsafe fn mmq<V: Vq>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, a
     let mut acc = [[[0f32; 4]; 4]; 2];
     let dbg = DBG;
     let _ = dbg;
-    for kt in 0..nst {
-        let bsel = kt % NSTAGE;
-        bar_sync(1 + bsel, NT + NP);
-        let st = stg[bsel as usize];
+    macro_rules! cstage {
+        ($kt:expr, $bsel:literal) => {{
+            let kt: u32 = $kt;
+            bar_sync_c::<{ 1 + $bsel }>(NT + NP);
+        let st = stg[$bsel as usize];
         // canonical order: the stage's 4 sub-blocks summed into a chunk partial from 0, then added to the total
         let mut tmp = [[[0f32; 4]; 4]; 2];
         unroll!(jli in 4 => {
@@ -220,13 +264,22 @@ pub unsafe fn mmq<V: Vq>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, a
         if CANON {
             unroll!(mi in 2 => { unroll!(ni in 4 => { unroll!(q in 4 => { acc[mi][ni][q] += tmp[mi][ni][q]; }); }); });
         }
-        if kt + NSTAGE < nst {
-            bar_arrive(1 + NSTAGE + bsel, NT + NP);
+            if kt + 2 < nst {
+                bar_arrive_c::<{ 3 + $bsel }>(NT + NP);
+            }
+        }};
+    }
+    let mut kt0 = 0;
+    while kt0 < nst {
+        cstage!(kt0, 0);
+        if kt0 + 1 < nst {
+            cstage!(kt0 + 1, 1);
         }
+        kt0 += 2;
     }
     if gu {
         // consumers only: stage buffers are free (every stage consumed); exchange through smem as f32 [BM][65]
-        bar_sync(1 + 2 * NSTAGE, NT);
+        bar_sync_c::<5>(NT);
         let ex = base.cast::<f32>();
         unroll!(mh in 4 => {
             let (mi, h) = (mh / 2, mh % 2);
@@ -237,7 +290,7 @@ pub unsafe fn mmq<V: Vq>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, a
                 ex.add(r * 65 + col + 1).st(acc[mi][ni][2 * h + 1]);
             });
         });
-        bar_sync(1 + 2 * NSTAGE, NT);
+        bar_sync_c::<5>(NT);
         // two threads per activation row, 16 h values each
         let r = t / 2;
         let half = t % 2;
@@ -249,7 +302,7 @@ pub unsafe fn mmq<V: Vq>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, a
             let c = half * 16 + i as u32;
             let gv = ex.add(r * 65 + c).ld();
             let uv = ex.add(r * 65 + 32 + c).ld();
-            hv[i] = kcommon::math::silu_det(gv) * uv;
+            hv[i] = crate::moe::swiglu(gv, uv, lim);
             amax = amax.max(hv[i].abs());
             sum += hv[i];
         });
@@ -315,19 +368,31 @@ pub unsafe fn mmq<V: Vq>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, a
     });
 }
 
+#[inline(always)]
+pub unsafe fn mmq<V: Vq>(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, as_: *const f32, w: *const u8,
+    row_bytes: u64, m: u32, k: u32, xidx: *const u32, yidx: *const u32, segw: *const u64, seg_off: *const u32,
+    tiles: *const u32, ntiles: *const u32, add: u32, segw2: *const u64, hq: *mut i8, wts: *const f32, lim: f32) {
+    mmq_bm::<V, 128>(y, ldy, aq, ad, as_, w, row_bytes, m, k, xidx, yidx, segw, seg_off, tiles, ntiles, add, segw2, hq, wts, lim)
+}
+
 /// Producer side of one stage (NP threads): A tile rows tp / 8 + 16 i (8 per thread), d and s of row tp, and 2 of the
 /// BN * SB weight sub-blocks decoded.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn produce<V: Vq>(st: Shared<u8>, c: &Ctx, j0: u32, arow: &[u32; 8], aok: &[bool; 8], srow: u32, sok: bool,
+#[allow(non_snake_case)]
+unsafe fn produce<V: Vq, const BM: u32>(st: Shared<u8>, c: &Ctx, j0: u32, arow: &[u32; 8], aok: &[bool; 8], srow: u32, sok: bool,
     wrow: &[*const u8; 2]) {
+    let NT: u32 = 2 * BM;
+    let (TA, OFF_AD, OFF_AS, OFF_BASE, OFF_M, OFF_IAB) = (BM * LDB, off_ad(BM), off_as(BM), off_base(BM), off_m(BM), off_iab(BM));
     let tp = tid_x() - NT;
     unroll!(i in 8 => {
-        let r = tp / 8 + (NP / 8) * i as u32;
-        let ch = tp % 8;
-        let dst = st.byte_add(r * LDB + ch * 16).addr();
-        let src = c.aq.add(arow[i] as usize * c.k as usize + (32 * j0 + 16 * ch) as usize) as *const u8;
-        cp_async_16_zfill(dst, src, if aok[i] { 16 } else { 0 });
+        if (i as u32) * (NP / 8) < BM {
+            let r = tp / 8 + (NP / 8) * i as u32;
+            let ch = tp % 8;
+            let dst = st.byte_add(r * LDB + ch * 16).addr();
+            let src = c.aq.add(arow[i] as usize * c.k as usize + (32 * j0 + 16 * ch) as usize) as *const u8;
+            cp_async_16_zfill(dst, src, if aok[i] { 16 } else { 0 });
+        }
     });
     {
         let r = tp % BM;
@@ -371,6 +436,16 @@ unsafe fn red_add_u64(p: *mut u64, v: u64) {
     core::arch::asm!("red.global.add.u64 [{p}], {v};", p = in(reg64) p, v = in(reg64) v, options(nostack));
 }
 
+/// dst[i] += src[i] over i64 fixed-point accumulators (the second card's partial sums), src re-zeroed. Grid ceil(n_total / 256).
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ggq_fx_add(dst: *mut i64, src: *mut i64, n_total: u32) {
+    let i = bid_x() * bdim_x() + tid_x();
+    if i < n_total {
+        *dst.add(i as usize) += *src.add(i as usize);
+        *src.add(i as usize) = 0;
+    }
+}
+
 /// i64 fixed-point accumulator -> f32 (out (= or +=) acc * 2^-40), then acc = 0. Grid ceil(n_total / 256).
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn ggq_fx_finish(out: *mut f32, acc: *mut i64, n_total: u32, add: u32) {
@@ -402,6 +477,15 @@ fn f16_round(x: f32) -> f32 {
     crate::dec::f16_to_f32(h)
 }
 
+/// Named barriers with compile-time ids: a runtime id makes ptxas reserve all 16 barriers for the CTA (1 CTA per SM).
+#[inline(always)]
+fn bar_sync_c<const ID: u32>(n: u32) {
+    unsafe { core::arch::asm!("bar.sync {i}, {n};", i = const ID, n = in(reg32) n) }
+}
+#[inline(always)]
+fn bar_arrive_c<const ID: u32>(n: u32) {
+    unsafe { core::arch::asm!("bar.arrive {i}, {n};", i = const ID, n = in(reg32) n, options(nostack)) }
+}
 #[inline(always)]
 fn bar_arrive(id: u32, n: u32) {
     unsafe { core::arch::asm!("bar.arrive {i}, {n};", i = in(reg32) id, n = in(reg32) n, options(nostack)) }
@@ -413,8 +497,8 @@ macro_rules! mmq_kernel {
         pub unsafe extern "ptx-kernel" fn $name(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, as_: *const f32,
             w: *const u8, row_bytes: u64, m: u32, k: u32, xidx: *const u32, yidx: *const u32, segw: *const u64,
             seg_off: *const u32, tiles: *const u32, ntiles: *const u32, add: u32, segw2: *const u64, hq: *mut i8,
-            wts: *const f32) {
-            mmq::<$v>(y, ldy, aq, ad, as_, w, row_bytes, m, k, xidx, yidx, segw, seg_off, tiles, ntiles, add, segw2, hq, wts)
+            wts: *const f32, lim: f32) {
+            mmq::<$v>(y, ldy, aq, ad, as_, w, row_bytes, m, k, xidx, yidx, segw, seg_off, tiles, ntiles, add, segw2, hq, wts, lim)
         }
     };
 }
@@ -428,3 +512,46 @@ mmq_kernel!(Q6K, ggq_mmq_q6_k);
 mmq_kernel!(Iq2S, ggq_mmq_iq2_s);
 mmq_kernel!(Iq3Xxs, ggq_mmq_iq3_xxs);
 mmq_kernel!(Iq3S, ggq_mmq_iq3_s);
+mmq_kernel!(Iq2Xxs, ggq_mmq_iq2_xxs);
+mmq_kernel!(Iq1M, ggq_mmq_iq1_m);
+mmq_kernel!(Iq2Xs, ggq_mmq_iq2_xs);
+mmq_kernel!(Mxfp4R, ggq_mmq_mxfp4r);
+macro_rules! mmq_kernel_bm {
+    ($v:ty, $name:ident, $bm:literal) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "ptx-kernel" fn $name(y: *mut f32, ldy: u32, aq: *const i8, ad: *const f32, as_: *const f32,
+            w: *const u8, row_bytes: u64, m: u32, k: u32, xidx: *const u32, yidx: *const u32, segw: *const u64,
+            seg_off: *const u32, tiles: *const u32, ntiles: *const u32, add: u32, segw2: *const u64, hq: *mut i8,
+            wts: *const f32, lim: f32) {
+            mmq_bm::<$v, $bm>(y, ldy, aq, ad, as_, w, row_bytes, m, k, xidx, yidx, segw, seg_off, tiles, ntiles, add, segw2, hq, wts, lim)
+        }
+    };
+}
+mmq_kernel_bm!(Q8_0, ggq_mmq_q8_0_bm64, 64);
+mmq_kernel_bm!(Q8_0, ggq_mmq_q8_0_bm32, 32);
+mmq_kernel_bm!(Q2_0, ggq_mmq_q2_0_bm64, 64);
+mmq_kernel_bm!(Q2_0, ggq_mmq_q2_0_bm32, 32);
+mmq_kernel_bm!(Iq4Nl, ggq_mmq_iq4_nl_bm64, 64);
+mmq_kernel_bm!(Iq4Nl, ggq_mmq_iq4_nl_bm32, 32);
+mmq_kernel_bm!(Iq4Xs, ggq_mmq_iq4_xs_bm64, 64);
+mmq_kernel_bm!(Iq4Xs, ggq_mmq_iq4_xs_bm32, 32);
+mmq_kernel_bm!(Q4K, ggq_mmq_q4_k_bm64, 64);
+mmq_kernel_bm!(Q4K, ggq_mmq_q4_k_bm32, 32);
+mmq_kernel_bm!(Q5K, ggq_mmq_q5_k_bm64, 64);
+mmq_kernel_bm!(Q5K, ggq_mmq_q5_k_bm32, 32);
+mmq_kernel_bm!(Q6K, ggq_mmq_q6_k_bm64, 64);
+mmq_kernel_bm!(Q6K, ggq_mmq_q6_k_bm32, 32);
+mmq_kernel_bm!(Iq2S, ggq_mmq_iq2_s_bm64, 64);
+mmq_kernel_bm!(Iq2S, ggq_mmq_iq2_s_bm32, 32);
+mmq_kernel_bm!(Iq3Xxs, ggq_mmq_iq3_xxs_bm64, 64);
+mmq_kernel_bm!(Iq3Xxs, ggq_mmq_iq3_xxs_bm32, 32);
+mmq_kernel_bm!(Iq3S, ggq_mmq_iq3_s_bm64, 64);
+mmq_kernel_bm!(Iq3S, ggq_mmq_iq3_s_bm32, 32);
+mmq_kernel_bm!(Iq2Xxs, ggq_mmq_iq2_xxs_bm64, 64);
+mmq_kernel_bm!(Iq2Xxs, ggq_mmq_iq2_xxs_bm32, 32);
+mmq_kernel_bm!(Iq1M, ggq_mmq_iq1_m_bm64, 64);
+mmq_kernel_bm!(Iq1M, ggq_mmq_iq1_m_bm32, 32);
+mmq_kernel_bm!(Iq2Xs, ggq_mmq_iq2_xs_bm64, 64);
+mmq_kernel_bm!(Iq2Xs, ggq_mmq_iq2_xs_bm32, 32);
+mmq_kernel_bm!(Mxfp4R, ggq_mmq_mxfp4r_bm64, 64);
+mmq_kernel_bm!(Mxfp4R, ggq_mmq_mxfp4r_bm32, 32);

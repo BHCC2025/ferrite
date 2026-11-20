@@ -65,6 +65,14 @@ pub fn ballot(p: bool) -> u32 {
 /// Up to this many tokens, moe_gu runs gate and up as separate row passes.
 const GU_SPLIT_MAX_B: usize = 0;
 
+/// DeepSeek's clamped SwiGLU: silu(min(g, lim)) * clamp(u, -lim, lim); `lim` = +inf leaves g and u (and the bits) untouched.
+#[inline(always)]
+pub fn swiglu(g: f32, u: f32, lim: f32) -> f32 {
+    let g = if g > lim { lim } else { g };
+    let u = if u > lim { lim } else if u < -lim { -lim } else { u };
+    silu(g) * u
+}
+
 #[inline(always)]
 fn silu(x: f32) -> f32 {
     // deterministic exp: the CPU miss path (fe-ggq cpu) computes the same bits
@@ -74,7 +82,7 @@ fn silu(x: f32) -> f32 {
 /// gate (row 0) and up (row 1) of one h row for B tokens; returns silu(g) * u per token (lane-reduced).
 #[inline(always)]
 unsafe fn gu_body<V: Vq, const B: usize>(row_g: *const u8, row_u: *const u8, nsb: u32, lpr: u32, aq: *const i8,
-    ad: *const f32, as_: *const f32, k: u32, tok: &[u32; 8], valid: bool) -> [f32; 8] {
+    ad: *const f32, as_: *const f32, k: u32, tok: &[u32; 8], valid: bool, lim: f32) -> [f32; 8] {
     let ar: [u32; B] = core::array::from_fn(|b| tok[b]);
     let mut acc = [[0f32; B]; 2];
     if valid {
@@ -94,7 +102,7 @@ unsafe fn gu_body<V: Vq, const B: usize>(row_g: *const u8, row_u: *const u8, nsb
         if B > b {
             let g = reduce_lanes(*acc[0].get_unchecked(b), lpr);
             let u = reduce_lanes(*acc[1].get_unchecked(b), lpr);
-            h[b] = silu(g) * u;
+            h[b] = swiglu(g, u, lim);
         }
     });
     h
@@ -120,7 +128,7 @@ fn roundf(v: f32) -> f32 {
 #[inline(always)]
 pub unsafe fn moe_gu<V: Vq>(hq: *mut i8, hd: *mut f32, hs: *mut f32, hf: *mut f32, gtab: *const u64,
     utab: *const u64, row_bytes: u64, ids: *const i32, np: u32, topk: u32, aq: *const i8, ad: *const f32,
-    as_: *const f32, k: u32, nff: u32, lpr: u32, sum_mode: u32) {
+    as_: *const f32, k: u32, nff: u32, lpr: u32, sum_mode: u32, lim: f32) {
     let p = bid_y();
     let (leader, cnt, tok, prs) = group(ids, p, np, topk);
     if !leader {
@@ -140,14 +148,14 @@ pub unsafe fn moe_gu<V: Vq>(hq: *mut i8, hd: *mut f32, hs: *mut f32, hf: *mut f3
     let (rg, ru) = ((gw as usize + off) as *const u8, (uw as usize + off) as *const u8);
     let nsb = k / 32;
     let h = match cnt {
-        1 => gu_body::<V, 1>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid),
-        2 => gu_body::<V, 2>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid),
-        3 => gu_body::<V, 3>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid),
-        4 => gu_body::<V, 4>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid),
-        5 => gu_body::<V, 5>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid),
-        6 => gu_body::<V, 6>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid),
-        7 => gu_body::<V, 7>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid),
-        _ => gu_body::<V, 8>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid),
+        1 => gu_body::<V, 1>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid, lim),
+        2 => gu_body::<V, 2>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid, lim),
+        3 => gu_body::<V, 3>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid, lim),
+        4 => gu_body::<V, 4>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid, lim),
+        5 => gu_body::<V, 5>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid, lim),
+        6 => gu_body::<V, 6>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid, lim),
+        7 => gu_body::<V, 7>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid, lim),
+        _ => gu_body::<V, 8>(rg, ru, nsb, lpr, aq, ad, as_, k, &tok, valid, lim),
     };
     let hsm: Shared<f32> = static_shared!(ggq_moe_hs, f32, 8 * 32 * 4);
     if lane() % lpr == 0 {
@@ -262,8 +270,8 @@ macro_rules! moe_kernels {
         #[unsafe(no_mangle)]
         pub unsafe extern "ptx-kernel" fn $gu(hq: *mut i8, hd: *mut f32, hs: *mut f32, hf: *mut f32, gtab: *const u64,
             utab: *const u64, row_bytes: u64, ids: *const i32, np: u32, topk: u32, aq: *const i8, ad: *const f32,
-            as_: *const f32, k: u32, nff: u32, lpr: u32, sum_mode: u32) {
-            moe_gu::<$v>(hq, hd, hs, hf, gtab, utab, row_bytes, ids, np, topk, aq, ad, as_, k, nff, lpr, sum_mode)
+            as_: *const f32, k: u32, nff: u32, lpr: u32, sum_mode: u32, lim: f32) {
+            moe_gu::<$v>(hq, hd, hs, hf, gtab, utab, row_bytes, ids, np, topk, aq, ad, as_, k, nff, lpr, sum_mode, lim)
         }
         #[unsafe(no_mangle)]
         pub unsafe extern "ptx-kernel" fn $down(y: *mut f32, dtab: *const u64, row_bytes: u64, ids: *const i32,
@@ -286,6 +294,10 @@ moe_kernels!(Q6K, ggq_moe_gu_q6_k, ggq_moe_down_q6_k);
 moe_kernels!(Iq2S, ggq_moe_gu_iq2_s, ggq_moe_down_iq2_s);
 moe_kernels!(Iq3Xxs, ggq_moe_gu_iq3_xxs, ggq_moe_down_iq3_xxs);
 moe_kernels!(Iq3S, ggq_moe_gu_iq3_s, ggq_moe_down_iq3_s);
+moe_kernels!(Iq2Xxs, ggq_moe_gu_iq2_xxs, ggq_moe_down_iq2_xxs);
+moe_kernels!(Iq1M, ggq_moe_gu_iq1_m, ggq_moe_down_iq1_m);
+moe_kernels!(Iq2Xs, ggq_moe_gu_iq2_xs, ggq_moe_down_iq2_xs);
+moe_kernels!(Mxfp4R, ggq_moe_gu_mxfp4r, ggq_moe_down_mxfp4r);
 
 /// Pairs whose expert has table entry 0. One warp: `count[0]` = n missed, `pairs[0..n]` = their pair indices in
 /// order, `slot[p]` = rank of p in that list or -1. Grid 1 x 32 threads.
@@ -361,4 +373,93 @@ pub unsafe extern "ptx-kernel" fn ggq_moe_combine_ld(out: *mut f32, ldo: u32, y:
     }
     let o = out.add(t * ldo as usize + i as usize);
     if add != 0 { *o += acc } else { *o = acc }
+}
+
+/// Device-side pair routing for the zero-host layer chain: `slot[q]` = -1 when the pair's expert belongs to this (the main) card
+/// (`owner` 0), else the row `(owner - 1) * stride + q` of the expert cards' result buffer. One warp.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ggq_slot_owner(slot: *mut i32, owner: *const u8, ids: *const i32, np: u32, stride: u32) {
+    let mut q = lane();
+    while q < np {
+        let o = *owner.add(*ids.add(q as usize) as usize) as u32;
+        *slot.add(q as usize) = if o == 0 { -1 } else { ((o - 1) * stride + q) as i32 };
+        q += 32;
+    }
+}
+
+/// Cold-expert staging, step 1: for every pair whose expert lives in pinned host memory (table pointer in [lo, hi)), claim a staging slot, remember
+/// the host pointers and point the tables at the slot (the copy kernel fills it before the MoE kernels read). One block per pair, thread 0 works.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ggq_cold_claim(ids: *const i32, np: u32, gtab: *mut u64, utab: *mut u64, dtab: *mut u64, lo: u64, hi: u64,
+    counter: *mut u32, slot_e: *mut u32, slot_orig: *mut u64, stage: *mut u8, slot_bytes: u64, nslots: u32, szg: u64, szu: u64) {
+    if lane() != 0 {
+        return;
+    }
+    let p = bid_x();
+    if p >= np {
+        return;
+    }
+    let e = *ids.add(p as usize);
+    let mut q = 0u32;
+    while q < p {
+        if *ids.add(q as usize) == e {
+            return;
+        }
+        q += 1;
+    }
+    let eu = e as usize;
+    let (gw, uw, dw) = (*gtab.add(eu), *utab.add(eu), *dtab.add(eu));
+    if gw >= lo && gw < hi && uw >= lo && uw < hi && dw >= lo && dw < hi {
+        let slot = atomic_add_u32(counter, 1);
+        if slot < nslots {
+            *slot_e.add(slot as usize) = e as u32;
+            *slot_orig.add(3 * slot as usize) = gw;
+            *slot_orig.add(3 * slot as usize + 1) = uw;
+            *slot_orig.add(3 * slot as usize + 2) = dw;
+            let base = stage as u64 + slot as u64 * slot_bytes;
+            *gtab.add(eu) = base;
+            *utab.add(eu) = base + szg;
+            *dtab.add(eu) = base + szg + szu;
+        }
+    }
+}
+
+/// Step 2: copy the claimed experts from pinned host memory into their slots with many 16-byte loads in flight (the link, not the MoE kernels'
+/// few loads, sets the speed). Grid (nslots, chunks), 256 threads.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ggq_cold_copy(counter: *const u32, slot_orig: *const u64, stage: *mut u8, slot_bytes: u64, nslots: u32, szg: u64, szu: u64, szd: u64, chunks: u32) {
+    let slot = bid_x();
+    let n = (*counter).min(nslots);
+    if slot >= n {
+        return;
+    }
+    let total = szg + szu + szd;
+    let per = (total / 16).div_ceil(chunks as u64);
+    let start = bid_y() as u64 * per;
+    let end = (start + per).min(total / 16);
+    let dst = stage.add((slot as u64 * slot_bytes) as usize);
+    let (g, u, d) = (*slot_orig.add(3 * slot as usize), *slot_orig.add(3 * slot as usize + 1), *slot_orig.add(3 * slot as usize + 2));
+    let mut i = start + tid_x() as u64;
+    let step = 256u64;
+    while i < end {
+        let off = i * 16;
+        let src = if off < szg { g + off } else if off < szg + szu { u + (off - szg) } else { d + (off - szg - szu) };
+        let v = ldg_stream_v4(src as *const u32);
+        *(dst.add(off as usize) as *mut [u32; 4]) = v;
+        i += step;
+    }
+}
+
+/// Step 3 (after the MoE kernels): the tables point at the host copies again. One block per slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ggq_cold_restore(counter: *const u32, slot_e: *const u32, slot_orig: *const u64, gtab: *mut u64, utab: *mut u64, dtab: *mut u64, nslots: u32) {
+    let slot = bid_x();
+    let n = (*counter).min(nslots);
+    if slot >= n || tid_x() != 0 {
+        return;
+    }
+    let e = *slot_e.add(slot as usize) as usize;
+    *gtab.add(e) = *slot_orig.add(3 * slot as usize);
+    *utab.add(e) = *slot_orig.add(3 * slot as usize + 1);
+    *dtab.add(e) = *slot_orig.add(3 * slot as usize + 2);
 }

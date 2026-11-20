@@ -59,6 +59,10 @@ are tagged "studied" below: read as reference while writing Ferrite's own kernel
 | [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4), NVIDIA, made with [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) 0.48 | Apache-2.0 | format, used | The prompt-row weights (`FE_PROMPT=fp4`): crates/fe-fp4 reads ModelOpt's layout (NVFP4 e2m1 codes with e4m3 block scales, `weight_scale_2`, `input_scale`; FP8 e4m3 per-tensor scales; `hf_quant_config.json`). Its NVFP4 lm_head is also the DFlash2 draft head. |
 | [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), a mirror of [incoai/Qwen3.8-27B-DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | Apache-2.0 (model card) | format, used | The DFlash2 drafter weights and config (DFlash below). |
 
+| [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), DeepSeek | MIT | format, used | The DeepSeek engine's model: its architecture (compressed sparse attention with the indexer, hyper-connections, the MoE with the shared expert, the Engram table), tokenizer marks, DSML tool-call format and chat template. |
+| [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF) and [-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), IST Austria DAS Lab | MIT | format, used | The Coder quant (expert pruning and GSQ-RCO mixed precision, IQ2_XXS) the DeepSeek engine serves, its chat template, and the Engram table. |
+| [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), Unsloth | MIT | format, used | The DSpark draft model (Q8_0) of the DeepSeek engine: crates/fe-dsc draft.rs implements its blocks, Markov head and confidence head. |
+
 ## EXL3 and its roots
 
 **[exllamav3](https://github.com/turboderp-org/exllamav3)** (turboderp-org, MIT, Copyright (c) 2025 Turboderp)

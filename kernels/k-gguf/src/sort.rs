@@ -125,3 +125,83 @@ pub unsafe extern "ptx-kernel" fn ggq_moe_sort_scatter(ids: *const i32, np: u32,
         base += 32;
     }
 }
+
+/// [`ggq_moe_sort_scan`] with small tiles for the tail of every expert (`ggq_mmq_*_bm64` / `_bm32`): an expert with t rows gets
+/// t / 128 full 128-row tiles, and the remainder rem in one more tile: rem <= 32 a 32-row tile, rem <= 64 a 64-row tile, else a
+/// 128-row tile. `tiles` / `ntiles[0]` = the 128-row tiles, `tiles_s[0 .. 2 nexp]` / `ntiles[1]` = the 64-row tiles,
+/// `tiles_s[2 nexp ..]` / `ntiles[2]` = the 32-row tiles. Empty experts get no tile. Same `seg_off` / `chunk_off` as the plain scan.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ggq_moe_sort_scan_small(counts: *const u32, nchunk: u32, nexp: u32, chunk_off: *mut u32,
+    seg_off: *mut u32, tiles: *mut u32, ntiles: *mut u32, tiles_s: *mut u32) {
+    let tot: Shared<u32> = static_shared!(ggq_sort_tot_s, u32, 512 * 4);
+    let n128: Shared<u32> = static_shared!(ggq_sort_n128, u32, 512 * 4);
+    let n64: Shared<u32> = static_shared!(ggq_sort_n64, u32, 512 * 4);
+    let n32: Shared<u32> = static_shared!(ggq_sort_n32, u32, 512 * 4);
+    let e = tid_x();
+    let mut t = 0u32;
+    if e < nexp {
+        for c in 0..nchunk {
+            t += *counts.add((c * nexp + e) as usize);
+        }
+    }
+    tot.add(e).st(t);
+    let rem = t % TILE;
+    n128.add(e).st(t / TILE + (rem > 64) as u32);
+    n64.add(e).st((rem > 32 && rem <= 64) as u32);
+    n32.add(e).st((rem > 0 && rem <= 32) as u32);
+    sync_threads();
+    if e == 0 {
+        let (mut a, mut b, mut b64, mut b32) = (0u32, 0u32, 0u32, 0u32);
+        for i in 0..nexp {
+            let x = tot.add(i).ld();
+            tot.add(i).st(a);
+            a += x;
+            let y = n128.add(i).ld();
+            n128.add(i).st(b);
+            b += y;
+            let y = n64.add(i).ld();
+            n64.add(i).st(b64);
+            b64 += y;
+            let y = n32.add(i).ld();
+            n32.add(i).st(b32);
+            b32 += y;
+        }
+        *seg_off.add(nexp as usize) = a;
+        *ntiles = b;
+        *ntiles.add(1) = b64;
+        *ntiles.add(2) = b32;
+    }
+    sync_threads();
+    if e < nexp {
+        let s0 = tot.add(e).ld();
+        *seg_off.add(e as usize) = s0;
+        let mut o = s0;
+        for c in 0..nchunk {
+            *chunk_off.add((c * nexp + e) as usize) = o;
+            o += *counts.add((c * nexp + e) as usize);
+        }
+        let rows = o - s0;
+        let full = rows / TILE;
+        let rem = rows % TILE;
+        let mut ti = n128.add(e).ld();
+        let mut r = s0;
+        for _ in 0..full {
+            *tiles.add(2 * ti as usize) = e;
+            *tiles.add(2 * ti as usize + 1) = r;
+            ti += 1;
+            r += TILE;
+        }
+        if rem > 64 {
+            *tiles.add(2 * ti as usize) = e;
+            *tiles.add(2 * ti as usize + 1) = r;
+        } else if rem > 32 {
+            let i = n64.add(e).ld();
+            *tiles_s.add(2 * i as usize) = e;
+            *tiles_s.add(2 * i as usize + 1) = r;
+        } else if rem > 0 {
+            let i = n32.add(e).ld();
+            *tiles_s.add(2 * nexp as usize + 2 * i as usize) = e;
+            *tiles_s.add(2 * nexp as usize + 2 * i as usize + 1) = r;
+        }
+    }
+}

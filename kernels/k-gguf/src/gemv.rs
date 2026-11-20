@@ -108,6 +108,10 @@ macro_rules! paste_b {
     ($v:ty, iq2_s) => { gemv_kernels!($v, ggq_gemv_iq2_s_b1 = 1, ggq_gemv_iq2_s_b2 = 2, ggq_gemv_iq2_s_b3 = 3, ggq_gemv_iq2_s_b4 = 4, ggq_gemv_iq2_s_b5 = 5, ggq_gemv_iq2_s_b6 = 6, ggq_gemv_iq2_s_b7 = 7, ggq_gemv_iq2_s_b8 = 8); };
     ($v:ty, iq3_xxs) => { gemv_kernels!($v, ggq_gemv_iq3_xxs_b1 = 1, ggq_gemv_iq3_xxs_b2 = 2, ggq_gemv_iq3_xxs_b3 = 3, ggq_gemv_iq3_xxs_b4 = 4, ggq_gemv_iq3_xxs_b5 = 5, ggq_gemv_iq3_xxs_b6 = 6, ggq_gemv_iq3_xxs_b7 = 7, ggq_gemv_iq3_xxs_b8 = 8); };
     ($v:ty, iq3_s) => { gemv_kernels!($v, ggq_gemv_iq3_s_b1 = 1, ggq_gemv_iq3_s_b2 = 2, ggq_gemv_iq3_s_b3 = 3, ggq_gemv_iq3_s_b4 = 4, ggq_gemv_iq3_s_b5 = 5, ggq_gemv_iq3_s_b6 = 6, ggq_gemv_iq3_s_b7 = 7, ggq_gemv_iq3_s_b8 = 8); };
+    ($v:ty, iq2_xxs) => { gemv_kernels!($v, ggq_gemv_iq2_xxs_b1 = 1, ggq_gemv_iq2_xxs_b2 = 2, ggq_gemv_iq2_xxs_b3 = 3, ggq_gemv_iq2_xxs_b4 = 4, ggq_gemv_iq2_xxs_b5 = 5, ggq_gemv_iq2_xxs_b6 = 6, ggq_gemv_iq2_xxs_b7 = 7, ggq_gemv_iq2_xxs_b8 = 8); };
+    ($v:ty, iq1_m) => { gemv_kernels!($v, ggq_gemv_iq1_m_b1 = 1, ggq_gemv_iq1_m_b2 = 2, ggq_gemv_iq1_m_b3 = 3, ggq_gemv_iq1_m_b4 = 4, ggq_gemv_iq1_m_b5 = 5, ggq_gemv_iq1_m_b6 = 6, ggq_gemv_iq1_m_b7 = 7, ggq_gemv_iq1_m_b8 = 8); };
+    ($v:ty, iq2_xs) => { gemv_kernels!($v, ggq_gemv_iq2_xs_b1 = 1, ggq_gemv_iq2_xs_b2 = 2, ggq_gemv_iq2_xs_b3 = 3, ggq_gemv_iq2_xs_b4 = 4, ggq_gemv_iq2_xs_b5 = 5, ggq_gemv_iq2_xs_b6 = 6, ggq_gemv_iq2_xs_b7 = 7, ggq_gemv_iq2_xs_b8 = 8); };
+    ($v:ty, mxfp4r) => { gemv_kernels!($v, ggq_gemv_mxfp4r_b1 = 1, ggq_gemv_mxfp4r_b2 = 2, ggq_gemv_mxfp4r_b3 = 3, ggq_gemv_mxfp4r_b4 = 4, ggq_gemv_mxfp4r_b5 = 5, ggq_gemv_mxfp4r_b6 = 6, ggq_gemv_mxfp4r_b7 = 7, ggq_gemv_mxfp4r_b8 = 8); };
 }
 gemv_all_b!(Q8_0, q8_0);
 gemv_all_b!(Q2_0, q2_0);
@@ -119,10 +123,16 @@ gemv_all_b!(Q6K, q6_k);
 gemv_all_b!(Iq2S, iq2_s);
 gemv_all_b!(Iq3Xxs, iq3_xxs);
 gemv_all_b!(Iq3S, iq3_s);
+gemv_all_b!(Mxfp4R, mxfp4r);
+gemv_all_b!(Iq2Xs, iq2_xs);
+gemv_all_b!(Iq1M, iq1_m);
+gemv_all_b!(Iq2Xxs, iq2_xxs);
 
 
 /// Prefetch the next sub-block in the row loops (superblock types only: it slows the small-block down types).
 pub const PREFETCH: bool = true;
+/// How many loop iterations ahead the row prefetch reaches.
+pub const PFD: u32 = 1;
 
 #[inline(always)]
 pub fn prefetch_l1(p: *const u8) {
@@ -137,8 +147,8 @@ pub unsafe fn row_dot_r<V: Vq, const B: usize, const R: usize>(rows: &[*const u8
     let mut j = j0;
     while j < nsb {
         // prefetch the next sub-block's quant block of every row into L1 (more loads in flight per lane)
-        if PREFETCH && V::QK >= 256 && j + step < nsb {
-            let jn = j + step;
+        if PREFETCH && V::QK >= 256 && j + PFD * step < nsb {
+            let jn = j + PFD * step;
             let off = ((jn * 32 / V::QK) * V::BYTES) as usize;
             unroll!(r in 4 => {
                 if R > r {
@@ -251,6 +261,83 @@ pub unsafe fn gemv_r<V: Vq, const B: usize, const R: usize>(y: *mut f32, w: *con
     outr!(2);
     outr!(3);
 }
+
+/// Grouped GEMV (grid y = group): group g multiplies weights `w + g * wg` by the activation rows `g * ag ..` and writes `y + g * yg` with row stride `yld`.
+/// Each output element has the float order of the plain kernel (same row_dot_r), so the bits are the plain launches'.
+#[inline(always)]
+pub unsafe fn gemv_rg<V: Vq, const B: usize, const R: usize>(y: *mut f32, w: *const u8, row_bytes: u64, aq: *const i8,
+    ad: *const f32, as_: *const f32, k: u32, n: u32, lpr: u32, add: u32, wg: u64, ag: u32, yg: u32, yld: u32) {
+    let gy = bid_y() as usize;
+    let w = w.add(gy * wg as usize);
+    let (aq, ad, as_) = (aq.add(gy * ag as usize * k as usize), ad.add(gy * ag as usize * (k / 32) as usize), as_.add(gy * ag as usize * (k / 32) as usize));
+    let y = y.add(gy * yg as usize);
+    let rpw = 32 / lpr;
+    let row0 = ((bid_x() * nwarps() + warp_id()) * rpw + lane() / lpr) * R as u32;
+    let nsb = k / 32;
+    let mut acc = [[0f32; B]; R];
+    let rows: [*const u8; R] = core::array::from_fn(|r| w.add((row0 + r as u32).min(n - 1) as usize * row_bytes as usize));
+    let ar: [u32; B] = core::array::from_fn(|b| b as u32);
+    if row0 < n {
+        row_dot_r::<V, B, R>(&rows, lane() % lpr, lpr, nsb, aq, ad, as_, k, &ar, &mut acc);
+    }
+    macro_rules! out {
+        ($r:literal, $b:literal) => {
+            if R > $r && B > $b {
+                let v = reduce_lanes(*acc.get_unchecked($r).get_unchecked($b), lpr);
+                let row = row0 + $r;
+                if row < n && lane() % lpr == 0 {
+                    let o = y.add($b * yld as usize + row as usize);
+                    if add != 0 { *o += v } else { *o = v }
+                }
+            }
+        };
+    }
+    macro_rules! outr {
+        ($r:literal) => {
+            out!($r, 0); out!($r, 1); out!($r, 2); out!($r, 3); out!($r, 4); out!($r, 5); out!($r, 6); out!($r, 7);
+            out!($r, 8); out!($r, 9); out!($r, 10); out!($r, 11); out!($r, 12); out!($r, 13); out!($r, 14); out!($r, 15);
+            out!($r, 16); out!($r, 17); out!($r, 18); out!($r, 19); out!($r, 20); out!($r, 21); out!($r, 22); out!($r, 23);
+        };
+    }
+    outr!(0);
+    outr!(1);
+    outr!(2);
+    outr!(3);
+}
+
+macro_rules! gemv_rg_kernel {
+    ($v:ty, $name:ident, $b:literal, $r:literal) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "ptx-kernel" fn $name(y: *mut f32, w: *const u8, row_bytes: u64, aq: *const i8,
+            ad: *const f32, as_: *const f32, k: u32, n: u32, lpr: u32, add: u32, wg: u64, ag: u32, yg: u32, yld: u32) {
+            gemv_rg::<$v, $b, $r>(y, w, row_bytes, aq, ad, as_, k, n, lpr, add, wg, ag, yg, yld)
+        }
+    };
+}
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b1_r1, 1, 1);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b1_r2, 1, 2);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b1_r4, 1, 4);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b2_r1, 2, 1);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b2_r2, 2, 2);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b2_r4, 2, 4);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b3_r1, 3, 1);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b3_r2, 3, 2);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b3_r4, 3, 4);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b4_r1, 4, 1);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b4_r2, 4, 2);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b4_r4, 4, 4);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b5_r1, 5, 1);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b5_r2, 5, 2);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b5_r4, 5, 4);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b6_r1, 6, 1);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b6_r2, 6, 2);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b6_r4, 6, 4);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b7_r1, 7, 1);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b7_r2, 7, 2);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b7_r4, 7, 4);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b8_r1, 8, 1);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b8_r2, 8, 2);
+gemv_rg_kernel!(Q5K, ggq_gemv_q5_k_g_b8_r4, 8, 4);
 
 macro_rules! gemv_r_kernel {
     ($v:ty, $name:ident, $b:literal, $r:literal) => {
@@ -561,3 +648,103 @@ gemv_r_kernel!(Iq3S, ggq_gemv_iq3_s_b12_w2, 12, 2);
 gemv_r_kernel!(Iq3S, ggq_gemv_iq3_s_b16_w2, 16, 2);
 gemv_r_kernel!(Iq3S, ggq_gemv_iq3_s_b20_w2, 20, 2);
 gemv_r_kernel!(Iq3S, ggq_gemv_iq3_s_b24_w2, 24, 2);
+
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b1_r2, 1, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b1_r4, 1, 4);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b2_r2, 2, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b2_r4, 2, 4);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b3_r2, 3, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b3_r4, 3, 4);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b4_r2, 4, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b4_r4, 4, 4);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b5_r2, 5, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b5_r4, 5, 4);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b6_r2, 6, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b6_r4, 6, 4);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b7_r2, 7, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b7_r4, 7, 4);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b8_r2, 8, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b8_r4, 8, 4);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b12_w, 12, 1);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b16_w, 16, 1);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b20_w, 20, 1);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b24_w, 24, 1);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b12_w2, 12, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b16_w2, 16, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b20_w2, 20, 2);
+gemv_r_kernel!(Iq2Xxs, ggq_gemv_iq2_xxs_b24_w2, 24, 2);
+
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b1_r2, 1, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b1_r4, 1, 4);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b2_r2, 2, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b2_r4, 2, 4);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b3_r2, 3, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b3_r4, 3, 4);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b4_r2, 4, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b4_r4, 4, 4);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b5_r2, 5, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b5_r4, 5, 4);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b6_r2, 6, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b6_r4, 6, 4);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b7_r2, 7, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b7_r4, 7, 4);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b8_r2, 8, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b8_r4, 8, 4);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b12_w, 12, 1);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b16_w, 16, 1);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b20_w, 20, 1);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b24_w, 24, 1);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b12_w2, 12, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b16_w2, 16, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b20_w2, 20, 2);
+gemv_r_kernel!(Iq1M, ggq_gemv_iq1_m_b24_w2, 24, 2);
+
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b1_r2, 1, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b1_r4, 1, 4);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b2_r2, 2, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b2_r4, 2, 4);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b3_r2, 3, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b3_r4, 3, 4);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b4_r2, 4, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b4_r4, 4, 4);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b5_r2, 5, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b5_r4, 5, 4);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b6_r2, 6, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b6_r4, 6, 4);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b7_r2, 7, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b7_r4, 7, 4);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b8_r2, 8, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b8_r4, 8, 4);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b12_w, 12, 1);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b16_w, 16, 1);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b20_w, 20, 1);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b24_w, 24, 1);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b12_w2, 12, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b16_w2, 16, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b20_w2, 20, 2);
+gemv_r_kernel!(Iq2Xs, ggq_gemv_iq2_xs_b24_w2, 24, 2);
+
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b1_r2, 1, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b1_r4, 1, 4);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b2_r2, 2, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b2_r4, 2, 4);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b3_r2, 3, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b3_r4, 3, 4);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b4_r2, 4, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b4_r4, 4, 4);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b5_r2, 5, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b5_r4, 5, 4);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b6_r2, 6, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b6_r4, 6, 4);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b7_r2, 7, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b7_r4, 7, 4);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b8_r2, 8, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b8_r4, 8, 4);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b12_w, 12, 1);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b16_w, 16, 1);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b20_w, 20, 1);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b24_w, 24, 1);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b12_w2, 12, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b16_w2, 16, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b20_w2, 20, 2);
+gemv_r_kernel!(Mxfp4R, ggq_gemv_mxfp4r_b24_w2, 24, 2);

@@ -149,7 +149,14 @@ impl PhaseDefaults {
                 None
             }
         });
-        let loop_rules = crate::loopdet::LoopCfg::from_json(env_rules.as_ref().or(cfg.get("loop_rules")));
+        let mut loop_rules = crate::loopdet::LoopCfg::from_json(env_rules.as_ref().or(cfg.get("loop_rules")));
+        // the stretch after a tool-call rewind samples with the thinking profile's values
+        if let Some(t) = profile_thinking.temperature.filter(|&t| t > 0.0) {
+            loop_rules.recover_temperature = t;
+        }
+        if let Some(t) = profile_thinking.top_p {
+            loop_rules.recover_top_p = t;
+        }
         // the token that ends the reasoning block (`think_end` in sampling.json, default `</think>`); None when the vocabulary has no such token
         let think_end = tok.token_id(cfg.get("think_end").and_then(Json::as_str).unwrap_or("</think>"));
         let mut call_marks = Vec::new();
@@ -620,7 +627,7 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
     let add_gen = req.add_generation_prompt.unwrap_or(true) && !continue_final;
     let offered = ToolSet::from_openai(template_tools.as_deref().unwrap_or(&[]));
     let mut forced: Option<ForcedCall> = match &choice {
-        _ if template_tools.is_none() || !add_gen || s.template.dsml => None,
+        _ if template_tools.is_none() || !add_gen => None,
         ToolChoice::Required => {
             // one function offered: that is the call; several: the name is the model's choice among them (constrained below)
             let names: Vec<&str> = offered.names().collect();
@@ -664,7 +671,7 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
         forced = None;
     }
     if let Some(f) = &forced {
-        prompt.push_str(&f.opener());
+        prompt.push_str(&f.opener_for(s.template.dsml));
     }
     if tracing::enabled!(tracing::Level::DEBUG) {
         let tail: String = prompt.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
@@ -680,7 +687,9 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
     params.call_open = forced.is_some();
     if forced == Some(ForcedCall::Any) {
         // the reply continues `<function=`: only an offered name may follow
-        params.prefix_choices = offered.names().filter_map(|n| s.tok.encode(&format!("{n}>\n")).ok()).filter(|c| !c.is_empty()).collect();
+        // (DSML: the reply continues `<｜DSML｜ invoke name="`)
+        let close = if s.template.dsml { "\">\n" } else { ">\n" };
+        params.prefix_choices = offered.names().filter_map(|n| s.tok.encode(&format!("{n}{close}")).ok()).filter(|c| !c.is_empty()).collect();
     }
     if thinking {
         if let Some(te) = ph.think_end {
@@ -1042,6 +1051,7 @@ impl Driver {
             "loop_breaker_fired": ev.loop_breaks > 0,
             "loop_breaker_firings": ev.loop_breaks,
             "sentence_loop_firings": ev.sentence_breaks,
+            "loop_rewinds": ev.rewinds,
             "watchdog": self.watchdog,
             "seconds": (self.t_start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
         }));

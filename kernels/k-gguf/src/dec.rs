@@ -98,6 +98,20 @@ pub unsafe fn dec_iq4_nl(b: *const u8, c: u32) -> [f32; 8] {
     nib8(b.add(2 + 8 * (c as usize & 1)), c >= 2, d)
 }
 #[inline(always)]
+pub unsafe fn dec_mxfp4r(b: *const u8, c: u32) -> [f32; 8] {
+    let d = crate::vq::e8m0_half(ld_u8(b) as u32);
+    let qs = b.add(2 + 8 * (c as usize & 1));
+    let lo = ld_u32_a2(qs);
+    let h2 = ld_u32_a2(qs.add(4));
+    let mut y = [0f32; 8];
+    for j in 0..8 {
+        let byte = if j < 4 { lo >> (8 * j) } else { h2 >> (8 * (j - 4)) } & 0xff;
+        let q = if c >= 2 { byte >> 4 } else { byte & 0xf };
+        y[j] = mul(d, (*KVALUES_MXFP4.as_ptr().add(q as usize)) as f32);
+    }
+    y
+}
+#[inline(always)]
 pub unsafe fn dec_iq4_xs(b: *const u8, c: u32) -> [f32; 8] {
     let d = ld_h(b);
     let ib = (c / 4) as usize;
@@ -232,6 +246,64 @@ pub unsafe fn dec_iq3_s(b: *const u8, c: u32) -> [f32; 8] {
     for j in 0..4 {
         y[j] = mul(mul(db, ((g1 >> (8 * j)) & 0xff) as f32), sgn(s, j as u32));
         y[j + 4] = mul(mul(db, ((g2 >> (8 * j)) & 0xff) as f32), sgn(s, j as u32 + 4));
+    }
+    y
+}
+#[inline(always)]
+pub unsafe fn dec_iq2_xxs(b: *const u8, c: u32) -> [f32; 8] {
+    let d = ld_h(b);
+    let ib = (c / 4) as usize;
+    let l = c % 4;
+    let aux = ld_u32_a2(b.add(6 + 8 * ib));
+    let db = mul(mul(d, add(0.5, (aux >> 28) as f32)), 0.25);
+    let signs = *KSIGNS_IQ2XS.as_ptr().add(((aux >> (7 * l)) & 127) as usize) as u32;
+    let g = *IQ2XXS_GRID.as_ptr().add(ld_u8(b.add(2 + ib * 8 + l as usize)) as usize);
+    let mut y = [0f32; 8];
+    for j in 0..8 {
+        y[j] = mul(mul(db, ((g >> (8 * j)) & 0xff) as f32), sgn(signs, j as u32));
+    }
+    y
+}
+#[inline(always)]
+pub unsafe fn dec_iq1_m(b: *const u8, c: u32) -> [f32; 8] {
+    let ib = (c / 4) as usize;
+    let l = c % 4;
+    let du = (ld_u16(b.add(48)) >> 12) | ((ld_u16(b.add(50)) >> 8) & 0x00f0) | ((ld_u16(b.add(52)) >> 4) & 0x0f00)
+        | (ld_u16(b.add(54)) & 0xf000);
+    let d = f16_to_f32(du);
+    let scw = ld_u16(b.add(48 + 2 * (ib / 2))) as u32;
+    let sh = 6 * (ib as u32 % 2) + if l < 2 { 0 } else { 3 };
+    let dl = mul(d, (2 * ((scw >> sh) & 7) + 1) as f32);
+    let qh = ld_u16(b.add(32 + 2 * ib)) as u32;
+    let hi = match l {
+        0 => (qh << 8) & 0x700,
+        1 => (qh << 4) & 0x700,
+        2 => qh & 0x700,
+        _ => (qh >> 4) & 0x700,
+    };
+    let idx = ld_u8(b.add(4 * ib + l as usize)) as usize | hi as usize;
+    let delta = if (qh >> (4 * l + 3)) & 1 != 0 { -0.125f32 } else { 0.125f32 };
+    let g = *IQ1S_GRID.as_ptr().add(idx);
+    let mut y = [0f32; 8];
+    for j in 0..8 {
+        y[j] = mul(dl, add((((g >> (8 * j)) & 0xff) as u8 as i8) as f32, delta));
+    }
+    y
+}
+#[inline(always)]
+pub unsafe fn dec_iq2_xs(b: *const u8, c: u32) -> [f32; 8] {
+    let d = ld_h(b);
+    let ib = (c / 4) as usize;
+    let l = (c % 4) as usize;
+    let sc = ld_u8(b.add(66 + ib)) as u32;
+    let s4 = if l < 2 { sc & 0xf } else { sc >> 4 };
+    let dl = mul(mul(d, add(0.5, s4 as f32)), 0.25);
+    let q = ld_u16(b.add(2 + 8 * ib + 2 * l)) as usize;
+    let g = *IQ2XS_GRID.as_ptr().add(q & 511);
+    let s = *KSIGNS_IQ2XS.as_ptr().add(q >> 9) as u32;
+    let mut y = [0f32; 8];
+    for j in 0..8 {
+        y[j] = mul(mul(dl, ((g >> (8 * j)) & 0xff) as f32), sgn(s, j as u32));
     }
     y
 }

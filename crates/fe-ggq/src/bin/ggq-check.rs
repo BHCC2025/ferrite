@@ -1632,6 +1632,10 @@ fn binv(g: &Gguf, k: &Ggq, s: &Stream, first: &BTreeMap<u32, &TensorInfo>) -> Re
         report(&format!("gemv {} [{kk} -> {n}]", t.ty.name()), &bad);
         report(&format!("  CPU gemv_rows_gpu == GPU gemv {} (lpr {lpr})", t.ty.name()), &cbad);
     }
+    if g.tensor("blk.0.hc_attn_down.weight").is_none() {
+        println!("hc / moe sections need Flash-Next tensors: skipped");
+        return Ok(());
+    }
     // BF16 GEMV + fused hc kernels (layer 0 hc weights)
     {
         let (dt, it, ut, nt) = (g.tensor("blk.0.hc_attn_down.weight").unwrap(), g.tensor("blk.0.hc_attn_inject.weight").unwrap(),

@@ -5,6 +5,10 @@
 //! [`engine::Engine`] only maps prompt token ids to generated token ids.
 pub mod api;
 pub mod batch;
+#[cfg(feature = "dsc")]
+pub mod dsc;
+#[cfg(feature = "dsc")]
+pub mod dsc_lanes;
 pub mod engine;
 #[cfg(feature = "fnext")]
 pub mod fnext;

@@ -54,6 +54,16 @@ pub enum GgmlType {
     Q1_0 = 41,
     /// Fork-specific (llama.cpp-flashnext): 64 values per block, f16 d + 2-bit codes {-1, 0, 1, 2} * d.
     Q2_0 = 42,
+    /// Not a file type: IQ1_M rows repacked for the CPU expert lane (`fe_ggq::cpu::repack`); never read from a GGUF.
+    RepIq1M = 1001,
+    /// Not a file type: MXFP4 repacked to 18-byte blocks (the e8m0 scale as a u16, then the 16 nibble bytes) so the GPU reads 2-byte aligned.
+    RepMxfp4 = 1002,
+    /// Not a file type: IQ2_XXS / IQ2_XS / IQ1_M repacked for the CPU expert lane into magnitude (2 bit) and sign (1 bit) planes + scale bytes (fe_ggq::cpu::repack::rep3).
+    RepR3Xxs = 1003,
+    RepR3Xs = 1004,
+    RepR3Iq1M = 1005,
+    /// IQ2_XXS with the 8-bit grid indices kept and the signs resolved into a bit plane (76 B per 256 values).
+    RepHXxs = 1006,
 }
 
 impl GgmlType {
@@ -103,6 +113,10 @@ impl GgmlType {
             NVFP4 => (64, 36),
             Q1_0 => (128, 18),
             Q2_0 => (64, 18),
+            RepIq1M => (256, 56),
+            RepMxfp4 => (32, 18),
+            RepR3Xxs | RepR3Xs | RepR3Iq1M => (256, 108),
+            RepHXxs => (256, 76),
         }
     }
     pub fn name(self) -> &'static str {
@@ -113,11 +127,15 @@ impl GgmlType {
             Q6K => "Q6_K", Q8K => "Q8_K", IQ2XXS => "IQ2_XXS", IQ2XS => "IQ2_XS", IQ3XXS => "IQ3_XXS",
             IQ1S => "IQ1_S", IQ4NL => "IQ4_NL", IQ3S => "IQ3_S", IQ2S => "IQ2_S", IQ4XS => "IQ4_XS", I8 => "I8",
             I16 => "I16", I32 => "I32", I64 => "I64", F64 => "F64", IQ1M => "IQ1_M", BF16 => "BF16",
-            TQ1_0 => "TQ1_0", TQ2_0 => "TQ2_0", MXFP4 => "MXFP4", NVFP4 => "NVFP4", Q1_0 => "Q1_0", Q2_0 => "Q2_0",
+            TQ1_0 => "TQ1_0", TQ2_0 => "TQ2_0", MXFP4 => "MXFP4", NVFP4 => "NVFP4", Q1_0 => "Q1_0", Q2_0 => "Q2_0", RepIq1M => "IQ1_M-rep", RepMxfp4 => "MXFP4-rep", RepR3Xxs => "IQ2_XXS-r3", RepR3Xs => "IQ2_XS-r3", RepR3Iq1M => "IQ1_M-r3", RepHXxs => "IQ2_XXS-h",
         }
     }
     /// Bytes of one row of `n` values (n must be a multiple of the block size).
     pub fn row_bytes(self, n: usize) -> usize {
+        if self == GgmlType::RepIq1M {
+            // 160-value units + per-row header, see fe_ggq::cpu::repack
+            return (8 + (n / 32).div_ceil(5) * 40 + n / 256 * 4 + 7) & !7;
+        }
         let (bs, by) = self.block();
         n / bs * by
     }
@@ -246,6 +264,9 @@ pub struct Gguf {
     pub tensors: Vec<TensorInfo>,
     t_idx: HashMap<String, usize>,
     pub shards: Vec<Shard>,
+    /// `open_partial` / `attach_partial` only: shard paths that do not exist yet and tensors whose bytes run past
+    /// the end of a file still being downloaded (neither is in `tensors`).
+    pub missing: Vec<String>,
 }
 
 struct Cur<'a> {
@@ -318,9 +339,23 @@ pub fn shard_paths(first: &Path) -> Vec<PathBuf> {
 impl Gguf {
     /// Open a GGUF file; a split name (`-00001-of-0000N`) opens all shards (any shard path works).
     pub fn open(path: impl AsRef<Path>) -> Result<Gguf> {
-        let paths = shard_paths(path.as_ref());
-        let mut g = Gguf { version: 0, kv: vec![], kv_idx: HashMap::new(), tensors: vec![], t_idx: HashMap::new(), shards: vec![] };
+        Self::open_impl(path.as_ref(), false)
+    }
+    /// Like [`Gguf::open`] for a download in progress: a shard that is not there yet is skipped (listed in
+    /// `missing`; its tensors are unknown), and a tensor that runs past the end of its file is left out (also in
+    /// `missing`). The first shard must exist. Never use this to serve: it exists for inventory and tests.
+    pub fn open_partial(path: impl AsRef<Path>) -> Result<Gguf> {
+        Self::open_impl(path.as_ref(), true)
+    }
+    fn open_impl(path: &Path, lenient: bool) -> Result<Gguf> {
+        let paths = shard_paths(path);
+        let mut g = Gguf { version: 0, kv: vec![], kv_idx: HashMap::new(), tensors: vec![], t_idx: HashMap::new(), shards: vec![], missing: vec![] };
         for (si, p) in paths.iter().enumerate() {
+            if lenient && si > 0 && !p.exists() {
+                g.missing.push(format!("shard {}", p.display()));
+                g.shards.push(Shard { path: p.clone(), map: memmap2::MmapMut::map_anon(1)?.make_read_only()? });
+                continue;
+            }
             let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
             let map = unsafe { Mmap::map(&f) }.with_context(|| format!("mmap {}", p.display()))?;
             let (version, kv, tensors) = parse(&map, si).with_context(|| format!("parse {}", p.display()))?;
@@ -333,6 +368,10 @@ impl Gguf {
             }
             for t in tensors {
                 if t.offset + t.bytes > map.len() as u64 {
+                    if lenient {
+                        g.missing.push(t.name.clone());
+                        continue;
+                    }
                     bail!("gguf: tensor {} runs past the end of {}", t.name, p.display());
                 }
                 g.t_idx.insert(t.name.clone(), g.tensors.len());
@@ -345,20 +384,32 @@ impl Gguf {
     /// Add the tensors of another (single-file) GGUF as one more shard, e.g. a separate draft head next to a split
     /// model. Tensor names must not repeat; the file's metadata is returned, not merged (see [`Gguf::set`]).
     pub fn attach(&mut self, path: impl AsRef<Path>) -> Result<Vec<(String, Value)>> {
-        let p = path.as_ref();
+        self.attach_impl(path.as_ref(), false)
+    }
+    /// [`Gguf::attach`] for a file still downloading: tensors past its end are left out and listed in `missing`.
+    pub fn attach_partial(&mut self, path: impl AsRef<Path>) -> Result<Vec<(String, Value)>> {
+        self.attach_impl(path.as_ref(), true)
+    }
+    fn attach_impl(&mut self, p: &Path, lenient: bool) -> Result<Vec<(String, Value)>> {
         let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
         let map = unsafe { Mmap::map(&f) }.with_context(|| format!("mmap {}", p.display()))?;
         let si = self.shards.len();
         let (_, kv, tensors) = parse(&map, si).with_context(|| format!("parse {}", p.display()))?;
-        for t in &tensors {
+        let mut keep = Vec::with_capacity(tensors.len());
+        for t in tensors {
             if t.offset + t.bytes > map.len() as u64 {
+                if lenient {
+                    self.missing.push(t.name.clone());
+                    continue;
+                }
                 bail!("gguf: tensor {} runs past the end of {}", t.name, p.display());
             }
             if self.t_idx.contains_key(&t.name) {
                 bail!("gguf: tensor {} of {} is already in the model", t.name, p.display());
             }
+            keep.push(t);
         }
-        for t in tensors {
+        for t in keep {
             self.t_idx.insert(t.name.clone(), self.tensors.len());
             self.tensors.push(t);
         }

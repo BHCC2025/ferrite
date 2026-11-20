@@ -4,6 +4,43 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-20
+
+### Added
+
+- **A third model: DeepSeek-V4.1-Flash Coder** (the ISTA-DASLab GSQ-RCO Coder IQ2_XXS GGUF, 72 GB) on three 24 GB
+  cards, or four with a 16 GB card added: `fe-server --engine dsc` (`--features dsc`), crate `fe-dsc`, kernels
+  `k-ds`, `k-dspark` and `k-engram`, [docs/deepseek-coder.md](docs/deepseek-coder.md). New `scripts/fetch-deepseek.sh`
+  (the model, the DSpark draft model and the Engram table, ~191 GB, checked against pinned sizes and sha256; it
+  writes the tokenizer and serving files with the new `dsc-mkmodel`) and `tools/serve-dsc.sh`.
+  - The main card runs the dense part and its share of the experts; the other cards hold experts only and get each
+    layer's input card to card. Which experts are on the cards comes from a placement heat measured on real
+    workloads (`crates/fe-dsc/heat/coder.cnt`). On three RTX PRO 4000 Blackwell about 1,440 experts stay in pinned
+    host memory and are copied to a card when picked; a fourth card holds them all.
+  - DSpark speculative decoding and drafts copied from the context, lossless (greedy output is the same as plain
+    decoding).
+  - One request, thinking off, three / four cards: Python 94 / 109, Rust 96 / 115, HTML and JavaScript 108 / 130,
+    chat 43 / 69 tokens/s.
+  - `FERRITE_SLOTS=2-4`: several requests at once, each with the same text as alone; one drafter pass serves all of
+    them. Four code requests total 116 / 141 tokens/s on three / four cards: on this model several requests add
+    little over one.
+  - The protections of [docs/harness.md](docs/harness.md) on every request, also with several at once: the
+    reasoning cap (the engine closes the block itself), the loop breaker, the repeated-sentence rule, the first-token
+    stop ban, enforced `tool_choice` in the DSML tool-call format, the watchdog and the finite check. A tool call
+    that starts to repeat itself is rewound to where the cycle began and continued with sampling
+    (`loop_rules.call_recover`, on in `crates/fe-server/sampling.deepseek-v4.1-flash-coder.json`).
+  - The tokenizer is built from the GGUF with the think and DSML marks as single tokens (split into pieces they
+    made replies run away and broke tool calls).
+- `tools/conformance/profiles/deepseek-v4.1-flash-coder.json`: the conformance suite for this model.
+- GGUF GPU kernels for the IQ2_XXS, IQ2_XS, IQ1_M and MXFP4 types (`k-gguf`, `fe-ggq`). AVX2 CPU kernels for the
+  same types are in `fe-ggq` too; the DeepSeek engine does not use them by default (copying a spilled expert to a
+  card measured faster).
+
+### Changed
+
+- The server's guard can rewind: an engine that holds back the tokens of a building tool-call cycle can take them
+  back and continue with sampling. Engines that do not enable it behave as before.
+
 ## [0.7.2] - 2026-11-19
 
 ### Added
@@ -535,6 +572,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.8.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.8.0
 [0.7.2]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.2
 [0.7.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.1
 [0.7.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.0

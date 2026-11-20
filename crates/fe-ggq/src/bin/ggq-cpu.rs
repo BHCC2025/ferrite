@@ -20,7 +20,7 @@ impl Lcg {
 
 fn main() -> Result<()> {
     let a: Vec<String> = std::env::args().collect();
-    let g = Gguf::open(&a[1])?;
+    let g = Gguf::open_partial(&a[1])?;
     let threads: Vec<usize> = a.iter().skip(3).filter_map(|s| s.parse().ok()).collect();
     println!("avx2+fma: {}", cpu::has_avx2());
     match a[2].as_str() {

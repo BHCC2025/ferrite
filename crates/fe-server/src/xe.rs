@@ -892,7 +892,7 @@ impl Ctl {
             std::mem::replace(&mut g.act, Act::None)
         };
         match act {
-            Act::None => {}
+            Act::None | Act::Rewind(..) => {}
             // an answer-phase cycle that came back after the boost: end cleanly (as the token limit would)
             Act::End => return Some(FinishReason::Length),
             // the engine closes the reasoning block: `</think>` follows this token

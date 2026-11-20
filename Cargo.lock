@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "fe-cli"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-cuda",
@@ -400,11 +400,11 @@ dependencies = [
 
 [[package]]
 name = "fe-cuda"
-version = "0.7.2"
+version = "0.8.0"
 
 [[package]]
 name = "fe-dflash"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-cuda",
@@ -418,8 +418,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fe-dsc"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "fe-cuda",
+ "fe-ggq",
+ "fe-gguf",
+ "fe-kbuild",
+ "libc",
+ "rayon",
+ "tokenizers",
+]
+
+[[package]]
 name = "fe-exl3"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-cuda",
@@ -429,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "fe-fabric"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-cuda",
@@ -441,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "fe-fnext"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-cuda",
@@ -457,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "fe-fp4"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-cuda",
@@ -468,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "fe-gdn"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-cuda",
@@ -479,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "fe-ggq"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-cuda",
@@ -490,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "fe-gguf"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "memmap2",
@@ -498,15 +512,15 @@ dependencies = [
 
 [[package]]
 name = "fe-kbuild"
-version = "0.7.2"
+version = "0.8.0"
 
 [[package]]
 name = "fe-kbuild-xe"
-version = "0.7.2"
+version = "0.8.0"
 
 [[package]]
 name = "fe-kx-tests"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-kbuild-xe",
@@ -517,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "fe-kxcore"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-kbuild-xe",
@@ -526,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "fe-model"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-cuda",
@@ -543,14 +557,16 @@ dependencies = [
 
 [[package]]
 name = "fe-server"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
  "fe-cuda",
  "fe-dflash",
+ "fe-dsc",
  "fe-fnext",
+ "fe-gguf",
  "fe-model",
  "fe-site",
  "fe-xdf",
@@ -570,11 +586,11 @@ dependencies = [
 
 [[package]]
 name = "fe-site"
-version = "0.7.2"
+version = "0.8.0"
 
 [[package]]
 name = "fe-xdf"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-kbuild-xe",
@@ -586,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "fe-xe"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fe-kbuild-xe",
@@ -599,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "fe-xq"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "memmap2",
@@ -608,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "fe-ze"
-version = "0.7.2"
+version = "0.8.0"
 
 [[package]]
 name = "fnv"

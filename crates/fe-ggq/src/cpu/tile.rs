@@ -40,7 +40,7 @@ pub struct DecRows {
 /// Whether a type's integer codes fit the offset form (|w| <= 63).
 pub fn offset_ok(ty: fe_gguf::GgmlType) -> bool {
     use fe_gguf::GgmlType::*;
-    matches!(ty, IQ2S | IQ3XXS | IQ3S | Q2_0 | Q4K | Q5K | Q6K)
+    matches!(ty, IQ2S | IQ3XXS | IQ3S | IQ2XXS | IQ1M | IQ2XS | RepIq1M | RepHXxs | RepR3Xxs | RepR3Xs | RepR3Iq1M | Q2_0 | Q4K | Q5K | Q6K)
 }
 
 /// Decode rows `r0 .. r0 + n` (row stride `row_bytes`, `k` values) into rows `at ..` of `d`.

@@ -8,6 +8,7 @@
 use crate::tables::*;
 use std::arch::x86_64::*;
 
+#[derive(Clone, Copy)]
 pub struct Dq {
     pub wa: __m256i,
     pub sg: __m256i,
@@ -73,6 +74,13 @@ pub static SIGNS_MEM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 pub fn signs_mem() -> bool {
     SIGNS_MEM.load(std::sync::atomic::Ordering::Relaxed)
 }
+/// Gathers for the IQ2_XXS / IQ1_M codebooks (8-byte entries, 4 per sub-block): off by default, the insert chains win on
+/// Zen 3 (IQ1_M B1 1.5 vs 1.0 GB/s per core); FE_GGQ_CPU_GATHER_XQ=1 turns them on.
+pub static GATHER_XQ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[inline]
+pub fn gather_xq() -> bool {
+    GATHER_XQ.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub static GATHER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Read FE_GGQ_CPU_GATHER once (0 = vector inserts); called by `cpu::has_avx2`.
 pub fn init_gather() {
@@ -82,6 +90,7 @@ pub fn init_gather() {
     let is_amd = v.ebx == 0x6874_7541; // "Auth"enticAMD
     let on = std::env::var("FE_GGQ_CPU_GATHER").map(|v| v == "1").unwrap_or(is_amd);
     GATHER.store(on, std::sync::atomic::Ordering::Relaxed);
+    GATHER_XQ.store(std::env::var("FE_GGQ_CPU_GATHER_XQ").map(|v| v == "1").unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
     let sm = std::env::var("FE_GGQ_CPU_SIGNMUL").map(|v| v == "1").unwrap_or(false);
     SIGNS_MEM.store(sm, std::sync::atomic::Ordering::Relaxed);
 }
@@ -130,6 +139,11 @@ pub trait Cq {
         base * isc as f32
     }
     unsafe fn dq(row: *const u8, j: usize) -> Dq;
+    /// The four sub-blocks' float factors (j % 4 == 0) as a vector; default: the `Dq::base`s. Overridden where a vector form is cheaper (same IEEE operations).
+    #[inline(always)]
+    unsafe fn base4(_row: *const u8, _j: usize, d: &[Dq; 4]) -> __m128 {
+        _mm_setr_ps(d[0].base, d[1].base, d[2].base, d[3].base)
+    }
     /// Sub-blocks j .. j + 4 (j % 4 == 0): superblock types override it to read the block header once.
     #[inline(always)]
     unsafe fn dq4(row: *const u8, j: usize) -> [Dq; 4] {
@@ -427,6 +441,395 @@ impl<const G: bool> Cq for Iq3S<G> {
     }
 }
 
+#[repr(align(32))]
+struct A32<T>(T);
+/// IQ1_M scale pair (s1 | s2 << 3) -> int16 multipliers (2 s1 + 1 for values 0..16, 2 s2 + 1 for 16..32).
+static IQ1M_SC: A32<[[i16; 16]; 64]> = {
+    let mut t = [[0i16; 16]; 64];
+    let mut i = 0;
+    while i < 64 {
+        let mut j = 0;
+        while j < 16 {
+            t[i][j] = if j < 8 { 2 * (i & 7) as i16 + 1 } else { 2 * (i >> 3) as i16 + 1 };
+            j += 1;
+        }
+        i += 1;
+    }
+    A32(t)
+};
+/// IQ1_M delta bits (bit l = group l of 8 negative) -> +1 / -1 per int8 value.
+static IQ1M_DELTA: A32<[[u64; 4]; 16]> = {
+    let mut t = [[0u64; 4]; 16];
+    let mut i = 0;
+    while i < 16 {
+        let mut l = 0;
+        while l < 4 {
+            t[i][l] = if (i >> l) & 1 != 0 { 0xffff_ffff_ffff_ffff } else { 0x0101_0101_0101_0101 };
+            l += 1;
+        }
+        i += 1;
+    }
+    A32(t)
+};
+/// IQ1S_GRID with every int8 value times 8 (g in -1, 0, 1 -> -8, 0, 8): derived from the codebook at compile time.
+static IQ1S_GRID8: [u64; 2048] = {
+    let mut t = [0u64; 2048];
+    let mut i = 0;
+    while i < 2048 {
+        let g = IQ1S_GRID[i];
+        let mut v = 0u64;
+        let mut j = 0;
+        while j < 8 {
+            let b = ((g >> (8 * j)) & 0xff) as u8 as i8;
+            v |= ((b.wrapping_mul(8)) as u8 as u64) << (8 * j);
+            j += 1;
+        }
+        t[i] = v;
+        i += 1;
+    }
+    t
+};
+
+pub struct Iq2Xxs<const G: bool = false>;
+impl<const G: bool> Iq2Xxs<G> {
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq_at(b: *const u8, d: f32, ib: usize) -> Dq {
+        let q = b.add(2 + 8 * ib);
+        let aux = rd32(q.add(4));
+        let g = IQ2XXS_GRID.as_ptr();
+        let x = rd32(q) as usize;
+        let i = [x & 0xff, (x >> 8) & 0xff, (x >> 16) & 0xff, x >> 24];
+        let wa = if G {
+            _mm256_i32gather_epi64::<8>(g as *const i64, _mm_setr_epi32(i[0] as i32, i[1] as i32, i[2] as i32, i[3] as i32))
+        } else {
+            _mm256_set_epi64x(*g.add(i[3]) as i64, *g.add(i[2]) as i64, *g.add(i[1]) as i64, *g.add(i[0]) as i64)
+        };
+        // 4 x 7 sign bits spread to bytes (pdep), bit 7 = parity of the byte's 7 bits (= ksigns_iq2xs)
+        let v = _pdep_u32(aux, 0x7f7f_7f7f);
+        let mut p = v ^ (v >> 4);
+        p ^= p >> 2;
+        p ^= p >> 1;
+        let s = v | ((p & 0x0101_0101) << 7);
+        // the GPU's float base d * (0.5 + ls) * 0.25, with exactly its operations
+        let base = d * (0.5 + (aux >> 28) as f32) * 0.25;
+        Dq { wa, sg: sign_bits(s), sc: sc1(), base, isc: 1, m: 0.0 }
+    }
+}
+impl<const G: bool> Cq for Iq2Xxs<G> {
+    const QK: usize = 256;
+    const OFFSET_OK: bool = true;
+    const BYTES: usize = 66;
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq(row: *const u8, j: usize) -> Dq {
+        let b = row.add(66 * (j / 8));
+        Self::dq_at(b, h(b), j % 8)
+    }
+    #[inline(always)]
+    unsafe fn dq4(row: *const u8, j: usize) -> [Dq; 4] {
+        let b = row.add(66 * (j / 8));
+        let d = h(b);
+        let ib = j % 8;
+        [Self::dq_at(b, d, ib), Self::dq_at(b, d, ib + 1), Self::dq_at(b, d, ib + 2), Self::dq_at(b, d, ib + 3)]
+    }
+}
+/// IQ1_M: int8 weights 8 g +- 1 (g in {-1, 0, 1} from the grid, +- 1 the per-8 delta), base d / 8, two integer
+/// half-block scales 2 s + 1.
+pub struct Iq1M<const G: bool = false>;
+impl<const G: bool> Iq1M<G> {
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq_at(b: *const u8, d: f32, ib: usize) -> Dq {
+        let qs = rd32(b.add(4 * ib));
+        let qh = rd16(b.add(32 + 2 * ib)) as u32;
+        let scw = rd16(b.add(48 + 2 * (ib / 2))) as usize;
+        let sc = _mm256_load_si256(IQ1M_SC.0.as_ptr().add((scw >> (6 * (ib % 2))) & 63) as *const __m256i);
+        // the four 11-bit grid indices as 4 x u16: qs byte | 3 high bits (qh bits 4l .. 4l + 3) << 8
+        let x = _pdep_u64(qs as u64, 0x00ff_00ff_00ff_00ff) | _pdep_u64(_pext_u32(qh, 0x7777) as u64, 0x0700_0700_0700_0700);
+        let idx = [(x & 0xffff) as usize, ((x >> 16) & 0xffff) as usize, ((x >> 32) & 0xffff) as usize, (x >> 48) as usize];
+        let g = IQ1S_GRID8.as_ptr();
+        let gv = if G {
+            _mm256_i32gather_epi64::<8>(g as *const i64, _mm_setr_epi32(idx[0] as i32, idx[1] as i32, idx[2] as i32,
+                idx[3] as i32))
+        } else {
+            _mm256_set_epi64x(*g.add(idx[3]) as i64, *g.add(idx[2]) as i64, *g.add(idx[1]) as i64, *g.add(idx[0]) as i64)
+        };
+        // delta bits of group l: qh bit 4l + 3
+        let dv = _mm256_load_si256(IQ1M_DELTA.0.as_ptr().add(_pext_u32(qh, 0x8888) as usize) as *const __m256i);
+        let (wa, sg) = signed(_mm256_add_epi8(gv, dv));
+        Dq { wa, sg, sc, base: d * 0.125, isc: 1, m: 0.0 }
+    }
+}
+impl<const G: bool> Cq for Iq1M<G> {
+    const QK: usize = 256;
+    const SAME: bool = false;
+    const OFFSET_OK: bool = true;
+    const BYTES: usize = 56;
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq(row: *const u8, j: usize) -> Dq {
+        let b = row.add(56 * (j / 8));
+        Self::dq_at(b, Self::dd(b), j % 8)
+    }
+    #[inline(always)]
+    unsafe fn dq4(row: *const u8, j: usize) -> [Dq; 4] {
+        let b = row.add(56 * (j / 8));
+        let d = Self::dd(b);
+        let ib = j % 8;
+        [Self::dq_at(b, d, ib), Self::dq_at(b, d, ib + 1), Self::dq_at(b, d, ib + 2), Self::dq_at(b, d, ib + 3)]
+    }
+}
+impl<const G: bool> Iq1M<G> {
+    /// The block's f16 d: one nibble from each of the four scale words.
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dd(b: *const u8) -> f32 {
+        let du = (rd16(b.add(48)) >> 12) | ((rd16(b.add(50)) >> 8) & 0x00f0) | ((rd16(b.add(52)) >> 4) & 0x0f00)
+            | (rd16(b.add(54)) & 0xf000);
+        _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(du as i32)))
+    }
+}
+
+/// IQ2_XS: 9-bit grid index + 7-bit sign index per 8 values, two 4-bit scales per 32 (as IQ2_S).
+pub struct Iq2Xs<const G: bool = false>;
+impl<const G: bool> Iq2Xs<G> {
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq_at(b: *const u8, d: f32, ib: usize) -> Dq {
+        let q = b.add(2 + 8 * ib);
+        let sc = *b.add(66 + ib) as u32;
+        let g = IQ2XS_GRID.as_ptr();
+        let lo = rd32(q) as usize;
+        let hi = rd32(q.add(4)) as usize;
+        let qq = [lo & 0xffff, lo >> 16, hi & 0xffff, hi >> 16];
+        let wa = if G {
+            _mm256_i32gather_epi64::<8>(g as *const i64, _mm_setr_epi32((qq[0] & 511) as i32, (qq[1] & 511) as i32,
+                (qq[2] & 511) as i32, (qq[3] & 511) as i32))
+        } else {
+            _mm256_set_epi64x(*g.add(qq[3] & 511) as i64, *g.add(qq[2] & 511) as i64, *g.add(qq[1] & 511) as i64, *g.add(qq[0] & 511) as i64)
+        };
+        let ks = KSIGNS_IQ2XS.as_ptr();
+        let s = *ks.add(qq[0] >> 9) as u32 | (*ks.add(qq[1] >> 9) as u32) << 8 | (*ks.add(qq[2] >> 9) as u32) << 16
+            | (*ks.add(qq[3] >> 9) as u32) << 24;
+        // d * (0.5 + ls) * 0.25 = d / 8 * (2 ls + 1)
+        Dq { wa, sg: sign_bits(s), sc: sc2(2 * (sc & 0xf) as i32 + 1, 2 * (sc >> 4) as i32 + 1), base: d * 0.125, isc: 1, m: 0.0 }
+    }
+}
+impl<const G: bool> Cq for Iq2Xs<G> {
+    const QK: usize = 256;
+    const SAME: bool = false;
+    const OFFSET_OK: bool = true;
+    const BYTES: usize = 74;
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq(row: *const u8, j: usize) -> Dq {
+        let b = row.add(74 * (j / 8));
+        Self::dq_at(b, h(b), j % 8)
+    }
+    #[inline(always)]
+    unsafe fn dq4(row: *const u8, j: usize) -> [Dq; 4] {
+        let b = row.add(74 * (j / 8));
+        let d = h(b);
+        let ib = j % 8;
+        [Self::dq_at(b, d, ib), Self::dq_at(b, d, ib + 1), Self::dq_at(b, d, ib + 2), Self::dq_at(b, d, ib + 3)]
+    }
+}
+
+/// IQ1_M repacked (see `repack`): lookup-free base-3 digit decode, the same int8 weights / scales / base as [`Iq1M`].
+static IQ1MR_C: A32<[[u64; 4]; 16]> = {
+    let mut t = [[0u64; 4]; 16];
+    let mut i = 0;
+    while i < 16 {
+        let mut l = 0;
+        while l < 4 {
+            // w = 8 * digit - 8 + delta: the per-8 constant -9 (delta -1) / -7 (delta +1)
+            t[i][l] = if (i >> l) & 1 != 0 { 0xf7f7_f7f7_f7f7_f7f7 } else { 0xf9f9_f9f9_f9f9_f9f9 };
+            l += 1;
+        }
+        i += 1;
+    }
+    A32(t)
+};
+static IQ1MR_POW: A32<[[u16; 16]; 10]> = {
+    let p = super::repack::POW3;
+    let mut t = [[0u16; 16]; 10];
+    let mut k = 0;
+    while k < 10 {
+        let mut l = 0;
+        while l < 16 {
+            t[k][l] = p[k];
+            l += 1;
+        }
+        k += 1;
+    }
+    A32(t)
+};
+pub struct Iq1MR;
+impl Iq1MR {
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq_at(row: *const u8, meta_off: usize, base_off: usize, u: usize, s: usize, j: usize) -> Dq {
+        let q = _mm256_loadu_si256(row.add(8 + 32 * u) as *const __m256i);
+        let three = _mm256_set1_epi16(3);
+        let pa = _mm256_load_si256(IQ1MR_POW.0.as_ptr().add(2 * s) as *const __m256i);
+        let pb = _mm256_load_si256(IQ1MR_POW.0.as_ptr().add(2 * s + 1) as *const __m256i);
+        let da = _mm256_mulhi_epu16(_mm256_mullo_epi16(q, pa), three);
+        let db = _mm256_mulhi_epu16(_mm256_mullo_epi16(q, pb), three);
+        let m10 = ((rd64(row.add(meta_off + 8 * u)) >> (10 * s)) & 0x3ff) as usize;
+        let cv = _mm256_load_si256(IQ1MR_C.0.as_ptr().add(m10 >> 6) as *const __m256i);
+        let w = _mm256_add_epi8(_mm256_slli_epi16(_mm256_packus_epi16(da, db), 3), cv);
+        let sc = _mm256_load_si256(IQ1M_SC.0.as_ptr().add(m10 & 63) as *const __m256i);
+        let base = f32::from_bits(rd32(row.add(base_off + 4 * (j / 8))));
+        let (wa, sg) = signed(w);
+        Dq { wa, sg, sc, base, isc: 1, m: 0.0 }
+    }
+}
+impl Cq for Iq1MR {
+    const QK: usize = 256;
+    const SAME: bool = false;
+    const OFFSET_OK: bool = true;
+    const BYTES: usize = 40;
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq(row: *const u8, j: usize) -> Dq {
+        let (mo, bo) = (rd32(row) as usize, rd32(row.add(4)) as usize);
+        let u = j / 5;
+        Self::dq_at(row, mo, bo, u, j - 5 * u, j)
+    }
+    #[inline(always)]
+    unsafe fn dq4(row: *const u8, j: usize) -> [Dq; 4] {
+        let (mo, bo) = (rd32(row) as usize, rd32(row.add(4)) as usize);
+        let u = j / 5;
+        let s = j - 5 * u;
+        // the four sub-blocks j .. j + 3 straddle at most one unit boundary
+        let at = |i: usize| {
+            let (ui, si) = if s + i >= 5 { (u + 1, s + i - 5) } else { (u, s + i) };
+            Self::dq_at(row, mo, bo, ui, si, j + i)
+        };
+        [at(0), at(1), at(2), at(3)]
+    }
+}
+
+
+/// IQ2_XXS (K = 0) / IQ2_XS (K = 1) / IQ1_M (K = 2) repacked into planes (see `repack::rep3`): per 256 values 64 B of 2-bit magnitude codes
+/// (sub-block s: 8 bytes, byte j = codes of values j, j + 8, j + 16, j + 24), 32 B of sign bits, 8 scale bytes, one f32; decoded with a
+/// broadcast + variable shift + mask + pshufb (magnitudes) and a broadcast + pshufb + and + cmpeq (signs): no table lookups. The decoded
+/// `Dq` is bit-identical to the original type's.
+pub struct Rep3<const K: u8>;
+impl<const K: u8> Rep3<K> {
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq_at(b: *const u8, ib: usize) -> Dq {
+        let m8 = _mm256_set1_epi64x((b.add(8 * ib) as *const i64).read_unaligned());
+        let codes = _mm256_and_si256(_mm256_srlv_epi64(m8, _mm256_setr_epi64x(0, 2, 4, 6)), _mm256_set1_epi8(3));
+        let lut = if K == 2 {
+            _mm256_broadcastsi128_si256(_mm_setr_epi8(1, 7, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        } else {
+            _mm256_broadcastsi128_si256(_mm_setr_epi8(8, 25, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        };
+        let wa = _mm256_shuffle_epi8(lut, codes);
+        let s32 = _mm256_set1_epi32((b.add(64 + 4 * ib) as *const i32).read_unaligned());
+        let rep = _mm256_shuffle_epi8(s32, _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
+        let bit = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
+        let sg = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(rep, bit), bit), _mm256_set1_epi8(1));
+        let sb = *b.add(96 + ib) as u32;
+        let dv = f32::from_bits(rd32(b.add(104)));
+        match K {
+            0 => Dq { wa, sg, sc: sc1(), base: dv * (0.5 + sb as f32) * 0.25, isc: 1, m: 0.0 },
+            1 => Dq { wa, sg, sc: _mm256_load_si256(IQ2XS_SC.0.as_ptr().add(sb as usize) as *const __m256i), base: dv, isc: 1, m: 0.0 },
+            _ => Dq { wa, sg, sc: _mm256_load_si256(IQ1M_SC.0.as_ptr().add((sb & 63) as usize) as *const __m256i), base: dv, isc: 1, m: 0.0 },
+        }
+    }
+}
+/// IQ2_XS scale byte (two 4-bit scales) -> the int16 multipliers (2 s + 1) of the two 16-value halves.
+static IQ2XS_SC: A32<[[i16; 16]; 256]> = {
+    let mut t = [[0i16; 16]; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut j = 0;
+        while j < 16 {
+            t[i][j] = if j < 8 { 2 * (i & 15) as i16 + 1 } else { 2 * (i >> 4) as i16 + 1 };
+            j += 1;
+        }
+        i += 1;
+    }
+    A32(t)
+};
+impl<const K: u8> Cq for Rep3<K> {
+    const QK: usize = 256;
+    const SAME: bool = K == 0;
+    const OFFSET_OK: bool = true;
+    const BYTES: usize = 108;
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq(row: *const u8, j: usize) -> Dq {
+        Self::dq_at(row.add(108 * (j / 8)), j % 8)
+    }
+    #[inline(always)]
+    unsafe fn dq4(row: *const u8, j: usize) -> [Dq; 4] {
+        let b = row.add(108 * (j / 8));
+        let ib = j % 8;
+        [Self::dq_at(b, ib), Self::dq_at(b, ib + 1), Self::dq_at(b, ib + 2), Self::dq_at(b, ib + 3)]
+    }
+    #[inline(always)]
+    unsafe fn base4(row: *const u8, j: usize, _d: &[Dq; 4]) -> __m128 {
+        let b = row.add(108 * (j / 8));
+        let dv = f32::from_bits(rd32(b.add(104)));
+        if K == 0 {
+            // d * (0.5 + ls) * 0.25, the same operations on four lanes
+            let ls = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((b.add(96 + j % 8) as *const i32).read_unaligned())));
+            _mm_mul_ps(_mm_mul_ps(_mm_set1_ps(dv), _mm_add_ps(_mm_set1_ps(0.5), ls)), _mm_set1_ps(0.25))
+        } else {
+            _mm_set1_ps(dv)
+        }
+    }
+}
+
+
+/// IQ2_XXS hybrid (see `repack::repack_hxxs_row`): per 256 values 32 B of grid indices (4 a sub-block), 32 B of resolved sign bits, 8 scale
+/// bytes (the 4-bit scale), the f32 d: 76 B. Magnitudes come from the 2 KiB grid table (4 plain loads), signs from the plane.
+pub struct RepH;
+impl RepH {
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq_at(b: *const u8, ib: usize) -> Dq {
+        let g = IQ2XXS_GRID.as_ptr();
+        let q = b.add(4 * ib);
+        let wa = _mm256_set_epi64x(*g.add(*q.add(3) as usize) as i64, *g.add(*q.add(2) as usize) as i64, *g.add(*q.add(1) as usize) as i64, *g.add(*q as usize) as i64);
+        let s32 = _mm256_set1_epi32((b.add(32 + 4 * ib) as *const i32).read_unaligned());
+        let rep = _mm256_shuffle_epi8(s32, _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
+        let bit = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
+        let sg = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(rep, bit), bit), _mm256_set1_epi8(1));
+        let sb = *b.add(64 + ib) as u32;
+        let dv = f32::from_bits(rd32(b.add(72)));
+        Dq { wa, sg, sc: sc1(), base: dv * (0.5 + sb as f32) * 0.25, isc: 1, m: 0.0 }
+    }
+}
+impl Cq for RepH {
+    const QK: usize = 256;
+    const OFFSET_OK: bool = true;
+    const BYTES: usize = 76;
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn dq(row: *const u8, j: usize) -> Dq {
+        Self::dq_at(row.add(76 * (j / 8)), j % 8)
+    }
+    #[inline(always)]
+    unsafe fn dq4(row: *const u8, j: usize) -> [Dq; 4] {
+        let b = row.add(76 * (j / 8));
+        let ib = j % 8;
+        [Self::dq_at(b, ib), Self::dq_at(b, ib + 1), Self::dq_at(b, ib + 2), Self::dq_at(b, ib + 3)]
+    }
+    #[inline(always)]
+    unsafe fn base4(row: *const u8, j: usize, _d: &[Dq; 4]) -> __m128 {
+        let b = row.add(76 * (j / 8));
+        let dv = f32::from_bits(rd32(b.add(72)));
+        let ls = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((b.add(64 + j % 8) as *const i32).read_unaligned())));
+        _mm_mul_ps(_mm_mul_ps(_mm_set1_ps(dv), _mm_add_ps(_mm_set1_ps(0.5), ls)), _mm_set1_ps(0.25))
+    }
+}
+
 /// q8 activation rows for the CPU kernels: int8 `q` [rows][k], f32 `d` [rows][k/32], `s` = f16-rounded float sum
 /// per block (see `refq::q8_block`).
 #[derive(Clone, Default)]
@@ -590,12 +993,40 @@ pub unsafe fn row_dot<C: Cq, const B: usize>(row: *const u8, nsb: usize, a: &Q8R
     out
 }
 
+
+/// Software prefetch (opt-in: FE_GGQ_CPU_PREFETCH=1, not yet measured on a quiet box) of the weight rows `PF_ROWS` ahead (all their cache lines): a row is only 0.5-1.4 KB, so the hardware stream
+/// prefetcher restarts at every row; cold expert weights (a few MB read once) otherwise stall each row's first lines.
+fn pf_rows() -> usize {
+    static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("FE_GGQ_CPU_PFR").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
+}
+#[inline(always)]
+unsafe fn prefetch_rows(w: *const u8, row_bytes: usize, r: usize, end: usize) {
+    if pf_on() {
+        let nr = r + pf_rows();
+        if nr < end {
+            let p = w.add(nr * row_bytes);
+            let mut o = 0;
+            while o < row_bytes {
+                _mm_prefetch(p.add(o) as *const i8, _MM_HINT_T0);
+                o += 64;
+            }
+        }
+    }
+}
+fn pf_on() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("FE_GGQ_CPU_PREFETCH").map_or(false, |v| v == "1"))
+}
+
 /// GEMV over a row range: y[b * ld + r] = W[r] . a[b] for r in rows.
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemv_rows<C: Cq, const B: usize>(w: *const u8, row_bytes: usize, rows: std::ops::Range<usize>,
     a: &Q8Rows, y: *mut f32, ld: usize) {
     let nsb = a.k / 32;
+    let end = rows.end;
     for r in rows {
+        prefetch_rows(w, row_bytes, r, end);
         let v = row_dot::<C, B>(w.add(r * row_bytes), nsb, a);
         for b in 0..B {
             *y.add(b * ld + r) = v[b];
@@ -809,83 +1240,85 @@ pub unsafe fn row_dot_gpu<C: Cq, const B: usize, const NL: usize>(row: *const u8
     let mut part = [[_mm_setzero_ps(); NL]; B];
     let k = a.k;
     let nb = k / 32;
-    let mut j = 0;
-    while j < nsb {
-        for li in 0..NL {
-            if j >= nsb {
-                break;
-            }
+    // lane li sums the groups li, li + NL, ... (the GPU's lane li): one pass per lane keeps its B accumulators in registers
+    let step = |acc: &mut [__m128; B], j: usize| {
             let [mut d0, mut d1, mut d2, mut d3] = C::dq4(row, j);
-            if C::GPU_ISC_IN_BASE {
-                for d in [&mut d0, &mut d1, &mut d2, &mut d3] {
-                    d.base = C::gpu_base(d.base, d.isc);
-                    d.sc = sc1();
-                }
+        if C::GPU_ISC_IN_BASE {
+            for d in [&mut d0, &mut d1, &mut d2, &mut d3] {
+                d.base = C::gpu_base(d.base, d.isc);
+                d.sc = sc1();
             }
-            let base = _mm_setr_ps(d0.base, d1.base, d2.base, d3.base);
-            let mv = if C::HAS_M { _mm_setr_ps(d0.m, d1.m, d2.m, d3.m) } else { _mm_setzero_ps() };
-            if C::OFFSET_OK && B >= OFFSET_MIN_B {
-                let off = _mm256_set1_epi8(-128i8);
-                let ws = [_mm256_sign_epi8(d0.wa, d0.sg), _mm256_sign_epi8(d1.wa, d1.sg), _mm256_sign_epi8(d2.wa, d2.sg),
-                    _mm256_sign_epi8(d3.wa, d3.sg)];
-                let sc = [d0.sc, d1.sc, d2.sc, d3.sc];
-                let cr = |i: usize| _mm256_madd_epi16(_mm256_maddubs_epi16(off, ws[i]), sc[i]);
-                let ch = red4(cr(0), cr(1), cr(2), cr(3));
-                let corr = _mm_add_epi32(_mm256_castsi256_si128(ch), _mm256_extracti128_si256(ch, 1));
-                for b in 0..B {
-                    let ap = a.qu.as_ptr().add(b * k + 32 * j);
-                    let pp = |i: usize| {
-                        let av = _mm256_loadu_si256(ap.add(32 * i) as *const __m256i);
-                        _mm256_madd_epi16(_mm256_maddubs_epi16(av, ws[i]), sc[i])
-                    };
-                    let h = red4(pp(0), pp(1), pp(2), pp(3));
-                    let x = _mm_sub_epi32(_mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1)), corr);
-                    let d8 = _mm_loadu_ps(a.d.as_ptr().add(b * nb + j));
-                    let mut v = _mm_mul_ps(_mm_mul_ps(d8, base), _mm_cvtepi32_ps(x));
-                    if C::HAS_M {
-                        v = _mm_sub_ps(v, _mm_mul_ps(mv, _mm_loadu_ps(a.s.as_ptr().add(b * nb + j))));
-                    }
-                    part[b][li] = _mm_add_ps(part[b][li], v);
+        }
+        let base = if C::GPU_ISC_IN_BASE { _mm_setr_ps(d0.base, d1.base, d2.base, d3.base) } else { C::base4(row, j, &[d0, d1, d2, d3]) };
+        let mv = if C::HAS_M { _mm_setr_ps(d0.m, d1.m, d2.m, d3.m) } else { _mm_setzero_ps() };
+        if C::OFFSET_OK && B >= OFFSET_MIN_B {
+            let off = _mm256_set1_epi8(-128i8);
+            let ws = [_mm256_sign_epi8(d0.wa, d0.sg), _mm256_sign_epi8(d1.wa, d1.sg), _mm256_sign_epi8(d2.wa, d2.sg),
+                _mm256_sign_epi8(d3.wa, d3.sg)];
+            let sc = [d0.sc, d1.sc, d2.sc, d3.sc];
+            let cr = |i: usize| _mm256_madd_epi16(_mm256_maddubs_epi16(off, ws[i]), sc[i]);
+            let ch = red4(cr(0), cr(1), cr(2), cr(3));
+            let corr = _mm_add_epi32(_mm256_castsi256_si128(ch), _mm256_extracti128_si256(ch, 1));
+            for b in 0..B {
+                let ap = a.qu.as_ptr().add(b * k + 32 * j);
+                let pp = |i: usize| {
+                    let av = _mm256_loadu_si256(ap.add(32 * i) as *const __m256i);
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(av, ws[i]), sc[i])
+                };
+                let h = red4(pp(0), pp(1), pp(2), pp(3));
+                let x = _mm_sub_epi32(_mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1)), corr);
+                let d8 = _mm_loadu_ps(a.d.as_ptr().add(b * nb + j));
+                let mut v = _mm_mul_ps(_mm_mul_ps(d8, base), _mm_cvtepi32_ps(x));
+                if C::HAS_M {
+                    v = _mm_sub_ps(v, _mm_mul_ps(mv, _mm_loadu_ps(a.s.as_ptr().add(b * nb + j))));
                 }
-            } else {
-                for b in 0..B {
-                    let ap = a.q.as_ptr().add(b * k + 32 * j);
-                    macro_rules! p {
-                        ($d:ident, $o:expr) => {{
-                            let av = _mm256_loadu_si256(ap.add($o) as *const __m256i);
-                            let av = if C::SIGNED { _mm256_sign_epi8(av, $d.sg) } else { av };
-                            _mm256_madd_epi16(_mm256_maddubs_epi16($d.wa, av), $d.sc)
-                        }};
-                    }
-                    let (p0, p1, p2, p3) = (p!(d0, 0), p!(d1, 32), p!(d2, 64), p!(d3, 96));
-                    let h = red4(p0, p1, p2, p3);
-                    let x = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
-                    let d8 = _mm_loadu_ps(a.d.as_ptr().add(b * nb + j));
-                    let mut v = _mm_mul_ps(_mm_mul_ps(d8, base), _mm_cvtepi32_ps(x));
-                    if C::HAS_M {
-                        v = _mm_sub_ps(v, _mm_mul_ps(mv, _mm_loadu_ps(a.s.as_ptr().add(b * nb + j))));
-                    }
-                    part[b][li] = _mm_add_ps(part[b][li], v);
-                }
+                acc[b] = _mm_add_ps(acc[b], v);
             }
-            j += 4;
+        } else {
+            for b in 0..B {
+                let ap = a.q.as_ptr().add(b * k + 32 * j);
+                macro_rules! p {
+                    ($d:ident, $o:expr) => {{
+                        let av = _mm256_loadu_si256(ap.add($o) as *const __m256i);
+                        let av = if C::SIGNED { _mm256_sign_epi8(av, $d.sg) } else { av };
+                        _mm256_madd_epi16(_mm256_maddubs_epi16($d.wa, av), $d.sc)
+                    }};
+                }
+                let (p0, p1, p2, p3) = (p!(d0, 0), p!(d1, 32), p!(d2, 64), p!(d3, 96));
+                let h = red4(p0, p1, p2, p3);
+                let x = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
+                let d8 = _mm_loadu_ps(a.d.as_ptr().add(b * nb + j));
+                let mut v = _mm_mul_ps(_mm_mul_ps(d8, base), _mm_cvtepi32_ps(x));
+                if C::HAS_M {
+                    v = _mm_sub_ps(v, _mm_mul_ps(mv, _mm_loadu_ps(a.s.as_ptr().add(b * nb + j))));
+                }
+                acc[b] = _mm_add_ps(acc[b], v);
+            }
+        }
+    };
+    for li in 0..NL {
+        let mut acc = [_mm_setzero_ps(); B];
+        let mut j = 4 * li;
+        while j < nsb {
+            step(&mut acc, j);
+            j += 4 * NL;
+        }
+        for b in 0..B {
+            part[b][li] = acc[b];
         }
     }
     let mut out = [0f32; B];
     for b in 0..B {
-        let mut l = [0f32; 32];
-        for i in 0..NL {
-            _mm_storeu_ps(l.as_mut_ptr().add(4 * i), part[b][i]);
-        }
-        let mut m = lpr / 2;
-        while m > 0 {
-            let w = l;
-            for i in 0..lpr {
-                l[i] = w[i] + w[i ^ m];
+        let mut v = part[b];
+        let mut step = NL / 2;
+        while step > 0 {
+            for li in 0..step {
+                v[li] = _mm_add_ps(v[li], v[li + step]);
             }
-            m /= 2;
+            step /= 2;
         }
-        out[b] = l[0];
+        let y = _mm_add_ps(v[0], _mm_movehl_ps(v[0], v[0]));
+        out[b] = _mm_cvtss_f32(_mm_add_ss(y, _mm_shuffle_ps(y, y, 1)));
     }
     out
 }
@@ -895,7 +1328,9 @@ pub unsafe fn row_dot_gpu<C: Cq, const B: usize, const NL: usize>(row: *const u8
 pub unsafe fn gemv_rows_gpu<C: Cq, const B: usize>(w: *const u8, row_bytes: usize, rows: std::ops::Range<usize>,
     a: &Q8Rows, y: *mut f32, ld: usize, lpr: usize) {
     let nsb = a.k / 32;
+    let end = rows.end;
     for r in rows {
+        prefetch_rows(w, row_bytes, r, end);
         let rp = w.add(r * row_bytes);
         let v = match lpr {
             4 => row_dot_gpu::<C, B, 1>(rp, nsb, a),
@@ -944,21 +1379,20 @@ pub unsafe fn row_dot_gpu_vnni<C: Cq, const B: usize, const NL: usize>(row: *con
             j += 4;
         }
     }
+    // the GPU's butterfly (l[i] = w[i] + w[i ^ m], m = lpr / 2 .. 1) for lane 0 only, as vector adds: the pairs
+    // (li, li ^ step) first (step = NL / 2 .. 1), then lanes (i, i ^ 2) and (i, i ^ 1). Same pairs, same bits.
     let mut out = [0f32; B];
     for b in 0..B {
-        let mut l = [0f32; 32];
-        for i in 0..NL {
-            _mm_storeu_ps(l.as_mut_ptr().add(4 * i), part[b][i]);
-        }
-        let mut m = lpr / 2;
-        while m > 0 {
-            let w = l;
-            for i in 0..lpr {
-                l[i] = w[i] + w[i ^ m];
+        let mut v = part[b];
+        let mut step = NL / 2;
+        while step > 0 {
+            for li in 0..step {
+                v[li] = _mm_add_ps(v[li], v[li + step]);
             }
-            m /= 2;
+            step /= 2;
         }
-        out[b] = l[0];
+        let y = _mm_add_ps(v[0], _mm_movehl_ps(v[0], v[0]));
+        out[b] = _mm_cvtss_f32(_mm_add_ss(y, _mm_shuffle_ps(y, y, 1)));
     }
     out
 }
@@ -968,7 +1402,9 @@ pub unsafe fn row_dot_gpu_vnni<C: Cq, const B: usize, const NL: usize>(row: *con
 pub unsafe fn gemv_rows_gpu_vnni<C: Cq, const B: usize>(w: *const u8, row_bytes: usize, rows: std::ops::Range<usize>,
     a: &Q8Rows, y: *mut f32, ld: usize, lpr: usize) {
     let nsb = a.k / 32;
+    let end = rows.end;
     for r in rows {
+        prefetch_rows(w, row_bytes, r, end);
         let rp = w.add(r * row_bytes);
         let v = match lpr {
             4 => row_dot_gpu_vnni::<C, B, 1>(rp, nsb, a),

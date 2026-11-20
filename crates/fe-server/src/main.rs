@@ -16,7 +16,7 @@ use fe_server::tokenizer::Tok;
 /// `fe-server --version`: the release and the engines this binary was built with
 static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let mut e = vec!["mock"];
-    for (on, name) in [(cfg!(feature = "ferrite"), "ferrite"), (cfg!(feature = "fnext"), "fnext"), (cfg!(feature = "xe"), "xe")] {
+    for (on, name) in [(cfg!(feature = "ferrite"), "ferrite"), (cfg!(feature = "fnext"), "fnext"), (cfg!(feature = "dsc"), "dsc"), (cfg!(feature = "xe"), "xe")] {
         if on {
             e.push(name);
         }
@@ -133,7 +133,7 @@ async fn serve(args: Args) -> Result<()> {
             },
         ))
     } else {
-        if args.engine == "fake" { fake_engine(&args, &tok)? } else if args.engine == "fnext" { fnext_engine(&args)? } else if args.engine == "xe" || args.engine == "xe-batch" { xe_engine(&args)? } else { real_engine(&args)? }
+        if args.engine == "fake" { fake_engine(&args, &tok)? } else if args.engine == "fnext" { fnext_engine(&args)? } else if args.engine == "dsc" { dsc_engine(&args)? } else if args.engine == "xe" || args.engine == "xe-batch" { xe_engine(&args)? } else { real_engine(&args)? }
     };
     let info = engine.info();
     let cfg = ServerConfig {
@@ -263,6 +263,17 @@ fn xe_engine(args: &Args) -> Result<Arc<dyn Engine>> {
 #[cfg(not(feature = "xe"))]
 fn xe_engine(_: &Args) -> Result<Arc<dyn Engine>> {
     bail!("this fe-server was built without the B70 engine: build with --features xe")
+}
+
+/// `--engine dsc`: DeepSeek-V4.1-Flash Coder from GGUF on three cards (DSC_* environment, see fe_server::dsc).
+#[cfg(feature = "dsc")]
+fn dsc_engine(args: &Args) -> Result<Arc<dyn Engine>> {
+    Ok(Arc::new(fe_server::dsc::DscEngine::start(args.max_model_len)?))
+}
+
+#[cfg(not(feature = "dsc"))]
+fn dsc_engine(_: &Args) -> Result<Arc<dyn Engine>> {
+    bail!("this fe-server was built without the DeepSeek engine: build with --features dsc")
 }
 
 /// `--engine fnext`: Qwen3.8-Flash-Next from GGUF (FNEXT_MODEL, FNEXT_COUNTS, FNEXT_THREADS, FNEXT_MTP ...).

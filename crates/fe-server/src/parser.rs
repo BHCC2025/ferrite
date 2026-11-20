@@ -51,6 +51,18 @@ impl ForcedCall {
             ForcedCall::Named(n) => format!("{TOOL_START}\n{FUNC_START}{n}>\n"),
         }
     }
+
+    /// The opener in the template's tool-call format: DSML writes the calls block the way the template renders one after the
+    /// reasoning block's end (`\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="`, then `NAME">\n` when the function is named).
+    pub fn opener_for(&self, dsml: bool) -> String {
+        if !dsml {
+            return self.opener();
+        }
+        match self {
+            ForcedCall::Any => format!("\n\n{DS_CALLS}\n{DS_INVOKE}"),
+            ForcedCall::Named(n) => format!("\n\n{DS_CALLS}\n{DS_INVOKE}{n}\">\n"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -239,7 +251,10 @@ impl OutputParser {
         let mut inv = Inv::default();
         let mut pending = Vec::new();
         let mut calls = 0;
+        // DSML: the parser reads the opener itself (below), so it starts in content mode
+        let dsml_opener = if cfg.dsml { cfg.forced.as_ref().map(|f| f.opener_for(true)) } else { None };
         let mode = match &cfg.forced {
+            Some(_) if cfg.dsml => Mode::Content,
             Some(ForcedCall::Any) => Mode::Name,
             Some(ForcedCall::Named(n)) => {
                 calls = 1;
@@ -250,8 +265,8 @@ impl OutputParser {
             None if cfg.thinking => Mode::Reasoning,
             None => Mode::Content,
         };
-        Self {
-            reopen: cfg.forced == Some(ForcedCall::Any),
+        let mut this = Self {
+            reopen: !cfg.dsml && cfg.forced == Some(ForcedCall::Any),
             inv,
             pending,
             malformed: false,
@@ -267,7 +282,12 @@ impl OutputParser {
             content_started: false,
             raw_tool: String::new(),
             dsml: cfg.dsml,
+        };
+        if let Some(op) = dsml_opener {
+            // the prompt ended with this text: what the model writes continues it
+            this.pending = this.feed(op.trim_start());
         }
+        this
     }
 
     /// True when DSML closing tags came with no call (the model wrote its answer as text and then only the end of a call block): the reply is passed
@@ -1539,6 +1559,19 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&args).unwrap();
         assert_eq!(v["query"], content);
         assert_eq!(v["limit"], 5);
+    }
+
+    /// DSML, tool_choice required / named: the prompt ended with the calls block opened, the output continues it.
+    #[test]
+    fn forced_call_openers_dsml() {
+        let base = || ParserConfig { thinking: false, tools: Some(tools()), max_tool_calls: None, dsml: true, forced: None };
+        assert_eq!(ForcedCall::Any.opener_for(true), "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"");
+        assert_eq!(ForcedCall::Named("get_weather".into()).opener_for(true), "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n");
+        let p = parse(ParserConfig { forced: Some(ForcedCall::Any), ..base() }, "get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>");
+        assert_eq!(p.content, "");
+        assert_eq!(p.tool_calls, vec![call("get_weather", json!({"location": "Paris"}))]);
+        let p = parse(ParserConfig { forced: Some(ForcedCall::Named("get_weather".into())), ..base() }, "<｜DSML｜ parameter name=\"location\" string=\"true\">Rome</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>");
+        assert_eq!(p.tool_calls, vec![call("get_weather", json!({"location": "Rome"}))]);
     }
 
     /// tool_choice required / named: the prompt ended with the call opener, the output starts inside the call.

@@ -26,6 +26,10 @@ pub fn stem(ty: GgmlType) -> Option<&'static str> {
         IQ2S => "iq2_s",
         IQ3XXS => "iq3_xxs",
         IQ3S => "iq3_s",
+        IQ2XXS => "iq2_xxs",
+        IQ1M => "iq1_m",
+        IQ2XS => "iq2_xs",
+        RepMxfp4 => "mxfp4r",
         F32 => "f32",
         F16 => "f16",
         BF16 => "bf16",
@@ -34,8 +38,10 @@ pub fn stem(ty: GgmlType) -> Option<&'static str> {
 }
 
 /// Types with a dp4a GEMV (`ggq_gemv_<stem>_b<B>`).
-pub const GEMV_TYPES: [GgmlType; 10] = [GgmlType::Q8_0, GgmlType::Q2_0, GgmlType::IQ4NL, GgmlType::IQ4XS, GgmlType::Q4K,
-    GgmlType::Q5K, GgmlType::Q6K, GgmlType::IQ2S, GgmlType::IQ3XXS, GgmlType::IQ3S];
+pub const GEMV_TYPES: [GgmlType; 14] = [GgmlType::Q8_0, GgmlType::Q2_0, GgmlType::IQ4NL, GgmlType::IQ4XS, GgmlType::Q4K,
+    GgmlType::Q5K, GgmlType::Q6K, GgmlType::IQ2S, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ2XXS,
+    GgmlType::IQ1M, GgmlType::IQ2XS,
+    GgmlType::RepMxfp4];
 
 /// q8_1-quantized activation rows on the device: int8 `q` [rows][k], f32 scale `d` [rows][k/32], f32 `s` [rows][k/32]
 /// (= the f16-rounded sum of the block's float inputs, ggml's ds.y, for the Q4_K/Q5_K min terms). Allocate once for
@@ -98,16 +104,29 @@ pub fn default_cfg(ty: GgmlType, k: usize, rows: usize) -> (u32, u32) {
     // group; the 2/3-bit IQ types and Q2_0 need the activation loads shared by 2 rows from B3 on, and 4 at B >= 6
     let rpl = match ty {
         Q8_0 => 1,
-        Q4K | Q5K | Q6K | IQ4NL | IQ4XS => {
+        Q4K | Q5K | Q6K | IQ4NL | IQ4XS | RepMxfp4 => {
             if rows >= 6 { 4 } else if rows >= 3 { 2 } else { 1 }
         }
         IQ2S => {
             if rows >= 2 { 2 } else { 1 }
         }
+        // IQ2_XXS: memory-bound at B1-2; IQ1_M (costlier decode) gains 11% at B1 from 4 rows per lane group
+        IQ2XS => {
+            if rows >= 2 { 2 } else { 1 }
+        }
+        IQ2XXS => {
+            if rows >= 2 { 2 } else { 1 }
+        }
+        IQ1M => {
+            if rows == 1 || rows >= 6 { 4 } else { 2 }
+        }
         _ => {
             if rows >= 6 { 4 } else if rows >= 2 { 2 } else { 1 }
         }
     };
+    // env override for tuning on other cards (the bits do not depend on the rows per lane group)
+    static O: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let rpl = O.get_or_init(|| std::env::var("FE_GGQ_RPL").ok().and_then(|v| v.parse().ok())).filter(|_| matches!(ty, Q4K | Q5K | Q6K | Q8_0)).map_or(rpl, |v| v.min(rows as u32).max(1).next_power_of_two().min(4));
     (lpr, rpl)
 }
 /// Split-K path for long rows with few outputs (env FE_GGQ_BF16_SPLITK=1; off by default: slower than the
@@ -159,9 +178,13 @@ pub const GEMV_WARPS: u32 = 4;
 /// All k-gguf kernels, looked up once. Cheap to share (`&Ggq`) across threads/streams.
 pub struct Ggq {
     pub module: Module,
+    /// DeepSeek's SwiGLU clamp L (bits of an f32): h = silu(min(g, L)) * clamp(u, -L, L) in moe_gu and the fused mmq gate/up; +inf = off.
+    swiglu_lim: std::sync::atomic::AtomicU32,
     deq: Vec<(GgmlType, Function, Function)>,
     /// (type, kernels for B = 1..=8, rows per lane group 1 / 2 / 4)
     gemv: Vec<(GgmlType, Vec<[Function; 3]>)>,
+    /// Grouped Q5_K GEMV kernels [B-1][rpl index].
+    gemvg: Vec<[Function; 3]>,
     /// (type, wide one-pass kernels for B = 12, 16, 20, 24)
     gemvw: Vec<(GgmlType, [Function; 4], [Function; 4])>,
     q8: Function,
@@ -169,10 +192,15 @@ pub struct Ggq {
     moe: Vec<(GgmlType, Function, Function)>,
     combine: Function,
     misses: Function,
+    slotk: Function,
+    cold: [Function; 3],
     gemm: Vec<(GgmlType, Function)>,
     f2bf: Function,
     mmq: Vec<(GgmlType, Function)>,
     sort: [Function; 3],
+    sort_small: Function,
+    /// (type, [64-row, 32-row tile kernels]) of the grouped prompt GEMM
+    mmq_s: Vec<(GgmlType, [Function; 2])>,
     /// BF16 GEMV: (wide, narrow, split-K) for B = 1..=8
     bf16: Vec<(Function, Function, Function, Function)>,
     /// split-K scratch: partial sums + per-row-group counters (zeroed once; kernels reset them)
@@ -184,6 +212,7 @@ pub struct Ggq {
     hcdw: Vec<Function>,
     hc_ws: (DeviceBuffer<f32>, DeviceBuffer<u32>),
     fx_finish: Function,
+    fx_add: Function,
     /// prompt attention: (bits, union, tensor-core, SIMT reference)
     fa: [Function; 7],
     /// dense BF16-weight GEMM (cp.async, 4 stages): BN 128, BN 64
@@ -238,7 +267,12 @@ pub struct SortWs {
     pub seg_off: DeviceBuffer<u32>,
     /// u32 [2 * max_tiles]: (expert, first sorted row) of each MMQ_BM-row tile; `ntiles[0]` valid
     pub tiles: DeviceBuffer<u32>,
+    /// u32 [3]: the 128-row tile count, and (after [`Ggq::moe_sort_small`]) the 64- and 32-row tile counts
     pub ntiles: DeviceBuffer<u32>,
+    /// u32 [4 * nexp]: after `moe_sort_small` the (expert, first row) lists of the 64-row tiles then the 32-row tiles
+    pub tiles_s: DeviceBuffer<u32>,
+    /// set by `moe_sort_small`, cleared by `moe_sort`: the grouped GEMMs then also launch the small-tile kernels
+    pub small: std::sync::atomic::AtomicBool,
     /// u32 [max_pairs]: token (activation row) and pair (output row) of each sorted row
     pub xidx: DeviceBuffer<u32>,
     pub yidx: DeviceBuffer<u32>,
@@ -253,7 +287,9 @@ impl SortWs {
             chunk_off: DeviceBuffer::alloc(nchunk * nexp)?,
             seg_off: DeviceBuffer::alloc(nexp + 1)?,
             tiles: DeviceBuffer::alloc(2 * Self::max_tiles(max_pairs, nexp))?,
-            ntiles: DeviceBuffer::alloc(1)?,
+            ntiles: DeviceBuffer::alloc(3)?,
+            tiles_s: DeviceBuffer::alloc(4 * nexp)?,
+            small: std::sync::atomic::AtomicBool::new(false),
             xidx: DeviceBuffer::alloc(max_pairs)?,
             yidx: DeviceBuffer::alloc(max_pairs)?,
         })
@@ -276,21 +312,33 @@ pub const MMQ_THREADS: u32 = 2 * MMQ_BM as u32 + 128;
 /// Weight rows per int8-GEMM tile (kernel BN): n % MMQ_BN == 0.
 pub const MMQ_BN: usize = 64;
 pub const MMQ_NSTAGE: u32 = 2;
+/// Dynamic shared memory of the BM-row tile kernels (BM = 128, 64, 32).
+pub const fn mmq_smem_bm(bm: u32) -> u32 {
+    MMQ_NSTAGE * ((bm + MMQ_BN as u32) * 144 + 2 * bm * 16 + 4 * MMQ_BN as u32 * 16)
+}
 pub const MMQ_SMEM: u32 = MMQ_NSTAGE * ((MMQ_BM + MMQ_BN) as u32 * 144 + 2 * MMQ_BM as u32 * 16 + 4 * MMQ_BN as u32 * 16);
 
 /// Types with a prompt GEMM (`ggq_gemm_<stem>`): the GEMV types plus BF16, F16, F32 weights.
-pub const GEMM_TYPES: [GgmlType; 13] = [GgmlType::Q8_0, GgmlType::Q2_0, GgmlType::IQ4NL, GgmlType::IQ4XS, GgmlType::Q4K,
-    GgmlType::Q5K, GgmlType::Q6K, GgmlType::IQ2S, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::BF16, GgmlType::F16,
-    GgmlType::F32];
+pub const GEMM_TYPES: [GgmlType; 17] = [GgmlType::Q8_0, GgmlType::Q2_0, GgmlType::IQ4NL, GgmlType::IQ4XS, GgmlType::Q4K,
+    GgmlType::Q5K, GgmlType::Q6K, GgmlType::IQ2S, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ2XXS, GgmlType::IQ1M,
+    GgmlType::IQ2XS, GgmlType::RepMxfp4, GgmlType::BF16, GgmlType::F16, GgmlType::F32];
 const GEMM_SMEM: u32 = 4 * 64 * 40 * 2;
 
 impl Ggq {
+    /// Set the SwiGLU clamp used by [`Ggq::moe_gu_q8`] / [`Ggq::moe_gu`] / [`Ggq::mmq_moe_gu`] (default +inf = no clamp, the old bits).
+    /// `CpuMoe::swiglu_limit` must be set to the same value for CPU == GPU bits.
+    pub fn set_swiglu_limit(&self, limit: f32) {
+        self.swiglu_lim.store(limit.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn swiglu_limit(&self) -> f32 {
+        f32::from_bits(self.swiglu_lim.load(std::sync::atomic::Ordering::Relaxed))
+    }
     /// Load the module into the current context.
     pub fn load() -> Result<Ggq> {
         let module = Module::load(K_GGUF_CUBIN)?;
         let mut deq = vec![];
         use GgmlType::*;
-        for ty in [Q8_0, Q2_0, IQ4NL, IQ4XS, Q4K, Q5K, Q6K, IQ2S, IQ3XXS, IQ3S, F32, F16, BF16] {
+        for ty in [Q8_0, Q2_0, IQ4NL, IQ4XS, Q4K, Q5K, Q6K, IQ2S, IQ3XXS, IQ3S, IQ2XXS, IQ1M, IQ2XS, RepMxfp4, F32, F16, BF16] {
             let s = stem(ty).unwrap();
             deq.push((ty, module.function(&format!("ggq_deq_{s}_f32"))?, module.function(&format!("ggq_deq_{s}_bf16"))?));
         }
@@ -303,6 +351,11 @@ impl Ggq {
                     module.function(&format!("ggq_gemv_{s}_b{b}_r4"))?]);
             }
             gemv.push((ty, fs));
+        }
+        let mut gemvg = vec![];
+        for b in 1..=8 {
+            gemvg.push([module.function(&format!("ggq_gemv_q5_k_g_b{b}_r1"))?, module.function(&format!("ggq_gemv_q5_k_g_b{b}_r2"))?,
+                module.function(&format!("ggq_gemv_q5_k_g_b{b}_r4"))?]);
         }
         let mut gemvw = vec![];
         for ty in GEMV_TYPES {
@@ -319,6 +372,8 @@ impl Ggq {
         }
         let combine = module.function("ggq_moe_combine")?;
         let misses = module.function("ggq_moe_misses")?;
+        let slotk = module.function("ggq_slot_owner")?;
+        let cold = [module.function("ggq_cold_claim")?, module.function("ggq_cold_copy")?, module.function("ggq_cold_restore")?];
         let mut gemm = vec![];
         for ty in GEMM_TYPES {
             gemm.push((ty, module.function(&format!("ggq_gemm_{}", stem(ty).unwrap()))?));
@@ -330,6 +385,18 @@ impl Ggq {
             f.set_max_dynamic_smem(MMQ_SMEM)?;
             mmq.push((ty, f));
         }
+        let mut mmq_s = vec![];
+        for ty in GEMV_TYPES {
+            let st = stem(ty).unwrap();
+            let (f64_, f32_) = (module.function(&format!("ggq_mmq_{st}_bm64"))?, module.function(&format!("ggq_mmq_{st}_bm32"))?);
+            f64_.set_max_dynamic_smem(mmq_smem_bm(64))?;
+            f32_.set_max_dynamic_smem(mmq_smem_bm(32))?;
+            // more than one small-tile CTA per SM needs the shared array carved out of L1
+            f64_.set_smem_carveout(100)?;
+            f32_.set_smem_carveout(100)?;
+            mmq_s.push((ty, [f64_, f32_]));
+        }
+        let sort_small = module.function("ggq_moe_sort_scan_small")?;
         let sort = [module.function("ggq_moe_sort_count")?, module.function("ggq_moe_sort_scan")?,
             module.function("ggq_moe_sort_scatter")?];
         let mut bf16 = vec![];
@@ -342,6 +409,7 @@ impl Ggq {
             hc.push((module.function(&format!("ggq_hc_down_b{b}"))?, module.function(&format!("ggq_hc_up_b{b}"))?));
         }
         let fx_finish = module.function("ggq_fx_finish")?;
+        let fx_add = module.function("ggq_fx_add")?;
         let hcn = module.function("ggq_hc_norm")?;
         let mut hcdw = vec![];
         for b in 1..=8 {
@@ -357,8 +425,8 @@ impl Ggq {
             module.function("ggq_fa_ref_simt")?, module.function("ggq_fa_ref_pattn")?,
             module.function("ggq_fa_mmaprobe")?, module.function("ggq_fa_tc2")?];
         fa[4].set_max_dynamic_smem(512 * 16 + 4 * 2 * 512 * 16 + 2 * 4 * 16 * 4)?;
-        Ok(Ggq { module, deq, gemv, q8, moe, combine, misses, gemm, f2bf, mmq, sort, bf16, bf16_ws: std::sync::Mutex::new(None), hc,
-            hcn, hcdw, hc_ws, fx_finish, fa, gemm16, ord, gemvw })
+        Ok(Ggq { swiglu_lim: std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()), module, deq, gemv, q8, moe, combine, misses, slotk, cold, gemm, f2bf, mmq, sort, sort_small, mmq_s, bf16, bf16_ws: std::sync::Mutex::new(None), hc,
+            hcn, hcdw, hc_ws, fx_finish, fx_add, fa, gemm16, ord, gemvw, gemvg })
     }
 
     /// Dequantize `n_values` values (a whole number of blocks; for F32/F16/BF16 a multiple of 8) of type `ty` at
@@ -426,6 +494,45 @@ impl Ggq {
         }
         let (_, dr) = default_cfg(ty, a.k, a.rows);
         self.gemv_cfg(s, ty, w, row_bytes, n, a, y, add, lpr, dr)
+    }
+
+    /// Q5_K GEMV over `groups` independent matrices in one launch: group g multiplies the weights at `w + g * wg` (n rows each) by the activation
+    /// rows `g * rows_per_group ..` of `a` and writes f32 `y + g * n + b * yld` (rows b < rows_per_group). `a` holds groups * rows_per_group rows
+    /// of K. Same per-element float order as `gemv` on each group (rows <= 8 per group).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_groups_q5k(&self, s: &Stream, w: DevPtr, row_bytes: usize, wg: usize, n: usize, groups: usize, a: &Q8Act, rows_per_group: usize,
+        y: DevPtr, yld: usize) -> Result<()> {
+        if rows_per_group == 0 || rows_per_group > 8 || a.rows != groups * rows_per_group {
+            bail!("gemv_groups_q5k: {} act rows for {groups} groups x {rows_per_group}", a.rows);
+        }
+        let (lpr, rpl) = default_cfg(GgmlType::Q5K, a.k, rows_per_group);
+        let ri = match rpl { 1 => 0, 2 => 1, _ => 2 };
+        let warps = gemv_warps();
+        let gx = (n as u32).div_ceil(warps * (32 / lpr) * rpl);
+        unsafe {
+            s.launch(&self.gemvg[rows_per_group - 1][ri], (gx, groups as u32), 32 * warps, 0, (y, w, row_bytes as u64, a.q.ptr(), a.d.ptr(), a.s.ptr(),
+                a.k as u32, n as u32, lpr, 0u32, wg as u64, rows_per_group as u32, n as u32, yld as u32))?
+        };
+        Ok(())
+    }
+
+    /// Cold-expert staging around one layer's MoE kernels (see `ggq_cold_claim`): `stage_begin` claims and copies, `stage_end` restores the tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cold_begin(&self, s: &Stream, ids: DevPtr, np: usize, tabs: [DevPtr; 3], lo: u64, hi: u64, counter: DevPtr, slot_e: DevPtr, slot_orig: DevPtr,
+        stage: DevPtr, slot_bytes: usize, nslots: usize, sz: [usize; 3]) -> Result<()> {
+        s.memset_d8(counter, 0, 4)?;
+        unsafe {
+            s.launch(&self.cold[0], np as u32, 32, 0, (ids, np as u32, tabs[0], tabs[1], tabs[2], lo, hi, counter, slot_e, slot_orig, stage, slot_bytes as u64,
+                nslots as u32, sz[0] as u64, sz[1] as u64))?;
+            s.launch(&self.cold[1], (nslots as u32, 16u32), 256, 0, (counter, slot_orig, stage, slot_bytes as u64, nslots as u32, sz[0] as u64, sz[1] as u64,
+                sz[2] as u64, 16u32))?;
+        }
+        Ok(())
+    }
+
+    pub fn cold_end(&self, s: &Stream, tabs: [DevPtr; 3], counter: DevPtr, slot_e: DevPtr, slot_orig: DevPtr, nslots: usize) -> Result<()> {
+        unsafe { s.launch(&self.cold[2], nslots as u32, 32, 0, (counter, slot_e, slot_orig, tabs[0], tabs[1], tabs[2], nslots as u32))? };
+        Ok(())
     }
 
     /// A wide one-pass GEMV (rows = 12, 16, 20 or 24) on activation rows r0 .. r0 + rows of `a`.
@@ -564,7 +671,7 @@ impl Ggq {
                 s.launch(f, ((n_ff / 32) as u32, np), 32 * lpr, 0, (hq.0.add::<i8>(p0 * n_ff), hq.1.add::<f32>(p0 * hb),
                     hq.2.add::<f32>(p0 * hb), hfp, gtab, utab, row_bytes as u64, ids.add::<i32>(p0), np, topk as u32,
                     x.q.ptr().add::<i8>(t0 * k), x.d.ptr().add::<f32>(t0 * nb), x.s.ptr().add::<f32>(t0 * nb), k as u32,
-                    n_ff as u32, lpr, mode as u32))?
+                    n_ff as u32, lpr, mode as u32, self.swiglu_limit()))?
             };
             t0 += nt;
         }
@@ -592,7 +699,7 @@ impl Ggq {
         let Some((_, _, f)) = self.moe.iter().find(|(t, _, _)| *t == ty) else {
             bail!("moe_down: type {} not supported", ty.name());
         };
-        let lpr = lpr.unwrap_or_else(|| default_lpr(h.k));
+        let lpr = lpr.unwrap_or_else(|| std::env::var("FE_GGQ_DOWN_LPR").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| default_lpr(h.k)));
         let rpl = moe_down_rpl();
         let rpb = GEMV_WARPS * (32 / lpr) * rpl;
         let (k, nb) = (h.k, h.k / 32);
@@ -619,6 +726,12 @@ impl Ggq {
 
     /// [`Ggq::moe_combine`] where pair p with `slot[p] >= 0` takes its row from `ycpu[slot[p]]` (f32 [count][n]).
     #[allow(clippy::too_many_arguments)]
+    /// Pair routing on the card: slot[q] = -1 (this card's expert) or the row of the expert card `owner[ids[q]]` in the results buffer.
+    pub fn slot_owner(&self, s: &Stream, slot: DevPtr, owner: DevPtr, ids: DevPtr, np: usize, stride: usize) -> Result<()> {
+        unsafe { s.launch(&self.slotk, 1, 32, 0, (slot, owner, ids, np as u32, stride as u32))? };
+        Ok(())
+    }
+
     pub fn moe_combine_cpu(&self, s: &Stream, out: DevPtr, y: DevPtr, w: DevPtr, n_tok: usize, topk: usize, n: usize,
         add: bool, ycpu: DevPtr, slot: DevPtr) -> Result<()> {
         unsafe {
@@ -689,12 +802,56 @@ impl Ggq {
         }
         let nchunk = np.div_ceil(4096) as u32;
         let (np32, ne) = (np as u32, ws.nexp as u32);
+        ws.small.store(false, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             s.launch(&self.sort[0], nchunk, 256, 0, (ws.counts.ptr(), ids, np32, ne))?;
             s.launch(&self.sort[1], 1, 512, 0, (ws.counts.ptr(), nchunk, ne, ws.chunk_off.ptr(), ws.seg_off.ptr(),
                 ws.tiles.ptr(), ws.ntiles.ptr()))?;
             s.launch(&self.sort[2], nchunk, 32, 0, (ids, np32, ne, topk as u32, ws.chunk_off.ptr(), ws.xidx.ptr(),
                 ws.yidx.ptr()))?;
+        }
+        Ok(())
+    }
+
+    /// [`Ggq::moe_sort`] with small tiles for the tail of every expert: the grouped GEMMs after it (`mmq_moe`, `mmq_moe_gu`,
+    /// `mmq_moe_down_acc`, `moe_down_ordered`) run an expert's full 128-row tiles as before and its remaining rows (1..127)
+    /// in one 32-, 64- or 128-row tile, up to 3 launches (empty experts get no tile). The bits do not depend on the tile
+    /// rows. `moe_sort` switches back to the plain tiles.
+    pub fn moe_sort_small(&self, s: &Stream, ids: DevPtr, n_tok: usize, topk: usize, ws: &SortWs) -> Result<()> {
+        let np = n_tok * topk;
+        if np > ws.max_pairs || ws.nexp > 512 || np == 0 {
+            bail!("moe_sort_small: {np} pairs (max {}), {} experts (max 512)", ws.max_pairs, ws.nexp);
+        }
+        let nchunk = np.div_ceil(4096) as u32;
+        let (np32, ne) = (np as u32, ws.nexp as u32);
+        unsafe {
+            s.launch(&self.sort[0], nchunk, 256, 0, (ws.counts.ptr(), ids, np32, ne))?;
+            s.launch(&self.sort_small, 1, 512, 0, (ws.counts.ptr(), nchunk, ne, ws.chunk_off.ptr(), ws.seg_off.ptr(),
+                ws.tiles.ptr(), ws.ntiles.ptr(), ws.tiles_s.ptr()))?;
+            s.launch(&self.sort[2], nchunk, 32, 0, (ids, np32, ne, topk as u32, ws.chunk_off.ptr(), ws.xidx.ptr(),
+                ws.yidx.ptr()))?;
+        }
+        ws.small.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The grouped GEMM launches for the tile lists of `ws`: the 128-row kernel `f128` over `ws.tiles`, plus (after
+    /// `moe_sort_small`) the 64- and 32-row kernels over their lists. `mk(tiles, ntiles)` builds the kernel arguments.
+    #[allow(clippy::too_many_arguments)]
+    fn mmq_grouped<A: fe_cuda::KernelArgs>(&self, s: &Stream, ty: GgmlType, f128: &Function, grid_x: u32, ws: &SortWs,
+        n_pairs: usize, mk: impl Fn(DevPtr, DevPtr) -> A) -> Result<()> {
+        let grid_y = SortWs::max_tiles(n_pairs, ws.nexp) as u32;
+        unsafe { s.launch(f128, (grid_x, grid_y), MMQ_THREADS, MMQ_SMEM, mk(ws.tiles.ptr(), ws.ntiles.ptr()))? };
+        if ws.small.load(std::sync::atomic::Ordering::Relaxed) {
+            let Some((_, fs)) = self.mmq_s.iter().find(|(t, _)| *t == ty) else {
+                bail!("mmq: small tiles for {} not supported", ty.name());
+            };
+            for (i, bm) in [64u32, 32].into_iter().enumerate() {
+                unsafe {
+                    s.launch(&fs[i], (grid_x, ws.nexp as u32), 2 * bm + 128, mmq_smem_bm(bm),
+                        mk(ws.tiles_s.ptr().add::<u32>(i * 2 * ws.nexp), ws.ntiles.ptr().add::<u32>(i + 1)))?
+                };
+            }
         }
         Ok(())
     }
@@ -711,7 +868,7 @@ impl Ggq {
         let z = DevPtr(0);
         unsafe {
             s.launch(f, ((n / MMQ_BN) as u32, x.rows.div_ceil(MMQ_BM) as u32), MMQ_THREADS, MMQ_SMEM, (y, ldy as u32, x.q.ptr(), x.d.ptr(),
-                x.s.ptr(), w, row_bytes as u64, x.rows as u32, x.k as u32, z, z, z, z, z, z, add as u32 | mmq_dbg(), z, z, z))?
+                x.s.ptr(), w, row_bytes as u64, x.rows as u32, x.k as u32, z, z, z, z, z, z, add as u32 | mmq_dbg(), z, z, z, self.swiglu_limit()))?
         };
         Ok(())
     }
@@ -731,14 +888,15 @@ impl Ggq {
             bail!("moe_down_ordered: n_out {n_out} % ncol {ncol}");
         }
         let np = n_tok * topk;
-        let grid_y = SortWs::max_tiles(np, ws.nexp) as u32;
         for c0 in (0..n_out).step_by(ncol) {
             unsafe {
                 s.launch(&self.ord[0], (ws.nexp as u32).div_ceil(256), 256, 0, (tabw, dtab, ws.nexp as u32,
                     (c0 * row_bytes) as u64))?;
-                s.launch(f, ((ncol / MMQ_BN) as u32, grid_y), MMQ_THREADS, MMQ_SMEM, (ybuf, ncol as u32, hq.q.ptr(), hq.d.ptr(),
-                    hq.s.ptr(), DevPtr(0), row_bytes as u64, 0u32, hq.k as u32, ws.yidx.ptr(), ws.yidx.ptr(), tabw,
-                    ws.seg_off.ptr(), ws.tiles.ptr(), ws.ntiles.ptr(), mmq_dbg(), DevPtr(0), DevPtr(0), DevPtr(0)))?;
+            }
+            self.mmq_grouped(s, ty, f, (ncol / MMQ_BN) as u32, ws, np, |tl, nt| (ybuf, ncol as u32, hq.q.ptr(), hq.d.ptr(),
+                hq.s.ptr(), DevPtr(0), row_bytes as u64, 0u32, hq.k as u32, ws.yidx.ptr(), ws.yidx.ptr(), tabw,
+                ws.seg_off.ptr(), tl, nt, mmq_dbg(), DevPtr(0), DevPtr(0), DevPtr(0), self.swiglu_limit()))?;
+            unsafe {
                 s.launch(&self.ord[1], ((ncol as u32).div_ceil(256), n_tok as u32), 256, 0, (out.add::<f32>(c0), n_out as u32,
                     ybuf, ncol as u32, wts, topk as u32, ncol as u32, add as u32))?;
             }
@@ -754,15 +912,10 @@ impl Ggq {
     pub fn mmq_moe(&self, s: &Stream, ty: GgmlType, y: DevPtr, ldy: usize, x: &Q8Act, tab: DevPtr, row_bytes: usize,
         n: usize, ws: &SortWs, n_pairs: usize, by_pair: bool, add: bool) -> Result<()> {
         let f = self.mmq_fn(ty, n, x.k)?;
-        let grid_y = SortWs::max_tiles(n_pairs, ws.nexp) as u32;
-        let nt = MMQ_THREADS;
         let xi = if by_pair { ws.yidx.ptr() } else { ws.xidx.ptr() };
-        unsafe {
-            s.launch(f, ((n / MMQ_BN) as u32, grid_y), nt, MMQ_SMEM, (y, ldy as u32, x.q.ptr(), x.d.ptr(), x.s.ptr(),
-                DevPtr(0), row_bytes as u64, 0u32, x.k as u32, xi, ws.yidx.ptr(), tab, ws.seg_off.ptr(), ws.tiles.ptr(),
-                ws.ntiles.ptr(), add as u32 | mmq_dbg(), DevPtr(0), DevPtr(0), DevPtr(0)))?
-        };
-        Ok(())
+        self.mmq_grouped(s, ty, f, (n / MMQ_BN) as u32, ws, n_pairs, |tl, nt| (y, ldy as u32, x.q.ptr(), x.d.ptr(), x.s.ptr(),
+            DevPtr(0), row_bytes as u64, 0u32, x.k as u32, xi, ws.yidx.ptr(), tab, ws.seg_off.ptr(), tl,
+            nt, add as u32 | mmq_dbg(), DevPtr(0), DevPtr(0), DevPtr(0), self.swiglu_limit()))
     }
 
     /// Prompt MoE down fused with the weighted combine, deterministic: for sorted row r (pair p = yidx[r], token
@@ -775,13 +928,9 @@ impl Ggq {
     pub fn mmq_moe_down_acc(&self, s: &Stream, ty: GgmlType, acc: DevPtr, lda: usize, h: &Q8Act, tab: DevPtr,
         row_bytes: usize, n: usize, ws: &SortWs, n_pairs: usize, topk: usize, wts: DevPtr, status: DevPtr) -> Result<()> {
         let f = self.mmq_fn(ty, n, h.k)?;
-        let grid_y = SortWs::max_tiles(n_pairs, ws.nexp) as u32;
-        unsafe {
-            s.launch(f, ((n / MMQ_BN) as u32, grid_y), MMQ_THREADS, MMQ_SMEM, (acc, lda as u32, h.q.ptr(), h.d.ptr(),
-                h.s.ptr(), status, row_bytes as u64, topk as u32, h.k as u32, ws.yidx.ptr(), ws.yidx.ptr(), tab,
-                ws.seg_off.ptr(), ws.tiles.ptr(), ws.ntiles.ptr(), mmq_dbg(), DevPtr(0), DevPtr(0), wts))?
-        };
-        Ok(())
+        self.mmq_grouped(s, ty, f, (n / MMQ_BN) as u32, ws, n_pairs, |tl, nt| (acc, lda as u32, h.q.ptr(), h.d.ptr(),
+            h.s.ptr(), status, row_bytes as u64, topk as u32, h.k as u32, ws.yidx.ptr(), ws.yidx.ptr(), tab,
+            ws.seg_off.ptr(), tl, nt, mmq_dbg(), DevPtr(0), DevPtr(0), wts, self.swiglu_limit()))
     }
 
     /// `out[i] (= or +=) acc[i] * 2^-40` for `n_total` values (i64 fixed point from `mmq_moe_down_acc`), and zero
@@ -843,6 +992,12 @@ impl Ggq {
         Ok(())
     }
 
+    /// dst (i64 fixed-point) += src, src zeroed: merges the partial sums of two cards.
+    pub fn fx_add(&self, s: &Stream, dst: DevPtr, src: DevPtr, n_total: usize) -> Result<()> {
+        unsafe { s.launch(&self.fx_add, (n_total as u32).div_ceil(256), 256, 0, (dst, src, n_total as u32))? };
+        Ok(())
+    }
+
     pub fn fx_finish(&self, s: &Stream, out: DevPtr, acc: DevPtr, n_total: usize, add: bool) -> Result<()> {
         unsafe { s.launch(&self.fx_finish, (n_total as u32).div_ceil(256), 256, 0, (out, acc, n_total as u32, add as u32))? };
         Ok(())
@@ -859,13 +1014,11 @@ impl Ggq {
         if n_ff % 32 != 0 || n_pairs > hq.max_rows || n_ff > hq.max_k {
             bail!("mmq_moe_gu: n_ff {n_ff}, hq {} x {}", hq.max_rows, hq.max_k);
         }
-        let grid_y = SortWs::max_tiles(n_pairs, ws.nexp) as u32;
-        unsafe {
-            // GU mode: y = hd, ldy = n_ff, w = hs
-            s.launch(f, ((n_ff / 32) as u32, grid_y), MMQ_THREADS, MMQ_SMEM, (hq.d.ptr(), n_ff as u32, x.q.ptr(), x.d.ptr(),
-                x.s.ptr(), hq.s.ptr(), row_bytes as u64, 0u32, x.k as u32, ws.xidx.ptr(), ws.yidx.ptr(), gtab, ws.seg_off.ptr(),
-                ws.tiles.ptr(), ws.ntiles.ptr(), mmq_dbg(), utab, hq.q.ptr(), DevPtr(0)))?
-        };
+        // GU mode: y = hd, ldy = n_ff, w = hs
+        let (hd, hs, hqq) = (hq.d.ptr(), hq.s.ptr(), hq.q.ptr());
+        self.mmq_grouped(s, ty, f, (n_ff / 32) as u32, ws, n_pairs, |tl, nt| (hd, n_ff as u32, x.q.ptr(), x.d.ptr(),
+            x.s.ptr(), hs, row_bytes as u64, 0u32, x.k as u32, ws.xidx.ptr(), ws.yidx.ptr(), gtab, ws.seg_off.ptr(),
+            tl, nt, mmq_dbg(), utab, hqq, DevPtr(0), self.swiglu_limit()))?;
         hq.rows = n_pairs;
         hq.k = n_ff;
         Ok(())

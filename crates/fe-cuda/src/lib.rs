@@ -159,6 +159,13 @@ impl Context {
     }
     /// Copy `bytes` from `src` (memory of context `src_ctx`) to `dst` (memory of this context), ordered on `s`
     /// (a stream of either context). Without peer access the driver stages through host memory.
+    /// Let this context read / write `peer`'s memory directly (P2P). `self` must be bindable on this thread; already-enabled is fine.
+    pub fn enable_peer(&self, peer: &Context) -> Result<()> {
+        self.bind()?;
+        let r = unsafe { ffi::cuCtxEnablePeerAccess(peer.ctx, 0) };
+        // CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED = 704
+        if r == 0 || r == 704 { Ok(()) } else { check(r, "cuCtxEnablePeerAccess") }
+    }
     pub fn copy_peer(&self, dst: DevPtr, src_ctx: &Context, src: DevPtr, bytes: usize, s: &Stream) -> Result<()> {
         cu!(cuMemcpyPeerAsync(dst.0, self.ctx, src.0, src_ctx.ctx, bytes, s.raw()))
     }
@@ -574,6 +581,10 @@ impl Function {
         self.f
     }
     /// Allow more than 48 KB of dynamic shared memory.
+    /// Preferred shared-memory share of the SM's L1 / shared array, in percent (CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9).
+    pub fn set_smem_carveout(&self, percent: i32) -> Result<()> {
+        cu!(cuFuncSetAttribute(self.f, 9, percent))
+    }
     pub fn set_max_dynamic_smem(&self, bytes: u32) -> Result<()> {
         cu!(cuFuncSetAttribute(self.f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32))
     }
@@ -675,6 +686,14 @@ impl Stream {
     pub fn new() -> Result<Stream> {
         let mut s = std::ptr::null_mut();
         cu!(cuStreamCreate(&mut s, CU_STREAM_NON_BLOCKING))?;
+        Ok(Stream { s })
+    }
+    /// A non-blocking stream with the context's highest priority (its blocks are scheduled ahead of other streams' waiting blocks).
+    pub fn new_high() -> Result<Stream> {
+        let (mut least, mut greatest) = (0i32, 0i32);
+        cu!(cuCtxGetStreamPriorityRange(&mut least, &mut greatest))?;
+        let mut s = std::ptr::null_mut();
+        cu!(cuStreamCreateWithPriority(&mut s, CU_STREAM_NON_BLOCKING, greatest))?;
         Ok(Stream { s })
     }
     pub fn raw(&self) -> CUstream {

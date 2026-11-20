@@ -1,0 +1,34 @@
+{
+ "model": "deepseek-v4.1-flash-coder",
+ "notes": "DeepSeek-V4.1-Flash Coder (GSQ-RCO Coder IQ2_XXS GGUF) on the Ferrite DeepSeek engine (--engine dsc), three RTX PRO 4000 Blackwell 24 GB (one main card, two expert cards), one request at a time; DSML tool-call format (<｜DSML｜ calls> / invoke / parameter), reasoning in reasoning_content; the template thinks unless the request turns thinking off. The server closes a reasoning block at 8192 tokens, has a loop breaker (exact cycles and repeated sentences), never returns a stop token first, enforces tool_choice required / named by starting the reply inside the calls block, and applies the per-mode sampling below to the fields a client omits (reported in the x-sampling-effective response header); a client that sends temperature 0 gets greedy decoding with no penalty (greedy_keeps_fast_path).",
+ "tool_format": "dsml",
+ "thinking_default_with_tools": true,
+ "context": 131072,
+ "long_write_lines": [
+  1000,
+  2500
+ ],
+ "max_gap_s": 20,
+ "stop_prompts_max_fraction": 0.5,
+ "reasoning_cap_tokens": 8192,
+ "cold_prefill_tokens": [
+  8000,
+  48000
+ ],
+ "single_stream": true,
+ "stop_set_max_tokens": 4096,
+ "sampling_profiles": {
+  "thinking": {
+   "temperature": 1.0,
+   "top_p": 0.95
+  },
+  "non_thinking": {
+   "temperature": 1.0,
+   "top_p": 0.95
+  }
+ },
+ "greedy_keeps_fast_path": true,
+ "effective_sampling_header": "x-sampling-effective",
+ "wander_max_tokens": 8000,
+ "wander_stop_tokens": 3600
+}

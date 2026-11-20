@@ -16,9 +16,11 @@ On one **RTX PRO 4000 Blackwell** (24 GB) the `rtx-pro-4000` preset also keeps p
 card: see [docs/rtx-pro-4000.md](docs/rtx-pro-4000.md).
 A second, experimental engine serves **Qwen3.8-Flash-Next** (the ISTA-DASLab IQ1_M GGUF) on one or two
 **RTX 5060 Ti 16 GB** with the experts mostly in host memory: see [docs/flash-next.md](docs/flash-next.md).
+A third, experimental engine serves **DeepSeek-V4.1-Flash Coder** (the ISTA-DASLab IQ2_XXS GGUF) on three 24 GB
+cards, or four with a 16 GB card added: see [docs/deepseek-coder.md](docs/deepseek-coder.md).
 
 > **Status: experimental.** Qwen3.8-27B on DGX Spark (the main target), RTX 5080 / 5060 Ti, RTX PRO 4000 Blackwell and Arc B70, and
-> Qwen3.8-Flash-Next on RTX 5060 Ti. At most 4 requests run at once; more wait in a queue. It works, but expect rough
+> Qwen3.8-Flash-Next on RTX 5060 Ti, DeepSeek-V4.1-Flash Coder on three or four cards. At most 4 requests run at once; more wait in a queue. It works, but expect rough
 > edges. Issues and measurements from other machines are welcome.
 
 ## Supported systems
@@ -31,6 +33,7 @@ A second, experimental engine serves **Qwen3.8-Flash-Next** (the ISTA-DASLab IQ1
 | NVIDIA RTX 5080 or RTX 5060 Ti 16 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas` and cuBLASLt | From source: [docs/rtx-5080.md](docs/rtx-5080.md) |
 | NVIDIA RTX PRO 4000 Blackwell 24 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 24 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas` and cuBLASLt | From source: [docs/rtx-pro-4000.md](docs/rtx-pro-4000.md) |
 | Qwen3.8-Flash-Next on RTX 5060 Ti, one or two (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas`; 32 GB of memory | From source: [docs/flash-next.md](docs/flash-next.md) |
+| DeepSeek-V4.1-Flash Coder on three 24 GB cards, plus an optional fourth of 16 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | tested on RTX PRO 4000 Blackwell (+ RTX 5060 Ti), NVIDIA driver 580 or later, CUDA 13 `ptxas`; tested with 128 GB of memory, ~191 GB of SSD for the files | From source: [docs/deepseek-coder.md](docs/deepseek-coder.md) |
 | Intel Arc Pro B70 (experimental) | Linux with the `xe` kernel driver; tested on Arch Linux | x86_64 | 32 GB, Level Zero loader 1.32+ | From source: [docs/arc-b70.md](docs/arc-b70.md) |
 
 ## Why Ferrite exists
@@ -101,7 +104,7 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.7.2` pins one) and the models into
+It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.8.0` pins one) and the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the
 models, and `--source` builds from source. Run again over an older release, the same command upgrades it.

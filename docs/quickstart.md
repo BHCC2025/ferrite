@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
    available memory (`FERRITE_MIN_FREE_GB`), and that the port is free or already serves Ferrite;
 2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the latest published release, which it asks the GitHub API for
-   (`FERRITE_VERSION=0.7.2` or `--version 0.7.2` pins one). That is the release tarball with ready-made binaries,
+   (`FERRITE_VERSION=0.8.0` or `--version 0.8.0` pins one). That is the release tarball with ready-made binaries,
    its sha256 checked. When the release has no tarball (or with `--source`) it says so and builds from source: a
    clone of the release's tag, rustup, the pinned toolchains and `cargo build`. Run inside a checkout or an unpacked
    release, it uses that folder instead;

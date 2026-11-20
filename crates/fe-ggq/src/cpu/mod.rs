@@ -10,6 +10,7 @@
 //! ```
 pub mod avx2;
 pub mod pool;
+pub mod repack;
 pub mod tile;
 
 use crate::refq;
@@ -39,8 +40,12 @@ fn vnni_off_min_b() -> usize {
 }
 
 /// Types with an AVX2 kernel.
+pub fn is_r3(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::RepR3Xxs | GgmlType::RepR3Xs | GgmlType::RepR3Iq1M | GgmlType::RepHXxs)
+}
+
 pub fn supported(ty: GgmlType) -> bool {
-    crate::gpu::GEMV_TYPES.contains(&ty)
+    (crate::gpu::GEMV_TYPES.contains(&ty) && ty != GgmlType::RepMxfp4) || ty == GgmlType::RepIq1M || is_r3(ty)
 }
 
 macro_rules! dispatch_gpu_vnni {
@@ -115,6 +120,17 @@ pub unsafe fn gemv_rows_gpu(ty: GgmlType, w: *const u8, row_bytes: usize, rows: 
         IQ3XXS => dispatch_gpu!(avx2::Iq3Xxs<false>, b, w, row_bytes, rows, a, y, ld, lpr),
         IQ3S if avx2::gather() => dispatch_gpu!(avx2::Iq3S<true>, b, w, row_bytes, rows, a, y, ld, lpr),
         IQ3S => dispatch_gpu!(avx2::Iq3S<false>, b, w, row_bytes, rows, a, y, ld, lpr),
+        IQ2XXS if avx2::gather_xq() => dispatch_gpu!(avx2::Iq2Xxs<true>, b, w, row_bytes, rows, a, y, ld, lpr),
+        IQ2XXS => dispatch_gpu!(avx2::Iq2Xxs<false>, b, w, row_bytes, rows, a, y, ld, lpr),
+        IQ1M if avx2::gather_xq() => dispatch_gpu!(avx2::Iq1M<true>, b, w, row_bytes, rows, a, y, ld, lpr),
+        IQ1M => dispatch_gpu!(avx2::Iq1M<false>, b, w, row_bytes, rows, a, y, ld, lpr),
+        RepIq1M => dispatch_gpu!(avx2::Iq1MR, b, w, row_bytes, rows, a, y, ld, lpr),
+        RepR3Xxs => dispatch_gpu!(avx2::Rep3<0>, b, w, row_bytes, rows, a, y, ld, lpr),
+        RepHXxs => dispatch_gpu!(avx2::RepH, b, w, row_bytes, rows, a, y, ld, lpr),
+        RepR3Xs => dispatch_gpu!(avx2::Rep3<1>, b, w, row_bytes, rows, a, y, ld, lpr),
+        RepR3Iq1M => dispatch_gpu!(avx2::Rep3<2>, b, w, row_bytes, rows, a, y, ld, lpr),
+        IQ2XS if avx2::gather_xq() => dispatch_gpu!(avx2::Iq2Xs<true>, b, w, row_bytes, rows, a, y, ld, lpr),
+        IQ2XS => dispatch_gpu!(avx2::Iq2Xs<false>, b, w, row_bytes, rows, a, y, ld, lpr),
         _ => unreachable!(),
     }
 }
@@ -137,6 +153,13 @@ pub fn exp_det(x: f32) -> f32 {
     let n1 = ni / 2;
     let n2 = ni - n1;
     r * f32::from_bits(((n1 + 127) as u32) << 23) * f32::from_bits(((n2 + 127) as u32) << 23)
+}
+/// DeepSeek's clamped SwiGLU, the GPU's `swiglu`: silu(min(g, lim)) * clamp(u, -lim, lim) (lim = +inf: the plain silu(g) * u).
+#[inline]
+pub fn swiglu_det(g: f32, u: f32, lim: f32) -> f32 {
+    let g = if g > lim { lim } else { g };
+    let u = if u > lim { lim } else if u < -lim { -lim } else { u };
+    silu_det(g) * u
 }
 /// x / (1 + exp_det(-x)): the GPU's SiLU.
 #[inline]
@@ -224,6 +247,17 @@ pub unsafe fn gemv_rows(ty: GgmlType, w: *const u8, row_bytes: usize, rows: std:
         IQ3S if a.k % 128 == 0 && avx2::vnni() && vnni_off_min_b() <= b => dispatch_vnni_off!(avx2::Iq3S<false>, b, w, row_bytes, rows, a, y, ld),
         IQ3S if avx2::gather() => dispatch_b!(avx2::Iq3S<true>, b, w, row_bytes, rows, a, y, ld),
         IQ3S => dispatch_b!(avx2::Iq3S<false>, b, w, row_bytes, rows, a, y, ld),
+        IQ2XXS if avx2::gather_xq() => dispatch_b!(avx2::Iq2Xxs<true>, b, w, row_bytes, rows, a, y, ld),
+        IQ2XXS => dispatch_b!(avx2::Iq2Xxs<false>, b, w, row_bytes, rows, a, y, ld),
+        IQ1M if avx2::gather_xq() => dispatch_b!(avx2::Iq1M<true>, b, w, row_bytes, rows, a, y, ld),
+        IQ1M => dispatch_b!(avx2::Iq1M<false>, b, w, row_bytes, rows, a, y, ld),
+        RepIq1M => dispatch_b!(avx2::Iq1MR, b, w, row_bytes, rows, a, y, ld),
+        RepR3Xxs => dispatch_b!(avx2::Rep3<0>, b, w, row_bytes, rows, a, y, ld),
+        RepHXxs => dispatch_b!(avx2::RepH, b, w, row_bytes, rows, a, y, ld),
+        RepR3Xs => dispatch_b!(avx2::Rep3<1>, b, w, row_bytes, rows, a, y, ld),
+        RepR3Iq1M => dispatch_b!(avx2::Rep3<2>, b, w, row_bytes, rows, a, y, ld),
+        IQ2XS if avx2::gather_xq() => dispatch_b!(avx2::Iq2Xs<true>, b, w, row_bytes, rows, a, y, ld),
+        IQ2XS => dispatch_b!(avx2::Iq2Xs<false>, b, w, row_bytes, rows, a, y, ld),
         _ => gemv_rows_scalar(ty, w, row_bytes, rows, a, y, ld),
     }
 }
@@ -272,12 +306,22 @@ pub struct CpuMoe {
     tokq: Q8Rows,
     tmpq: Q8Rows,
     tok_seen: Vec<bool>,
+    /// DeepSeek's SwiGLU clamp L: h = silu(min(g, L)) * clamp(u, -L, L), every path; +inf (default) = off, the old bits.
+    /// Set it to the value given to `Ggq::set_swiglu_limit` for CPU == GPU bits. The routing weight is applied by the caller.
+    pub swiglu_limit: f32,
     /// compute in the GPU kernels' float order (default; FE_GGQ_CPU_GPU_ORDER=0 = the faster AVX2 order)
     pub gpu_order: bool,
     /// lanes per row of the GPU kernels this must match: moe_gu_q8 (`gpu::moe_gu_lpr`) and moe_down
     /// (`gpu::default_lpr(n_ff)`)
     pub gu_lpr: usize,
     pub down_lpr: usize,
+    /// NUMA node of each pool thread (index 0 = the calling thread); empty = no node awareness. With `NODE_REGION` set, work units read from
+    /// the node holding their weights first (units are claimed per node), then steal the other node's.
+    pub worker_node: Vec<u8>,
+    /// guided scheduling: the first 3/4 of a matrix's rows go out in units of `gu_big` (gate/up, <= 64) / `down_big` rows, the last quarter in
+    /// `gu_chunk` / `down_chunk` rows (big units stream better, small ones balance the tail); 0 = off
+    pub gu_big: usize,
+    pub down_big: usize,
 }
 
 struct SyncPtr<T>(*mut T);
@@ -292,7 +336,16 @@ impl CpuMoe {
     /// Workers pinned one per CPU in `cpus` (e.g. `pool::parse_cpus("1-7")`), plus the calling thread. Workers spin
     /// for `spin` after each layer (keep it above the time between two layers' calls).
     pub fn pinned(cpus: &[usize], spin: std::time::Duration, n_embd: usize, n_ff: usize) -> CpuMoe {
-        Self::with_pool(Pool::pinned(cpus, spin), n_embd, n_ff)
+        let mut m = Self::with_pool(Pool::pinned(cpus, spin), n_embd, n_ff);
+        m.worker_node = std::iter::once(0u8).chain(cpus.iter().map(|&c| cpu_node(c))).collect();
+        m
+    }
+    /// Pin the calling thread (the one that calls `run`; it works as pool thread 0) to `cpu`.
+    pub fn set_caller_cpu(&mut self, cpu: usize) {
+        pool::pin_current(cpu);
+        if let Some(n) = self.worker_node.first_mut() {
+            *n = cpu_node(cpu);
+        }
     }
     pub fn with_pool(pool: Pool, n_embd: usize, n_ff: usize) -> CpuMoe {
         CpuMoe {
@@ -303,14 +356,18 @@ impl CpuMoe {
             hq: vec![],
             h: vec![],
             out: vec![],
-            gu_chunk: 16,
-            down_chunk: 64,
+            gu_chunk: std::env::var("FE_GGQ_CPU_GU").ok().and_then(|v| v.parse().ok()).unwrap_or(16),
+            down_chunk: std::env::var("FE_GGQ_CPU_DN").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
             tokq: Q8Rows::default(),
             tmpq: Q8Rows::default(),
             tok_seen: vec![],
+            swiglu_limit: f32::INFINITY,
             gpu_order: std::env::var("FE_GGQ_CPU_GPU_ORDER").map_or(true, |v| v != "0"),
             gu_lpr: crate::gpu::moe_gu_lpr() as usize,
             down_lpr: crate::gpu::default_lpr(n_ff) as usize,
+            worker_node: vec![],
+            gu_big: std::env::var("FE_GGQ_CPU_GUB").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            down_big: std::env::var("FE_GGQ_CPU_DNB").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         }
     }
 
@@ -357,6 +414,7 @@ impl CpuMoe {
     fn run_le8(&mut self, jobs: &[MoeJob], x: &[f32]) -> Result<()> {
         let t_start = std::time::Instant::now();
         let (ne, nf) = (self.n_embd, self.n_ff);
+        let lim = self.swiglu_limit;
         if nf % 32 != 0 || !(self.gu_chunk == 16 || self.gu_chunk % 32 == 0) || nf % self.gu_chunk != 0 {
             bail!("CpuMoe: n_ff {nf} / gu_chunk {}", self.gu_chunk);
         }
@@ -421,11 +479,57 @@ impl CpuMoe {
         // One pass, work-claiming: units 0..nj*gu_units are gate/up (+ SwiGLU + q8 of h) chunks of gu_chunk rows,
         // the rest are down chunks of down_chunk rows. Units are claimed in that order, so by the time a down unit of
         // job j is taken every gate/up unit of j is claimed; it waits (spinning) only for those still running.
-        let gu_units = nf / self.gu_chunk;
-        let dc = self.down_chunk;
-        let d_units = ne.div_ceil(dc);
-        let total = nj * (gu_units + d_units);
-        let next = AtomicUsize::new(0);
+        let (gs, ds) = (self.gu_chunk, self.down_chunk);
+        let gb = if self.gu_big > gs && self.gu_big <= 64 && self.gu_big % 32 == 0 { self.gu_big } else { gs };
+        let db = if self.down_big > ds { self.down_big } else { ds };
+        // units: (kind 0 = gate/up, 1 = down; job; first row; rows)
+        let mut units: Vec<(u8, usize, usize, usize)> = vec![];
+        let mut gu_cnt = vec![0usize; nj];
+        let big_gu = if gb > gs { (nf * 3 / 4) / gb * gb } else { 0 };
+        for j in 0..nj {
+            let mut r = 0;
+            while r < big_gu {
+                units.push((0, j, r, gb));
+                gu_cnt[j] += 1;
+                r += gb;
+            }
+        }
+        for j in 0..nj {
+            let mut r = big_gu;
+            while r < nf {
+                units.push((0, j, r, gs));
+                gu_cnt[j] += 1;
+                r += gs;
+            }
+        }
+        let big_dn = if db > ds { (ne * 3 / 4) / db * db } else { 0 };
+        for j in 0..nj {
+            let mut r = 0;
+            while r < big_dn {
+                units.push((1, j, r, db));
+                r += db;
+            }
+        }
+        for j in 0..nj {
+            let mut r = big_dn;
+            while r < ne {
+                units.push((1, j, r, ds.min(ne - r)));
+                r += ds;
+            }
+        }
+        // work queues: gate/up units then down units, each split by the NUMA node holding the unit's weights
+        let mut queues: [Vec<u32>; 4] = Default::default();
+        let have_nodes = !self.worker_node.is_empty() && NODE_REGION.1.load(Ordering::Relaxed) != 0 && std::env::var_os("FE_GGQ_CPU_NONODE").is_none();
+        for (t, &(kind, j, r0, _)) in units.iter().enumerate() {
+            let node = if !have_nodes { 0 } else if kind == 0 {
+                region_node(jobs[j].gate.as_ptr() as usize + r0 * jobs[j].ty_gu.row_bytes(ne))
+            } else {
+                region_node(jobs[j].down.as_ptr() as usize + r0 * jobs[j].ty_down.row_bytes(nf))
+            };
+            queues[2 * kind as usize + node].push(t as u32);
+        }
+        let qn: [AtomicUsize; 4] = Default::default();
+        let wnode = &self.worker_node;
         let gu_done: Vec<AtomicUsize> = (0..nj).map(|_| AtomicUsize::new(0)).collect();
         // per (job, 32-row h block): halves finished (gu_chunk = 16)
         let half_done: Vec<AtomicUsize> = (0..nj * nf / 32).map(|_| AtomicUsize::new(0)).collect();
@@ -445,17 +549,24 @@ impl CpuMoe {
         if prof {
             PROF_NS[6].fetch_add(t_start.elapsed().as_nanos() as usize, Ordering::Relaxed);
         }
-        self.pool.run_dyn(|_, _| {
+        self.pool.run_dyn(|wi, _| {
+            let my = wnode.get(wi).copied().unwrap_or(0) as usize & 1;
+            let order = [my, 1 - my, 2 + my, 3 - my];
             let mut first = true;
             let mut g = [0f32; 8 * 64];
             let mut u = [0f32; 8 * 64];
             let mut tl = std::time::Instant::now();
             let mut acc = [0u64; 3];
             loop {
-                let t = next.fetch_add(1, Ordering::Relaxed);
-                if t >= total {
-                    break;
+                let mut tt = None;
+                for &q in &order {
+                    let k = qn[q].fetch_add(1, Ordering::Relaxed);
+                    if k < queues[q].len() {
+                        tt = Some(queues[q][k] as usize);
+                        break;
+                    }
                 }
+                let Some(t) = tt else { break };
                 if prof {
                     tl = std::time::Instant::now();
                     if first {
@@ -464,13 +575,15 @@ impl CpuMoe {
                         PROF_NS[5].fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                if t < nj * gu_units {
-                    let (j, c) = (t / gu_units, t % gu_units);
+                let (ukind, uj, ur0, unr) = units[t];
+                if ukind == 0 {
+                    let j = uj;
                     let job = &jobs[j];
                     let a = &xq[j];
                     let b = a.rows;
                     let rb = job.ty_gu.row_bytes(ne);
-                    let r0 = c * gc;
+                    let r0 = ur0;
+                    let gc = unr;
                     unsafe {
                         let gp = g.as_mut_ptr().wrapping_sub(r0);
                         let up = u.as_mut_ptr().wrapping_sub(r0);
@@ -486,8 +599,8 @@ impl CpuMoe {
                         for bb in 0..b {
                             for i in 0..gc {
                                 let gv = g[bb * gc + i];
-                                *h.add(bb * nf + r0 + i) = if gpu_order { silu_det(gv) * u[bb * gc + i] }
-                                    else { gv / (1.0 + (-gv).exp()) * u[bb * gc + i] };
+                                *h.add(bb * nf + r0 + i) = if gpu_order { swiglu_det(gv, u[bb * gc + i], lim) }
+                                    else { let (gv, uu) = (gv.min(lim), u[bb * gc + i].clamp(-lim, lim)); gv / (1.0 + (-gv).exp()) * uu };
                             }
                             if gc >= 32 {
                                 for blk in 0..gc / 32 {
@@ -512,9 +625,8 @@ impl CpuMoe {
                         acc[0] += tl.elapsed().as_nanos() as u64;
                     }
                 } else {
-                    let t = t - nj * gu_units;
-                    let (j, c) = (t / d_units, t % d_units);
-                    while gu_done[j].load(Ordering::Acquire) < gu_units {
+                    let j = uj;
+                    while gu_done[j].load(Ordering::Acquire) < gu_cnt[j] {
                         std::hint::spin_loop();
                     }
                     if prof {
@@ -522,8 +634,8 @@ impl CpuMoe {
                         tl = std::time::Instant::now();
                     }
                     let job = &jobs[j];
-                    let r0 = c * dc;
-                    let r1 = (r0 + dc).min(ne);
+                    let r0 = ur0;
+                    let r1 = r0 + unr;
                     unsafe {
                         if gpu_order {
                             gemv_rows_gpu(job.ty_down, job.down.as_ptr(), job.ty_down.row_bytes(nf), r0..r1, &*hq_ro[j].0, op[j].0, ne, ldn);
@@ -547,6 +659,10 @@ impl CpuMoe {
         });
         if prof {
             PROF_NS[7].fetch_add(t_call.elapsed().as_nanos() as usize, Ordering::Relaxed);
+            let x: f64 = jobs.iter().map(|j| (j.gate.len() + j.up.len() + j.down.len()) as f64).sum::<f64>() / 1e6;
+            let y = t_call.elapsed().as_nanos() as f64 / 1e3;
+            let mut f = PROF_FIT.lock().unwrap();
+            f[0] += 1.0; f[1] += x; f[2] += y; f[3] += x * y; f[4] += x * x;
         }
         Ok(())
     }
@@ -556,6 +672,7 @@ impl CpuMoe {
     /// then down in units of 64 output rows. Same numerics as `run`.
     pub fn run_tiled(&mut self, jobs: &[MoeJob], x: &[f32]) -> Result<()> {
         let (ne, nf) = (self.n_embd, self.n_ff);
+        let lim = self.swiglu_limit;
         let nj = jobs.len();
         while self.xq.len() < nj {
             self.xq.push(Q8Rows::default());
@@ -624,13 +741,13 @@ impl CpuMoe {
                                 if gpu_order {
                                     let gu = tile::micro_gpu_any(&tb.0, [r, 32 + r], a, ar, na, off, lgu);
                                     for i in 0..na {
-                                        h[i * 32 + r] = silu_det(gu[i][0]) * gu[i][1];
+                                        h[i * 32 + r] = swiglu_det(gu[i][0], gu[i][1], lim);
                                     }
                                 } else {
                                     let gu = tile::micro_any(&tb.0, [r, 32 + r], a, ar, na, off, corr);
                                     for i in 0..na {
-                                        let gv = gu[i][0];
-                                        h[i * 32 + r] = gv / (1.0 + (-gv).exp()) * gu[i][1];
+                                        let gv = gu[i][0].min(lim);
+                                        h[i * 32 + r] = gv / (1.0 + (-gv).exp()) * gu[i][1].clamp(-lim, lim);
                                     }
                                 }
                             }
@@ -706,6 +823,7 @@ impl CpuMoe {
     /// weights decoded once per call). Output `out(j)`: [rows][n_embd].
     pub fn run_mmq_order(&mut self, jobs: &[MoeJob], xq: &Q8Rows) -> Result<()> {
         let (ne, nf) = (self.n_embd, self.n_ff);
+        let lim = self.swiglu_limit;
         if !has_avx2() || ne % 128 != 0 || nf % 128 != 0 || xq.k != ne {
             bail!("run_mmq_order: AVX2 and n_embd, n_ff % 128 == 0 (k {} vs n_embd {ne})", xq.k);
         }
@@ -764,7 +882,7 @@ impl CpuMoe {
                                 let gu = if off { tile::micro_mmq::<true>(&tb.0, [r, 32 + r], a, ar, na) }
                                     else { tile::micro_mmq::<false>(&tb.0, [r, 32 + r], a, ar, na) };
                                 for i in 0..na {
-                                    h[i * 32 + r] = silu_det(gu[i][0]) * gu[i][1];
+                                    h[i * 32 + r] = swiglu_det(gu[i][0], gu[i][1], lim);
                                 }
                             }
                             for i in 0..na {
@@ -850,6 +968,37 @@ unsafe fn q8_mmq_h(h: &[f32], q: *mut i8, qu: *mut u8, d: *mut f32, s: *mut f32)
 }
 
 /// Bench-only profile of `run`: summed thread time in gate/up units, waiting for gate/up before down, down units.
+/// A region whose 2 MiB pages alternate between NUMA nodes 0 / 1 (page index % 2): (base, len); 0 = none.
+pub static NODE_REGION: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
+
+/// NUMA node of a CPU (the socket: sysfs physical_package_id; NPS1 = one node per socket).
+pub fn cpu_node(cpu: usize) -> u8 {
+    std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id")).ok()
+        .and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Per-2-MiB-page node table of `NODE_REGION` (a leaked slice: pointer, length); 0 = parity (page index % 2).
+pub static NODE_MAP: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
+
+pub fn set_node_map(map: Vec<u8>) {
+    let m: &'static mut [u8] = Box::leak(map.into_boxed_slice());
+    NODE_MAP.1.store(m.len(), Ordering::Relaxed);
+    NODE_MAP.0.store(m.as_ptr() as usize, Ordering::Relaxed);
+}
+
+fn region_node(p: usize) -> usize {
+    let (b, l) = (NODE_REGION.0.load(Ordering::Relaxed), NODE_REGION.1.load(Ordering::Relaxed));
+    if l == 0 || p < b || p >= b + l {
+        return 0;
+    }
+    let k = (p - b) >> 21;
+    let (mp, ml) = (NODE_MAP.0.load(Ordering::Relaxed), NODE_MAP.1.load(Ordering::Relaxed));
+    if ml > k { unsafe { *(mp as *const u8).add(k) as usize & 1 } } else { k & 1 }
+}
+
+/// regression accumulators of the pass time against the bytes of the call: (n, sum x, sum y, sum xy, sum xx) with x = MB, y = us
+pub static PROF_FIT: std::sync::Mutex<[f64; 5]> = std::sync::Mutex::new([0.0; 5]);
+
 pub static PROF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static PROF_NS: [AtomicUsize; 8] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
     AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
@@ -892,6 +1041,14 @@ unsafe fn decode_any(ty: GgmlType, w: *const u8, rb: usize, r0: usize, n: usize,
         IQ2S => tile::decode_rows::<avx2::Iq2S>(w, rb, r0, n, k, off, at, d),
         IQ3XXS => tile::decode_rows::<avx2::Iq3Xxs>(w, rb, r0, n, k, off, at, d),
         IQ3S => tile::decode_rows::<avx2::Iq3S>(w, rb, r0, n, k, off, at, d),
+        IQ2XXS => tile::decode_rows::<avx2::Iq2Xxs>(w, rb, r0, n, k, off, at, d),
+        IQ1M => tile::decode_rows::<avx2::Iq1M>(w, rb, r0, n, k, off, at, d),
+        RepIq1M => tile::decode_rows::<avx2::Iq1MR>(w, rb, r0, n, k, off, at, d),
+        RepR3Xxs => tile::decode_rows::<avx2::Rep3<0>>(w, rb, r0, n, k, off, at, d),
+        RepHXxs => tile::decode_rows::<avx2::RepH>(w, rb, r0, n, k, off, at, d),
+        RepR3Xs => tile::decode_rows::<avx2::Rep3<1>>(w, rb, r0, n, k, off, at, d),
+        RepR3Iq1M => tile::decode_rows::<avx2::Rep3<2>>(w, rb, r0, n, k, off, at, d),
+        IQ2XS => tile::decode_rows::<avx2::Iq2Xs>(w, rb, r0, n, k, off, at, d),
         _ => unreachable!(),
     }
 }
