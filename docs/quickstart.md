@@ -14,7 +14,7 @@ their own pages: [rtx-5080.md](rtx-5080.md) and [arc-b70.md](arc-b70.md).
 | Hardware | DGX Spark (GB10, compute capability 12.1, 128 GB unified memory). The GPU kernels are compiled for `sm_121a` only. Two Sparks need the ConnectX-7 cable between them (RoCE). |
 | OS / driver | DGX OS (Ubuntu 24.04), NVIDIA driver 580.x with CUDA 13.0. Tested with 580.178.04 on kernel 7.0.0-1019-nvidia. |
 | Memory | One node with the defaults (128K context x 4 slots, NVFP4 prompt weights, DFlash2) needs about 80 GB available for the model and the 4 x 128K KV cache, plus the prompt cache's 12 GB pool (`FERRITE_PARK_GB`), so at least 95 GB must be available before starting; with agents running, about 34 GB stays available. The pool also shrinks by itself to keep 20 GB available. The GPU shares system memory: running out of it can stall or reboot the machine, so do not run other large GPU jobs beside the server. |
-| Disk | 45 GB free: about 38 GB for the three model folders, plus Ferrite (the release tarball needs almost nothing; a source build about 6 GB under your home folder for rustup, cargo and the build). |
+| Disk | 45 GB free: about 38 GB for the three model folders, plus about 6 GB under your home folder for the source build (rustup, cargo and the build). |
 | Libraries | `libcuda.so.1` (the driver) and `libibverbs.so.1` (rdma-core, preinstalled on DGX OS). Two nodes also need NCCL 2.30+ ([Two nodes](#two-nodes-tp2): a user-level `pip` install works, no sudo). |
 | Download tool | The Hugging Face CLI (`hf`). DGX OS's Python refuses a system-wide `pip install`, so give it its own environment: `python3 -m venv ~/.venvs/hf && ~/.venvs/hf/bin/pip install -U huggingface_hub`. `scripts/fetch-models.sh` finds `hf` there or on `PATH`. |
 
@@ -31,10 +31,9 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
    available memory (`FERRITE_MIN_FREE_GB`), and that the port is free or already serves Ferrite;
 2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the latest published release, which it asks the GitHub API for
-   (`FERRITE_VERSION=0.8.0` or `--version 0.8.0` pins one). That is the release tarball with ready-made binaries,
-   its sha256 checked. When the release has no tarball (or with `--source`) it says so and builds from source: a
-   clone of the release's tag, rustup, the pinned toolchains and `cargo build`. Run inside a checkout or an unpacked
-   release, it uses that folder instead;
+   (`FERRITE_VERSION=0.8.1` or `--version 0.8.1` pins one), built from source: a clone of the release's tag,
+   rustup, the pinned toolchains and `cargo build` (a few minutes the first time). Run inside a checkout, it uses
+   that folder instead. Ferrite ships no prebuilt binaries;
 3. installs the Hugging Face CLI into `~/.venvs/hf`;
 4. downloads and verifies the models into `FERRITE_MODELS` (`/var/tmp/models`);
 5. starts the server in the background with `scripts/ferritectl.sh start` (log `logs/server-8000.log`;
@@ -56,15 +55,14 @@ The sections below are the same steps by hand.
 
 ## 1. Get Ferrite
 
-Either unpack a release tarball on the Spark:
+Clone the repository and build it (details in [Build from source](#build-from-source)); the scripts below run from
+the repository:
 
 ```bash
-tar xzf ferrite-<version>-dgx-spark-aarch64.tar.gz
-cd ferrite-<version>-dgx-spark-aarch64
-scripts/check-deps.sh
+git clone https://github.com/BHCC2025/ferrite.git && cd ferrite
+scripts/check-deps.sh --build --install
+cargo build --release -p fe-server --features ferrite -p fe-cli
 ```
-
-or build from source (see [Build from source](#build-from-source)) and run the same scripts from the repository.
 
 ## 2. Download the models
 
@@ -307,7 +305,6 @@ the missing toolchains with rustup.
 The build compiles every `kernels/k-*` crate to PTX with that nightly (`target-cpu=sm_121a`), assembles it with
 `ptxas -arch=sm_121a`, and embeds the cubins in `target/release/fe-server` and `target/release/ferrite`. Tested with
 rustc 1.99.1 (host), nightly-2026-11-04 (kernels) and ptxas 13.0.88.
-`scripts/package-release.sh` builds and packs the release tarball into `dist/`.
 
 To build for an RTX 50 card instead (x86_64, `sm_120a`), set `FE_KARCH=sm_120a` for the build (the table in
 [Clean machine](#clean-machine)); see [rtx-5080.md](rtx-5080.md). A source build prints a few compiler warnings;

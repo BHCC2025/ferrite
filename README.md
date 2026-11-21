@@ -29,7 +29,7 @@ cards, or four with a 16 GB card added: see [docs/deepseek-coder.md](docs/deepse
 
 | Target | Operating system | CPU | GPU and driver | How you get it |
 |---|---|---|---|---|
-| NVIDIA DGX Spark, one or two | DGX OS (Ubuntu 24.04) | aarch64 | GB10, NVIDIA driver 580+, CUDA 13 | Prebuilt package, or from source |
+| NVIDIA DGX Spark, one or two | DGX OS (Ubuntu 24.04) | aarch64 | GB10, NVIDIA driver 580+, CUDA 13 | From source |
 | NVIDIA RTX 5080 or RTX 5060 Ti 16 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas` and cuBLASLt | From source: [docs/rtx-5080.md](docs/rtx-5080.md) |
 | NVIDIA RTX PRO 4000 Blackwell 24 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 24 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas` and cuBLASLt | From source: [docs/rtx-pro-4000.md](docs/rtx-pro-4000.md) |
 | Qwen3.8-Flash-Next on RTX 5060 Ti, one or two (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas`; 32 GB of memory | From source: [docs/flash-next.md](docs/flash-next.md) |
@@ -104,10 +104,11 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It installs the latest release into `~/ferrite` (`FERRITE_HOME`; `--version 0.8.0` pins one) and the models into
+It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.8.1` pins one; a few minutes
+the first time: rustup, the pinned toolchains, `cargo build`) and puts the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the
-models, and `--source` builds from source. Run again over an older release, the same command upgrades it.
+models. Run again over an older release, the same command upgrades it. Ferrite ships no prebuilt binaries.
 
 > **Network access.** Every Ferrite launcher listens on all interfaces (`0.0.0.0`) by default, so other machines on
 > your local network (a laptop running a coding agent, say) can use the server. There is no API key: use it on a
@@ -117,12 +118,13 @@ models, and `--source` builds from source. Run again over an older release, the 
 >
 > `Install Ferrite on this DGX Spark by following https://github.com/BHCC2025/ferrite/blob/main/AGENTS.md exactly; stop and ask me if any check fails.`
 
-**Step by step** from the release tarball (no Rust or CUDA toolchain needed):
+**Step by step** from source:
 
 ```bash
-# 1. unpack the release
-tar xzf ferrite-<version>-dgx-spark-aarch64.tar.gz && cd ferrite-<version>-dgx-spark-aarch64
-scripts/check-deps.sh
+# 1. clone and build (scripts/check-deps.sh --build --install sets up rustup and the pinned toolchains)
+git clone https://github.com/BHCC2025/ferrite.git && cd ferrite
+scripts/check-deps.sh --build --install
+cargo build --release -p fe-server --features ferrite -p fe-cli
 
 # 2. download the models (about 38 GB) into $FERRITE_MODELS
 export FERRITE_MODELS=$HOME/models
@@ -133,7 +135,7 @@ scripts/serve.sh                      # or in the background: scripts/ferritectl
 curl -s localhost:8000/v1/models
 ```
 
-The release tarball holds the binaries, every launcher, the benchmark clients (`tools/bench`), the conformance suite
+The repository holds every launcher, the benchmark clients (`tools/bench`), the conformance suite
 (`tools/conformance`) and all of `docs/`.
 
 Point any OpenAI-compatible client at `http://<spark>:8000/v1`: Open WebUI, Continue, Cline and other coding agents.

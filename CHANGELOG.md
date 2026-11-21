@@ -4,6 +4,25 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-11-21
+
+### Fixed
+
+- **DeepSeek-V4.1-Flash Coder: Engram rows are read in parallel.** Every token reads 48 rows of the 111 GB Engram
+  table. They were read one after another, and a row that is not in the page cache waits about 70 us on the SSD, so a
+  pass over six drafted tokens could wait some 20 ms before the cards started. Rows in the page cache are now read at
+  once on the engine thread and the others together on a pool of reader threads (`DSC_ENGRAM_THREADS`, default 128).
+  Eight prompts the server had not seen before, fresh start, temperature 0: 74 -> 87 tokens/s on three cards and
+  88 -> 105 on four, with the same text as 0.8.0. Figures in [docs/deepseek-coder.md](docs/deepseek-coder.md)
+  re-measured with 0.8.1.
+
+### Changed
+
+- **Source only: Ferrite ships no prebuilt binaries.** `scripts/install.sh` clones the release's tag and builds it
+  (rustup, the pinned toolchains and `cargo build`, a few minutes the first time); `--source` is still accepted and
+  does the same. The packages attached to releases 0.1.0 to 0.8.0 were withdrawn and `scripts/package-release.sh`
+  removed. An install unpacked from one of those packages is upgraded by the same command.
+
 ## [0.8.0] - 2026-11-20
 
 ### Added
@@ -572,6 +591,7 @@ Qwen3.8-27B behind an OpenAI-compatible API.
 - One-line install (`scripts/install.sh`), an agent-led install guide ([AGENTS.md](AGENTS.md)) and a prebuilt
   `ferrite-0.1.0-dgx-spark-aarch64.tar.gz` (aarch64, CUDA 13, kernels for `sm_121a`).
 
+[0.8.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.8.1
 [0.8.0]: https://github.com/BHCC2025/ferrite/releases/tag/v0.8.0
 [0.7.2]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.2
 [0.7.1]: https://github.com/BHCC2025/ferrite/releases/tag/v0.7.1

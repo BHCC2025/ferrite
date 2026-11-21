@@ -249,11 +249,11 @@
 <pre><code>curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash</code></pre>
       <p class="note"><strong>Install with your AI agent.</strong> Paste this into your coding agent on the Spark:<br>
         <code>Install Ferrite on this DGX Spark by following https://github.com/BHCC2025/ferrite/blob/main/AGENTS.md exactly; stop and ask me if any check fails.</code></p>
-      <p class="muted">Or step by step, from the release tarball (no Rust or CUDA toolchain needed):</p>
-<pre><code><span class="c"># 1. unpack the release and check the machine</span>
-tar xzf ferrite-&lt;version&gt;-dgx-spark-aarch64.tar.gz
-cd ferrite-&lt;version&gt;-dgx-spark-aarch64
-scripts/check-deps.sh
+      <p class="muted">Or step by step, from source:</p>
+<pre><code><span class="c"># 1. clone and build (check-deps.sh --build --install sets up rustup and the pinned toolchains)</span>
+git clone https://github.com/BHCC2025/ferrite.git &amp;&amp; cd ferrite
+scripts/check-deps.sh --build --install
+cargo build --release -p fe-server --features ferrite -p fe-cli
 
 <span class="c"># 2. download the models (about 38 GB) into $FERRITE_MODELS</span>
 export FERRITE_MODELS=$HOME/models

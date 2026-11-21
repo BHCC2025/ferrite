@@ -30,7 +30,7 @@ Run all of these first. Every one must pass.
 | Architecture | `uname -m` | `aarch64` |
 | GPU | `nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader` | the name contains `GB10`, compute capability `12.1`, driver 580 or newer |
 | Memory | `free -g` | the `available` value of the `Mem:` line is 95 or more |
-| Disk | `df -h /var/tmp` (or the folder for `FERRITE_MODELS`) | at least 45 GB free (about 38 GB of models, plus Ferrite itself); a source build also needs ~6 GB under your home folder (rustup, cargo, the build); the release tarball needs almost nothing there |
+| Disk | `df -h /var/tmp` (or the folder for `FERRITE_MODELS`) | at least 45 GB free (about 38 GB of models, plus Ferrite itself); the source build also needs ~6 GB under your home folder (rustup, cargo, the build) |
 | GPU in use | `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader` | prints nothing |
 | Port | `ss -ltn 'sport = :8000'` | no listening socket on port 8000 |
 | Tools | `command -v curl python3 git` | prints three paths |
@@ -53,9 +53,9 @@ questions, and can be run again: finished steps are skipped.
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It prints six steps (`==> [1/6] Checking this machine` to `==> [6/6]`). It installs the latest published release
-(step 2 names it) from its ready-made binaries. When that release has no tarball it says `BUILDING FROM SOURCE
-instead` and clones and builds it (a few minutes). Downloading the models (about 38 GB) takes most of the time;
+It prints six steps (`==> [1/6] Checking this machine` to `==> [6/6]`). It clones the latest published release
+(step 2 names it) and builds it from source (a few minutes; Ferrite ships no prebuilt binaries). Downloading the
+models (about 38 GB) takes most of the time;
 checking them takes about 2 minutes and loading the server about a minute.
 
 **Success** is a final line like

@@ -19,9 +19,21 @@ pub struct Engram {
     pad: i64,
     /// per layer: file and absolute byte offset of the table
     tables: Vec<(std::fs::File, u64)>,
+    /// reader threads for `vectors` (DSC_ENGRAM_THREADS, default 128): they block in pread almost all the time, so the pool size is
+    /// the queue depth the NVMe sees, not a CPU count
+    pool: rayon::ThreadPool,
 }
 
 pub const ROW_BYTES: usize = 144;
+
+/// One 144-byte row at `off` if it is in the page cache: preadv2 with RWF_NOWAIT returns at once, with the row or without it
+/// (EAGAIN, or a short read when the row spans a page that is not cached); false means read it the ordinary way.
+fn read_cached(f: &std::fs::File, buf: &mut [u8; ROW_BYTES], off: u64) -> bool {
+    use std::os::fd::AsRawFd;
+    let iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: ROW_BYTES };
+    let n = unsafe { libc::preadv2(f.as_raw_fd(), &iov, 1, off as libc::off_t, libc::RWF_NOWAIT) };
+    n == ROW_BYTES as isize
+}
 
 impl Engram {
     pub fn new(g: &Gguf, c: &DscConfig) -> Result<Engram> {
@@ -42,8 +54,18 @@ impl Engram {
             tables.push((f, t.offset));
         }
         let pad = c.token_map[c.engram_pad as usize] as i64;
+        let nthreads = std::env::var("DSC_ENGRAM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize).max(1);
+        // the engine thread may be pinned (CpuMoe::set_caller_cpu) and pool threads inherit its mask: give the readers every online CPU
+        let ncpu = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize).min(libc::CPU_SETSIZE as usize);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(nthreads).thread_name(|i| format!("engram-{i}")).start_handler(move |_| unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for cpu in 0..ncpu {
+                libc::CPU_SET(cpu, &mut set);
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }).build()?;
         Ok(Engram { layers: c.engram_layers.clone(), cols, heads: c.heads_per_ngram, ngram: c.ngram, dim: c.ple_dim,
-            mult, primes, offs, map: c.token_map.clone(), pad, tables })
+            mult, primes, offs, map: c.token_map.clone(), pad, tables, pool })
     }
 
     fn comp(&self, id: i64) -> i64 {
@@ -69,6 +91,47 @@ impl Engram {
             }
         }
         out
+    }
+
+    /// The Engram vectors of several rows for every Engram layer at once: `reqs` is (history, position) a row, `out` gets them
+    /// layer-major, [layer][row][cols x dim] f32, the same values as `vector` row by row and layer by layer. The rows' 144-byte
+    /// reads are independent random reads of a 110 GB file (a cold one is one NVMe read, ~70 us; 24 a row and Engram layer), so
+    /// they are all issued together on the reader pool instead of one after another.
+    pub fn vectors(&self, reqs: &[(&[u32], usize)], out: &mut [f32]) -> Result<()> {
+        use rayon::prelude::*;
+        let nl = self.tables.len();
+        ensure!(out.len() == nl * reqs.len() * self.cols * self.dim, "engram vectors: out {} != {} layers x {} rows x {}", out.len(), nl, reqs.len(), self.cols * self.dim);
+        let mut at: Vec<(usize, u64)> = Vec::with_capacity(nl * reqs.len() * self.cols);
+        for li in 0..nl {
+            for &(ids, pos) in reqs {
+                for r in self.hashes(ids, pos, li) {
+                    at.push((li, self.tables[li].1 + r as u64 * ROW_BYTES as u64));
+                }
+            }
+        }
+        // rows already in the page cache are read here, without waiting (preadv2 RWF_NOWAIT: a full row or nothing); only the
+        // others go to the reader pool, so a warm pass costs no thread wake-ups (each one cost more than the whole cached read)
+        let tables = &self.tables;
+        let mut misses: Vec<(&mut [f32], usize, u64)> = vec![];
+        let mut buf = [0u8; ROW_BYTES];
+        for (o, &(li, off)) in out.chunks_mut(self.dim).zip(at.iter()) {
+            if read_cached(&tables[li].0, &mut buf, off) {
+                fe_ggq::refq::dequant(fe_gguf::GgmlType::IQ4NL, &buf, o);
+            } else {
+                misses.push((o, li, off));
+            }
+        }
+        if misses.is_empty() {
+            return Ok(());
+        }
+        self.pool.install(|| {
+            misses.par_iter_mut().with_max_len(1).try_for_each(|(o, li, off)| -> Result<()> {
+                let mut buf = [0u8; ROW_BYTES];
+                tables[*li].0.read_exact_at(&mut buf, *off)?;
+                fe_ggq::refq::dequant(fe_gguf::GgmlType::IQ4NL, &buf, o);
+                Ok(())
+            })
+        })
     }
 
     /// The Engram vector (cols x dim f32, concatenated) of position `pos` for layer index `li`.

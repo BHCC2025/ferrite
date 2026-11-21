@@ -2,14 +2,13 @@
 # Install Ferrite on a DGX Spark and start it: one command from a fresh machine to a running server.
 #
 #   curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
-#   scripts/install.sh [options]        (inside a checkout or an unpacked release: installs and starts that one)
+#   scripts/install.sh [options]        (inside a checkout: installs and starts that one)
 #
 # Each step says what it does and is skipped when it is already done, so running it again continues where it stopped.
 #   1. checks: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, enough free memory, the port
-#   2. Ferrite: this checkout or release folder; otherwise, in $FERRITE_HOME, the latest published release (the
-#      GitHub API names it; FERRITE_VERSION or --version pins one): its tarball with ready-made binaries, or when the
-#      release has none (or --source) a clone of its tag and a source build (rustup, the pinned toolchains through
-#      scripts/check-deps.sh --build --install, cargo build). It says which of the two it does, and why.
+#   2. Ferrite: this checkout; otherwise, in $FERRITE_HOME, the latest published release (the GitHub API names it;
+#      FERRITE_VERSION or --version pins one): a clone of its tag, built from source (rustup, the pinned toolchains
+#      through scripts/check-deps.sh --build --install, cargo build). Ferrite ships no prebuilt binaries.
 #      An older release already in $FERRITE_HOME is upgraded: the old folder is kept as $FERRITE_HOME-<old version>
 #      (a source checkout is moved to the new tag when it has no local changes, else it says why not).
 #   3. the Hugging Face CLI, in ~/.venvs/hf
@@ -22,8 +21,8 @@
 # it, and there is no API key. FERRITE_HOST=127.0.0.1 keeps it on this machine.
 #
 # Options:
-#   --version V    install release V (e.g. 0.8.0) instead of the latest one
-#   --source       build from source even when a release tarball exists
+#   --version V    install release V (e.g. 0.8.1) instead of the latest one
+#   --source       accepted for older instructions: every install builds from source
 #   --no-serve     stop after the models (step 4)
 #   -h, --help     this text
 # Environment:
@@ -31,22 +30,20 @@
 #   FERRITE_MODELS       the model folder [/var/tmp/models]; the other settings of scripts/serve.sh (FERRITE_PORT,
 #                        FERRITE_HOST, FERRITE_CTX, FERRITE_SLOTS, ...) apply to the server it starts
 #   FERRITE_MIN_FREE_GB  memory that must be available before it starts the server [95]
-#   FERRITE_VERSION      the release to install [the latest published release; 0.8.0 when GitHub cannot be asked]
-#   FERRITE_RELEASE_URL  the release tarball [the GitHub release of that version]; its .sha256 is checked
-#   FERRITE_REPO_URL     the repository to clone for a source build [https://github.com/BHCC2025/ferrite.git]
+#   FERRITE_VERSION      the release to install [the latest published release; 0.8.1 when GitHub cannot be asked]
+#   FERRITE_REPO_URL     the repository to clone [https://github.com/BHCC2025/ferrite.git]
 set -euo pipefail
 
 REPO=BHCC2025/ferrite
-DEFAULT_VERSION=0.8.0   # the release this installer comes with: used when GitHub cannot be asked for the latest one
+DEFAULT_VERSION=0.8.1   # the release this installer comes with: used when GitHub cannot be asked for the latest one
 REPO_URL=${FERRITE_REPO_URL:-https://github.com/$REPO.git}
 VERSION=${FERRITE_VERSION:-}
-source_build=0
 serve=1
 while [ $# -gt 0 ]; do
   case $1 in
-    --source) source_build=1 ;;
+    --source) ;;
     --no-serve) serve=0 ;;
-    --version) VERSION=${2:-}; [ -n "$VERSION" ] || { echo "install: --version needs a version (e.g. 0.8.0)" >&2; exit 1; }; shift ;;
+    --version) VERSION=${2:-}; [ -n "$VERSION" ] || { echo "install: --version needs a version (e.g. 0.8.1)" >&2; exit 1; }; shift ;;
     --version=*) VERSION=${1#--version=} ;;
     -h|--help)
       if [ -f "${BASH_SOURCE[0]:-}" ]; then sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
@@ -120,29 +117,10 @@ if [ -z "$VERSION" ]; then
   fi
 fi
 [ -n "$VERSION" ] && say "release $VERSION ($([ $pinned = 1 ] && echo "pinned by FERRITE_VERSION / --version" || echo "the latest published release"))"
-RELEASE_URL=${FERRITE_RELEASE_URL:-https://github.com/$REPO/releases/download/v$VERSION/ferrite-$VERSION-dgx-spark-aarch64.tar.gz}
 
-# fetch: the release tarball into $1, else a clone of the release's tag (or main) for a source build
+# fetch: a clone of the release's tag (or main) into $1, built from source below
 fetch() {
-  local dest=$1 tmp code
-  if [ $source_build = 0 ] && [ -n "$VERSION" ]; then
-    say "downloading the release tarball: $RELEASE_URL"
-    tmp=$(mktemp -d)
-    code=$(curl -sSL -w '%{http_code}' -o "$tmp/r.tar.gz" "$RELEASE_URL" 2>/dev/null || true)
-    if [ "$code" = 200 ] && curl -fsSL -o "$tmp/r.sha256" "$RELEASE_URL.sha256" 2>/dev/null; then
-      [ "$(sha256sum < "$tmp/r.tar.gz" | cut -c1-64)" = "$(cut -c1-64 "$tmp/r.sha256")" ] \
-        || die "the tarball's sha256 does not match $RELEASE_URL.sha256 (a broken download? run this again)"
-      mkdir -p "$dest"
-      tar xzf "$tmp/r.tar.gz" --strip-components=1 -C "$dest"
-      rm -rf "$tmp"
-      say "unpacked into $dest (sha256 checked): ready-made binaries, no build"
-      return 0
-    fi
-    rm -rf "$tmp"
-    say "release $VERSION has no tarball at that address (HTTP ${code:-error}): BUILDING FROM SOURCE instead (a few minutes; needs build-essential)"
-  elif [ $source_build = 1 ]; then
-    say "--source: building from source"
-  fi
+  local dest=$1
   command -v git > /dev/null || need_pkg git git
   if [ -n "$VERSION" ]; then
     say "cloning $REPO_URL at tag v$VERSION into $dest"
@@ -204,6 +182,7 @@ else
 fi
 cd "$root"
 if [ -x bin/fe-server ] && [ ! -f Cargo.toml ]; then
+  # an unpacked release folder from 0.8.0 or earlier (those came with binaries)
   say "release binaries: bin/fe-server, bin/ferrite ($(bin/fe-server --version 2>/dev/null || sed -n 1p BUILD-INFO))"
 else
   say "building from source (the first build takes a few minutes; later runs only check it)"

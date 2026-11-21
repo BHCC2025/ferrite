@@ -91,7 +91,7 @@ so read it as a low-sample point.
 The published figures come from `tools/bench/sweep.sh`, which serves with the defaults above on a test port, runs every
 case and writes `docs/bench-data/` (raw runs and `summary.json`) and the chart's data.
 
-The benchmark clients are in `tools/bench/` (in the release tarball too). With a server running:
+The benchmark clients are in `tools/bench/`. With a server running:
 
 ```bash
 # the whole published sweep against a running server (about 20 minutes), medians in sweep/summary.json

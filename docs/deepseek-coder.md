@@ -19,7 +19,8 @@ How the model is spread over the cards:
   pick counts measured on code, agent sessions, chat and long HTML/JS writes), the most used first. With three cards
   about 1,440 of the 7,680 experts do not fit; they stay in pinned host memory (~11.6 GiB) and are copied to a card
   when a token picks one. With a fourth card all of them are on the cards;
-- the **Engram table** (111 GB) is read a few rows a token from its file, so keep it on an SSD.
+- the **Engram table** (111 GB) is read 48 rows a token from its file, so keep it on an SSD; rows that are not in
+  the page cache yet are read in parallel.
 
 > **Status: experimental.** One model, built from source only, on Linux. Measured on one machine (below). The
 > layout needs three cards of 24 GB; other card mixes are not tested. Reports welcome.
@@ -27,18 +28,23 @@ How the model is spread over the cards:
 ## Results
 
 AMD EPYC 7313 x 2, 128 GB DDR4, three RTX PRO 4000 Blackwell (24 GB, 145 W) on PCIe 4.0 (two x16, one x8), and for
-the four-card column an RTX 5060 Ti 16 GB (x8). `tools/serve-dsc.sh` with its defaults, 128K context configured,
-temperature 0, thinking off, measured at the server: replies of 900 to 1,500 tokens, the second of two runs after a
-short warm-up (the first run after a start is 5-10% slower while the cards warm up).
+the four-card column an RTX 5060 Ti 16 GB (x8). Ferrite 0.8.1, `tools/serve-dsc.sh` with its defaults, 128K context
+configured, temperature 0, thinking off, measured at the server: replies of 900 to 1,500 tokens, the second of two runs
+after a short warm-up.
 
 | tokens/s | Three cards | Four cards |
 |---|---|---|
-| Python | 94 | 109 |
-| Rust | 96 | 115 |
-| HTML / JavaScript | 108 | 130 |
+| Python | 103 | 114 |
+| Rust | 102 | 114 |
+| HTML / JavaScript | 115 | 129 |
 | Chat (prose) | 43 | 69 |
-| Four code requests at once (`FERRITE_SLOTS=4`), total | 116 | 141 |
-| Four requests at once, three code and one chat, total | 96 | 134 |
+| Eight prompts the server has not seen before, first reply each after a start (average) | 87 | 105 |
+| Four code requests at once (`FERRITE_SLOTS=4`), total | 118 | 142 |
+| Four requests at once, three code and one chat, total | 97 | 135 |
+
+- Text the server has not seen before reads its Engram rows from the SSD, not the page cache. Since 0.8.1 those
+  reads are issued together, so such replies run close to repeated ones; with 0.8.0 the same eight prompts averaged 74
+  (three cards) and 88 tokens/s (four cards), with the same text.
 
 - Chat gains most from the fourth card: prose picks far more of the experts that do not fit on three cards.
 - Several requests at once add little on this model. Only the dense part of each pass is shared; every row of every
@@ -75,7 +81,8 @@ tools/serve-dsc.sh
 
 Engine settings (`DSC_*`) pass through; the launcher sets the tested values. Among them: `DSC_RESERVE_GBS` (card
 memory left free per card, GiB: main, expert cards, drafter card), `DSC_HEAT` (the placement heat file),
-`DSC_SPEC=0` (no drafting), `DSC_COPY=0` (no drafts copied from the context).
+`DSC_SPEC=0` (no drafting), `DSC_COPY=0` (no drafts copied from the context), `DSC_ENGRAM_THREADS` (reader threads for
+Engram rows that are not in the page cache, default 128).
 
 ## Behaviour
 

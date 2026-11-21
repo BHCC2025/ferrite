@@ -238,7 +238,7 @@ The design of the engine is written up in [crates/fe-xe/DESIGN.md](../crates/fe-
 - One request at a time by default. With `FERRITE_SLOTS=4` the context is split (81,920 + 3 x 28,672 positions)
   instead of one 128K conversation, and four lanes total about 1.4x one request's speed, not 4x: the drafter still
   runs once a lane.
-- Built from source only; there is no release tarball or installer for this target yet.
+- Built from source; there is no installer for this target yet.
 - The check tools under `crates/fe-kx-tests` and `crates/fe-kxcore` compare the Rust kernels bit for bit with the
   OpenCL kernels of the engine Ferrite's Arc port was developed against. Those reference modules are not in this
   repository, so the tools that need them do not run from a public checkout; the Rust kernels and the engine do not

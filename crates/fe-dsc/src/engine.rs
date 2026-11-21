@@ -1531,12 +1531,15 @@ impl<'a> Engine<'a> {
         memcpy_htod(self.h.ptr(), &h4)?;
         memcpy_htod(self.meta.ptr(), &meta)?;
         let w = c.engram_width();
-        for li in 0..c.engram_layers.len() {
-            for (i, &(lane, pos, _)) in rows.iter().enumerate() {
-                let hist: &[u32] = if lane == self.cur_slot { &self.ids_seen } else { &self.lane_ids[lane] };
-                let v = self.eng.vector(hist, pos, li)?;
-                memcpy_htod(self.evecs[li].ptr().add::<f32>(i * w), &v)?;
-            }
+        let nl = c.engram_layers.len();
+        // every row's Engram reads of every Engram layer at once (parallel reads), one upload a layer
+        let mut all = vec![0f32; nl * nr * w];
+        {
+            let reqs: Vec<(&[u32], usize)> = rows.iter().map(|&(lane, pos, _)| (if lane == self.cur_slot { &self.ids_seen[..] } else { &self.lane_ids[lane][..] }, pos)).collect();
+            self.eng.vectors(&reqs, &mut all)?;
+        }
+        for li in 0..nl {
+            memcpy_htod(self.evecs[li].ptr(), &all[li * nr * w..(li + 1) * nr * w])?;
         }
         let pos_max = rows.iter().map(|r| r.1).max().unwrap();
         let lr = (|| -> Result<()> {
@@ -1873,11 +1876,15 @@ impl<'a> Engine<'a> {
         memcpy_htod(self.meta.ptr(), &meta)?;
         let t_e = Instant::now();
         let w = c.engram_width();
-        for li in 0..c.engram_layers.len() {
-            for i in 0..nr {
-                let v = self.eng.vector(&self.ids_seen, pos0 + i, li)?;
-                memcpy_htod(self.evecs[li].ptr().add::<f32>(i * w), &v)?;
-            }
+        let nl = c.engram_layers.len();
+        // every row's Engram reads of every Engram layer at once (parallel reads), one upload a layer
+        let mut all = vec![0f32; nl * nr * w];
+        {
+            let reqs: Vec<(&[u32], usize)> = (0..nr).map(|i| (&self.ids_seen[..], pos0 + i)).collect();
+            self.eng.vectors(&reqs, &mut all)?;
+        }
+        for li in 0..nl {
+            memcpy_htod(self.evecs[li].ptr(), &all[li * nr * w..(li + 1) * nr * w])?;
         }
         self.split.engram_ms += t_e.elapsed().as_secs_f64() * 1e3;
         Ok(())
