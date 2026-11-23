@@ -16,6 +16,10 @@ A mixed-precision quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen
 the weight format of [Ferrite](https://github.com/BHCC2025/ferrite)'s engine for the **Intel Arc Pro B70** (32 GB).
 It averages **5.0 bits per weight (29 GB with the BF16 embedding)**; each tensor has its own width (4, 5, 6 or 8 bits).
 
+> **No longer maintained.** The Arc Pro B70 this quant was made and measured on is no longer available to the Ferrite
+> project. Ferrite's Arc engine was last built and run on the card with Ferrite 0.7.1 (2026-11-19); later versions are
+> not tested on it. The files stay available unchanged. If a later version does not work, use Ferrite's `v0.7.1` tag.
+
 XQ is decoded directly by GPU kernels: grouped integer codes with fp16 scales per 128 inputs, after a Hadamard
 rotation of the inputs. It is meant for one engine, Ferrite; it does not load in transformers, llama.cpp or
 exllamav3.
@@ -31,7 +35,7 @@ exllamav3.
 | Size | 30.3 GB on disk, of which 1.3 GB is the optional MTP draft head `dhead_q8.bin` |
 | Accuracy | KL vs BF16 with Ferrite's default int8 prompt path: code 0.0061, prose 0.0114, chat 0.0065, 16K context 0.0055, 120K context 0.0037 (fp16 prompt path: 0.0054 / 0.0105 / 0.0057 / 0.0048 / 0.0033) |
 | Context | measured to 120K tokens (Ferrite serves 128K on the 32 GB card) |
-| Runs on | Ferrite on an Intel Arc Pro B70 |
+| Runs on | Ferrite on an Intel Arc Pro B70 (no longer tested; last run with Ferrite 0.7.1) |
 | License | Apache-2.0, inherited from the base model |
 
 ## Accuracy

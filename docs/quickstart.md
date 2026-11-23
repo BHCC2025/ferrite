@@ -11,7 +11,7 @@ other setup has its own page:
 |---|---|---|
 | RTX 5080 or RTX 5060 Ti (16 GB) | Qwen3.8-27B | [rtx-5080.md](rtx-5080.md) |
 | RTX PRO 4000 Blackwell (24 GB) | Qwen3.8-27B | [rtx-pro-4000.md](rtx-pro-4000.md) |
-| Intel Arc Pro B70 (32 GB) | Qwen3.8-27B | [arc-b70.md](arc-b70.md) |
+| Intel Arc Pro B70 (32 GB), no longer maintained | Qwen3.8-27B | [arc-b70.md](arc-b70.md) |
 | One or two RTX 5060 Ti (16 GB) | Qwen3.8-Flash-Next | [flash-next.md](flash-next.md) |
 | Three or four cards (24 GB each, an optional 16 GB) | DeepSeek-V4.1-Flash Coder | [deepseek-coder.md](deepseek-coder.md) |
 | One RTX PRO 4000 Blackwell or RTX 5060 Ti | Inkling-2-Mini | [inkling-2-mini.md](inkling-2-mini.md) |
@@ -56,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
    available memory (`FERRITE_MIN_FREE_GB`), and that the port is free or already serves Ferrite;
 2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the latest published release, which it asks the GitHub API for
-   (`FERRITE_VERSION=0.9.2` or `--version 0.9.2` pins one), built from source: a clone of the release's tag,
+   (`FERRITE_VERSION=0.9.3` or `--version 0.9.3` pins one), built from source: a clone of the release's tag,
    rustup, the pinned toolchains and `cargo build` (a few minutes the first time). Run inside a checkout, it uses
    that folder instead. Ferrite ships no prebuilt binaries;
 3. installs the Hugging Face CLI into `~/.venvs/hf`;

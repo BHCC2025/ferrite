@@ -13,9 +13,15 @@ OpenAI-compatible API, with a 128K context.
 The terms used on this page are explained in the README:
 [Words used in these docs](../README.md#words-used-in-these-docs).
 
-> **Status: experimental.** One model and one card, built from source only. By default one request runs at a time;
+> **Status: no longer maintained.** The Arc Pro B70 this engine was developed on is no longer available to the project.
+> The engine was last built and run on the card with Ferrite 0.7.1 (2026-11-19), and the speeds on this page were
+> measured with 0.6.0. Later versions are not built or tested on this card, so it may stop working without notice. The
+> code, this page and the [XQ model](model-card-xq.md) stay available as they are. If a later version does not work,
+> use the last tested one: `git checkout v0.7.1`.
+>
+> It was always experimental: one model and one card, built from source only. By default one request runs at a time;
 > `FERRITE_SLOTS=4` serves up to four, and more wait in a queue. It was developed and measured on a single machine.
-> Reports from other B70 machines are welcome.
+> Reports and fixes from other B70 machines are welcome.
 
 ## What you get
 

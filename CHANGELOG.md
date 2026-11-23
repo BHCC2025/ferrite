@@ -4,6 +4,21 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-11-23
+
+### Changed
+
+- **The Intel Arc Pro B70 engine is no longer maintained.** The card it was developed on is no longer available to the project, so
+  the engine is not built or tested on later versions. It was last built and run on the card with 0.7.1; the speeds in its guide
+  were measured with 0.6.0. The code, [docs/arc-b70.md](docs/arc-b70.md) and the XQ model stay available as they are, and the guide
+  names `v0.7.1` as the version to use if a later one does not work. The README table, the quickstart and the XQ model card say
+  the same.
+- **Model cards updated on Hugging Face.** The Qwen3.8-27B EXL3 card lists the RTX PRO 4000 Blackwell (24 GB) among the cards
+  Ferrite runs it on, and two figures now match the repository: KL on two Sparks for code 0.0207 (was 0.0208) and the later-turn
+  time to first token 0.3-1.0 s (was 0.4-1.0 s). The XQ card carries the notice above. `scripts/models.manifest` pins the new
+  revisions of both model repositories; only `README.md` and `sha256sums.txt` changed in them, no weight file.
+- Documentation only. No engine code and no measured figure changed. Version 0.9.3.
+
 ## [0.9.2] - 2026-11-23
 
 ### Changed

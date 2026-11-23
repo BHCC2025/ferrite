@@ -18,8 +18,8 @@ tensor gets its own width (2, 3 or 4 bits) based on how sensitive it is. The res
 3.0 bpw on every test set while reading fewer bytes per token**.
 
 It was built as the decode model of [Ferrite](https://github.com/BHCC2025/ferrite), a Rust inference engine for
-Qwen3.8-27B on NVIDIA DGX Spark and on a 16 GB RTX 5080 or RTX 5060 Ti, and it also runs unchanged in exllamav3 and
-TabbyAPI.
+Qwen3.8-27B on NVIDIA DGX Spark, on a 16 GB RTX 5080 or RTX 5060 Ti and on a 24 GB RTX PRO 4000 Blackwell, and it
+also runs unchanged in exllamav3 and TabbyAPI.
 
 ## At a glance
 
@@ -32,14 +32,14 @@ TabbyAPI.
 | Memory read per token | 9.98 GB (uniform 3.0 bpw: 10.14 GB) |
 | Accuracy | KL vs BF16 is 0.86-0.93x that of uniform 3.0 bpw on all five test sets |
 | Context | measured to 120K tokens (Ferrite serves 128K) |
-| Runs on | Ferrite (DGX Spark, one or two nodes; RTX 5080 / RTX 5060 Ti 16 GB), exllamav3, TabbyAPI |
+| Runs on | Ferrite (DGX Spark, one or two nodes; RTX 5080 / RTX 5060 Ti 16 GB; RTX PRO 4000 Blackwell 24 GB), exllamav3, TabbyAPI |
 | License | Apache-2.0, inherited from the base model |
 
 ## Which engine to use
 
 | Engine | Hardware | Use it for |
 |---|---|---|
-| **[Ferrite](https://github.com/BHCC2025/ferrite)** | NVIDIA DGX Spark (GB10), one or two units; one RTX 5080 or RTX 5060 Ti 16 GB ([guide](https://github.com/BHCC2025/ferrite/blob/main/docs/rtx-5080.md)) | Rust kernels, speculative decoding, a prompt cache for agents, an OpenAI-compatible server, 128K context on a 16 GB card |
+| **[Ferrite](https://github.com/BHCC2025/ferrite)** | NVIDIA DGX Spark (GB10), one or two units; one RTX 5080 or RTX 5060 Ti 16 GB ([guide](https://github.com/BHCC2025/ferrite/blob/main/docs/rtx-5080.md)); one RTX PRO 4000 Blackwell 24 GB ([guide](https://github.com/BHCC2025/ferrite/blob/main/docs/rtx-pro-4000.md)) | Rust kernels, speculative decoding, a prompt cache for agents, an OpenAI-compatible server, 128K context on a 16 GB card |
 | **exllamav3** | NVIDIA GPUs supported by exllamav3 (made and measured on a 16 GB RTX 5080) | Python use, scripts, MTP drafting |
 | **TabbyAPI** | same as exllamav3 | an OpenAI-compatible server on a regular GPU |
 
@@ -81,7 +81,7 @@ BF16 model):
 | Setup | code | text | long16k |
 |---|---|---|---|
 | one DGX Spark, bf16 prompt weights | 0.0218 | 0.0466 | 0.025 |
-| two DGX Sparks, NVFP4 prompt weights | 0.0208 | 0.0401 | 0.024 |
+| two DGX Sparks, NVFP4 prompt weights | 0.0207 | 0.0401 | 0.024 |
 
 The two harnesses differ, so compare numbers within a table, not across tables. Ferrite's speculative decoding is
 lossless (greedy output is token-for-token identical to plain decoding), and its prompt cache is exact (a resumed
@@ -120,7 +120,7 @@ Measured 2026-11-15 with Ferrite 0.6.1 (`tools/bench/sweep.sh` on two Sparks; th
 |---|---|---|
 | prompt tokens processed | -84% | -86% |
 | time to first token, first turn | 14.7 -> 5.0 s | 14.3 -> 4.6 s |
-| time to first token, later turns | 9.6-10.2 -> 0.4-1.0 s | 7.4-11.2 -> ~0.4 s |
+| time to first token, later turns | 9.6-10.2 -> 0.3-1.0 s | 7.4-11.2 -> ~0.4 s |
 | combined output | 33.8 -> 101 tok/s | 41.1 -> 113 tok/s |
 
 (`tools/bench/agents.py --agents 4` on two Sparks, 2026-11-14.)
