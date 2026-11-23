@@ -17,6 +17,8 @@ const TEMPLATE_NAME: &str = "chat_template";
 pub struct ChatTemplate {
     /// The template writes DeepSeek DSML tool calls (`<｜DSML｜ calls>`)
     pub dsml: bool,
+    /// The template writes Inkling-2 typed messages (`<|content_thinking|>`, `<|content_invoke_tool_json|>`): the reply is read by `crate::inkling`
+    pub inkling: bool,
     env: Environment<'static>,
     /// Special-token variables HF passes to every render (`bos_token`, `eos_token`, ...).
     special_tokens: Map<String, Json>,
@@ -49,6 +51,9 @@ impl ChatTemplate {
     }
 
     pub fn from_source(source: String, special_tokens: Map<String, Json>) -> Result<Self> {
+        // HF training-mask tags (`{% generation %}`): they only mark the assistant spans for loss masks and render nothing
+        let source = ["{%- generation -%}", "{%- endgeneration -%}", "{% generation %}", "{% endgeneration %}"]
+            .iter().fold(source, |s, t| s.replace(t, ""));
         let mut env = Environment::new();
         let syntax = minijinja::syntax::SyntaxConfig::builder()
             .trim_blocks(true)
@@ -62,8 +67,9 @@ impl ChatTemplate {
         env.add_filter("tojson", tojson);
         env.add_function("strftime_now", strftime_now);
         let dsml = source.contains("｜DSML｜");
+        let inkling = source.contains("<|content_thinking|>") && source.contains("<|content_invoke_tool_json|>");
         env.add_template_owned(TEMPLATE_NAME, source).context("compiling chat template")?;
-        Ok(Self { dsml, env, special_tokens })
+        Ok(Self { dsml, inkling, env, special_tokens })
     }
 
     /// Render a conversation. `messages` / `tools` are OpenAI-format JSON, already normalized
@@ -116,15 +122,31 @@ fn raise_exception(msg: String) -> Result<Value, Error> {
 }
 
 fn tojson(value: &Value, kwargs: Kwargs) -> Result<Value, Error> {
+    // HF's `tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False)` = json.dumps with those arguments
     let indent: Option<usize> = kwargs.get("indent")?;
-    // other json.dumps kwargs (ensure_ascii, separators, sort_keys) are rare in chat templates
-    let _: Option<Value> = kwargs.get("ensure_ascii")?;
-    let _: Option<Value> = kwargs.get("sort_keys")?;
-    let _: Option<Value> = kwargs.get("separators")?;
+    let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
+    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
+    let separators: Option<Value> = kwargs.get("separators")?;
     kwargs.assert_all_used()?;
+    let separators = match separators {
+        Some(v) if !v.is_none() => {
+            let items: Vec<String> = v
+                .try_iter()
+                .map_err(|_| Error::new(ErrorKind::InvalidOperation, "tojson: separators must be a pair of strings"))?
+                .map(|x| x.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "tojson: separators must be a pair of strings"))?;
+            if items.len() != 2 {
+                return Err(Error::new(ErrorKind::InvalidOperation, "tojson: separators must be a pair of strings"));
+            }
+            Some((items[0].clone(), items[1].clone()))
+        }
+        _ => None,
+    };
     let json = serde_json::to_value(value)
         .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
-    Ok(Value::from_safe_string(pyjson::dumps(&json, indent)))
+    let opts = pyjson::Opts { indent, separators, sort_keys: sort_keys.unwrap_or(false), ensure_ascii: ensure_ascii.unwrap_or(false) };
+    Ok(Value::from_safe_string(pyjson::dumps_with(&json, &opts)))
 }
 
 fn strftime_now(fmt: String) -> Result<Value, Error> {

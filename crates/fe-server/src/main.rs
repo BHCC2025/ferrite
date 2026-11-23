@@ -16,7 +16,7 @@ use fe_server::tokenizer::Tok;
 /// `fe-server --version`: the release and the engines this binary was built with
 static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let mut e = vec!["mock"];
-    for (on, name) in [(cfg!(feature = "ferrite"), "ferrite"), (cfg!(feature = "fnext"), "fnext"), (cfg!(feature = "dsc"), "dsc"), (cfg!(feature = "xe"), "xe")] {
+    for (on, name) in [(cfg!(feature = "ferrite"), "ferrite"), (cfg!(feature = "fnext"), "fnext"), (cfg!(feature = "dsc"), "dsc"), (cfg!(feature = "ink"), "ink"), (cfg!(feature = "xe"), "xe")] {
         if on {
             e.push(name);
         }
@@ -119,7 +119,8 @@ async fn serve(args: Args) -> Result<()> {
     }
     let tok = Arc::new(Tok::from_dir(&args.model_dir)?);
     let template = Arc::new(ChatTemplate::from_dir(&args.model_dir)?);
-    let defaults = GenDefaults::from_dir(&args.model_dir, &tok);
+    let mut defaults = GenDefaults::from_dir(&args.model_dir, &tok);
+    defaults.apply_template(&template);
     let engine: Arc<dyn Engine> = if args.mock {
         Arc::new(MockEngine::new(
             tok.clone(),
@@ -133,7 +134,7 @@ async fn serve(args: Args) -> Result<()> {
             },
         ))
     } else {
-        if args.engine == "fake" { fake_engine(&args, &tok)? } else if args.engine == "fnext" { fnext_engine(&args)? } else if args.engine == "dsc" { dsc_engine(&args)? } else if args.engine == "xe" || args.engine == "xe-batch" { xe_engine(&args)? } else { real_engine(&args)? }
+        if args.engine == "fake" { fake_engine(&args, &tok)? } else if args.engine == "fnext" { fnext_engine(&args)? } else if args.engine == "dsc" { dsc_engine(&args)? } else if args.engine == "ink" { ink_engine(&args)? } else if args.engine == "xe" || args.engine == "xe-batch" { xe_engine(&args)? } else { real_engine(&args)? }
     };
     let info = engine.info();
     let cfg = ServerConfig {
@@ -153,7 +154,7 @@ async fn serve(args: Args) -> Result<()> {
     let state = AppState::new(engine, tok, template, cfg);
     let cfg = &state.cfg;
     tracing::info!(
-        "engine {} | model id {} | {} concurrent | context {} | eos {:?} | defaults temp {} top_p {} top_k {}",
+        "engine {} | model id {} | {} concurrent | context {} | eos {:?} | defaults temp {} top_p {} top_k {} max_tokens {:?} effort {:?}",
         info.name,
         cfg.model_id,
         cfg.max_concurrent,
@@ -161,7 +162,9 @@ async fn serve(args: Args) -> Result<()> {
         cfg.defaults.eos_ids,
         cfg.defaults.temperature,
         cfg.defaults.top_p,
-        cfg.defaults.top_k
+        cfg.defaults.top_k,
+        cfg.defaults.default_max_tokens,
+        cfg.defaults.default_reasoning_effort
     );
     // an engine that stops for good (a panic, a lost TP2 peer) takes the process down with a non-zero status, after a
     // moment in which /health and new requests answer 503 with the reason: a launcher or systemd restarts it
@@ -274,6 +277,18 @@ fn dsc_engine(args: &Args) -> Result<Arc<dyn Engine>> {
 #[cfg(not(feature = "dsc"))]
 fn dsc_engine(_: &Args) -> Result<Arc<dyn Engine>> {
     bail!("this fe-server was built without the DeepSeek engine: build with --features dsc")
+}
+
+/// `--engine ink`: Inkling-2-Mini (safetensors in --weights-dir or --model-dir) on the visible card.
+#[cfg(feature = "ink")]
+fn ink_engine(args: &Args) -> Result<Arc<dyn Engine>> {
+    let dir = args.weights_dir.clone().unwrap_or_else(|| args.model_dir.clone());
+    Ok(Arc::new(fe_server::ink::InkEngine::start(dir, args.max_model_len)?))
+}
+
+#[cfg(not(feature = "ink"))]
+fn ink_engine(_: &Args) -> Result<Arc<dyn Engine>> {
+    bail!("this fe-server was built without the Inkling engine: build with --features ink")
 }
 
 /// `--engine fnext`: Qwen3.8-Flash-Next from GGUF (FNEXT_MODEL, FNEXT_COUNTS, FNEXT_THREADS, FNEXT_MTP ...).

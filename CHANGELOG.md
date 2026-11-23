@@ -4,6 +4,40 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-23
+
+### Added
+
+- **A fourth model: Inkling-2-Mini** (Thinking Machines Lab, Apache-2.0; the checkpoint as published, NVFP4 and MXFP8 experts and FP8
+  attention, 20 GB) on **one card**, an RTX PRO 4000 Blackwell (24 GB) or an RTX 5060 Ti (16 GB), with a 128K context on either:
+  `fe-server --engine ink` (`--features ink`), crates `fe-ink` and `fe-inkk`, kernels `k-ink`, `k-inkm` and `k-draft`,
+  [docs/inkling-2-mini.md](docs/inkling-2-mini.md). New `scripts/fetch-inkling.sh` (the files pinned to the tested revision, sizes and
+  sha256 checked), `tools/serve-ink.sh` (the layout comes from the card's memory) and `tools/bench-ink.py`.
+  - The model's own draft head gives lossless speculative decoding: greedy text is the same with it and without it, and the same whatever the
+    prompt chunk, the rows beside a token or the cache state (`ink-run selftest` checks all of it, and a 64K and a 128K prompt).
+  - Both layouts keep a 6-bit K/V cache mapped as the context grows (1.6 GiB at 128K; `INK_KV=bf16` is the opt-out on the 24 GB card). The 24 GB
+    layout keeps the weights as published. The 16 GB layout requantises layers 20-23 to NVFP4 when the model
+    loads, parks the experts that do not fit in pinned host memory (more of them as the context
+    grows, fewer again when a request ends) and keeps the FP8 draft head at every context up to 128K.
+  - Accuracy against the published model (free-running KL on code, prose and a 16K text): 0.004 / 0.008 / 0.009 on the 24 GB layout,
+    0.005 / 0.011 on the 16 GB layout.
+  - One request, temperature 0, draft head on / off: code 138 / 83 tokens/s on the RTX PRO 4000 and 110 / 69 on the RTX 5060 Ti, an agent
+    turn 126 / 83 and 99 / 69, prose 84 / 83 and 69 / 70. A 126K-token prompt prefills at 703 tokens/s on the RTX PRO 4000 and 413 on the RTX
+    5060 Ti and then decodes at 117 and 64 tokens/s with the draft head (60 and 45 without it); 8K, 32K and 64K contexts, the effect of the text on
+    drafting and the bf16 K/V opt-in in [docs/inkling-2-mini.md](docs/inkling-2-mini.md).
+  - The server parses the model's typed replies: reasoning goes to `reasoning_content` and the answer to `content`; tool calls become OpenAI
+    `tool_calls` (through the model's own chat template, byte for byte like the Hugging Face one on 28 conversations, with markup spelled in message
+    text disarmed); stop strings cut at the exact token. Defaults are the publisher's (temperature 1.0, reasoning effort 0.9) with a 32,768-token cap
+    for requests without `max_tokens` (`FE_DEFAULT_TEMPERATURE`, `FE_DEFAULT_REASONING_EFFORT`, `FE_DEFAULT_MAX_TOKENS`); the `inkling-2-mini` profile
+    and four Inkling checks are in `tools/conformance`.
+  - Known gaps: text only (an image in a request is ignored), one request at a time, no prompt cache.
+
+### Changed
+
+- The draft head's fold tables are computed from two tensors of the checkpoint on the first start and kept beside the model.
+- Every engine's chat completion reports `usage.completion_tokens_details.reasoning_tokens` (the tokens inside the reasoning block).
+- `fe-cuda`: `Context::device_id`. Version 0.9.0.
+
 ## [0.8.1] - 2026-11-21
 
 ### Fixed

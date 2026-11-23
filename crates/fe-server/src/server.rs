@@ -36,6 +36,11 @@ pub struct GenDefaults {
     pub repetition_penalty: f32,
     pub eos_ids: Vec<u32>,
     pub phase: PhaseDefaults,
+    /// max_tokens for a request that sends none (FE_DEFAULT_MAX_TOKENS, 0 = no cap; the Inkling template gets 32768 unless the env says otherwise, see
+    /// `apply_template`): the model card advises limiting output because reasoning can loop; the context's end is the only other limit
+    pub default_max_tokens: Option<usize>,
+    /// reasoning effort for a request that sends none (FE_DEFAULT_REASONING_EFFORT: a name or a number; Inkling template only); unset = the template's own 0.9
+    pub default_reasoning_effort: Option<Json>,
 }
 
 /// Reasoning tokens after which the engine closes the block itself when neither sampling.json nor FE_MAX_REASONING_TOKENS says otherwise.
@@ -198,8 +203,15 @@ impl GenDefaults {
             }
         }
         let do_sample = cfg.get("do_sample").and_then(Json::as_bool).unwrap_or(true);
+        // FE_DEFAULT_TEMPERATURE: the temperature of a request that sends none (default: generation_config.json, i.e. the publisher's)
+        let env_temp = std::env::var("FE_DEFAULT_TEMPERATURE").ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|t| t.is_finite() && *t >= 0.0);
+        let default_max_tokens = std::env::var("FE_DEFAULT_MAX_TOKENS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0);
+        let default_reasoning_effort = std::env::var("FE_DEFAULT_REASONING_EFFORT").ok().map(|v| v.trim().to_lowercase()).filter(|v| !v.is_empty())
+            .map(|v| v.parse::<f64>().map(|f| json!(f)).unwrap_or_else(|_| json!(v)));
         Self {
-            temperature: if do_sample { f("temperature", 1.0) } else { 0.0 },
+            default_max_tokens,
+            default_reasoning_effort,
+            temperature: env_temp.unwrap_or(if do_sample { f("temperature", 1.0) } else { 0.0 }),
             top_p: f("top_p", 1.0),
             top_k: cfg.get("top_k").and_then(Json::as_u64).unwrap_or(0) as usize,
             min_p: f("min_p", 0.0),
@@ -209,6 +221,18 @@ impl GenDefaults {
         }
     }
 }
+
+impl GenDefaults {
+    /// Defaults that depend on the chat template: the Inkling model gets a max_tokens cap of 32768 for requests that send none (FE_DEFAULT_MAX_TOKENS
+    /// overrides it, 0 turns it off).
+    pub fn apply_template(&mut self, t: &ChatTemplate) {
+        if t.inkling && self.default_max_tokens.is_none() && std::env::var_os("FE_DEFAULT_MAX_TOKENS").is_none() {
+            self.default_max_tokens = Some(INK_DEFAULT_MAX_TOKENS);
+        }
+    }
+}
+
+pub const INK_DEFAULT_MAX_TOKENS: usize = 32768;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -486,7 +510,9 @@ fn resolve_sampling(
     if requested == Some(0) {
         return Err(ApiError::bad_request("max_tokens must be at least 1"));
     }
-    let max_tokens = requested.or(default_max).unwrap_or(room).min(room);
+    let cap = requested.is_none().then(|| default_max.or(s.cfg.defaults.default_max_tokens)).flatten();
+    let max_tokens = requested.or(cap).unwrap_or(room).min(room);
+    let max_from = if requested.is_some() { "client" } else if cap.is_some() { "default" } else { "context" };
     if let Some(t) = r.temperature {
         if !(0.0..=100.0).contains(&t) {
             return Err(ApiError::bad_request("temperature must be >= 0"));
@@ -566,7 +592,9 @@ fn resolve_sampling(
         stop_token_ids: stop_ids,
         ..Default::default()
     };
+    from.insert("max_tokens".to_string(), json!(max_from));
     let effective = json!({
+        "max_tokens": max_tokens,
         "mode": match thinking { Some(true) => "thinking", Some(false) => "non_thinking", None => "none" },
         "temperature": jf(temperature), "top_p": jf(top_p), "top_k": top_k, "min_p": jf(min_p),
         "presence_penalty": jf(presence_penalty), "frequency_penalty": jf(frequency_penalty), "repetition_penalty": jf(repetition_penalty),
@@ -621,12 +649,32 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
     if let Some(on) = req.enable_thinking {
         kwargs.entry("enable_thinking").or_insert(Json::Bool(on));
     }
+    // Inkling-2: the template reads `reasoning_effort` (names none..max, or a number 0..0.99; default 0.9); thinking on / off switches map onto it
+    // (off = "none", which the model card says still reasons a little), and the reply is split by `crate::inkling`, not by a `<think>` convention
+    let ink = s.template.inkling;
+    if ink {
+        let off = matches!(kwargs.get("enable_thinking"), Some(Json::Bool(false)));
+        kwargs.remove("enable_thinking");
+        if !kwargs.contains_key("reasoning_effort") {
+            if let Some(e) = &req.reasoning_effort {
+                let e = e.trim().to_lowercase();
+                let v = e.parse::<f64>().map(|f| json!(f)).unwrap_or_else(|_| json!(e));
+                kwargs.insert("reasoning_effort".into(), v);
+            } else if off {
+                kwargs.insert("reasoning_effort".into(), json!("none"));
+            } else if let Some(d) = &s.cfg.defaults.default_reasoning_effort {
+                // the launcher's default (FE_DEFAULT_REASONING_EFFORT); without one the template's own 0.9 applies
+                kwargs.insert("reasoning_effort".into(), d.clone());
+            }
+        }
+    }
     // tool_choice required / named: the reply IS the call. The generation prompt is prefilled with the call opener (below), which only
     // works outside a reasoning block: such a reply does not think.
     let continue_final = req.continue_final_message.unwrap_or(false);
     let add_gen = req.add_generation_prompt.unwrap_or(true) && !continue_final;
     let offered = ToolSet::from_openai(template_tools.as_deref().unwrap_or(&[]));
     let mut forced: Option<ForcedCall> = match &choice {
+        _ if ink => None,
         _ if template_tools.is_none() || !add_gen => None,
         ToolChoice::Required => {
             // one function offered: that is the call; several: the name is the model's choice among them (constrained below)
@@ -639,7 +687,7 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
     if forced.is_some() {
         kwargs.insert("enable_thinking".into(), Json::Bool(false));
     }
-    if let Some(effort) = &req.reasoning_effort {
+    if let Some(effort) = req.reasoning_effort.as_ref().filter(|_| !ink) {
         match effort.to_lowercase().as_str() {
             "none" => {
                 kwargs.entry("enable_thinking").or_insert(Json::Bool(false));
@@ -655,6 +703,19 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
             _ => {}
         }
     }
+    let mut template_tools = template_tools;
+    if ink {
+        // text in messages and tool definitions must not be able to spell the model's control tokens (see crate::inkling::ESC)
+        let is_markup = |t: &str| s.tok.is_markup(t);
+        for m in messages.iter_mut() {
+            crate::inkling::escape_json(m, &is_markup);
+        }
+        if let Some(ts) = template_tools.as_mut() {
+            for t in ts.iter_mut() {
+                crate::inkling::escape_json(t, &is_markup);
+            }
+        }
+    }
     let mut prompt = s
         .template
         .render(&messages, template_tools.as_deref(), add_gen, &kwargs)
@@ -665,7 +726,11 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
             prompt = t.to_string();
         }
     }
-    let thinking = prompt_opens_thinking(&prompt);
+    let thinking = if ink {
+        !matches!(kwargs.get("reasoning_effort"), Some(Json::String(e)) if e == "none") && !matches!(kwargs.get("reasoning_effort"), Some(Json::Number(n)) if n.as_f64() == Some(0.0))
+    } else {
+        prompt_opens_thinking(&prompt)
+    };
     if thinking {
         // a template that opens a reasoning block regardless: the system hint is all there is
         forced = None;
@@ -677,7 +742,16 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
         let tail: String = prompt.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
         tracing::debug!("rendered prompt ({} chars, thinking {thinking}), tail: {tail:?}", prompt.len());
     }
-    let prompt_ids = s.tok.encode(&prompt).map_err(|e| ApiError::internal(e.to_string()))?;
+    let prompt_ids = if ink && prompt.contains(crate::inkling::ESC) {
+        // pieces: the template's own control tokens are parsed, the disarmed spellings in message text are not
+        let mut ids = Vec::new();
+        for piece in prompt.split(crate::inkling::ESC) {
+            ids.extend(s.tok.encode(piece).map_err(|e| ApiError::internal(e.to_string()))?);
+        }
+        ids
+    } else {
+        s.tok.encode(&prompt).map_err(|e| ApiError::internal(e.to_string()))?
+    };
     let (mut params, stops, include_stop, skip_special, mut effective) = resolve_sampling(s, &req.sampling, prompt_ids.len(), None, Some(thinking))?;
     let ph = &s.cfg.defaults.phase;
     // the loop breaker watches every chat reply (answer and tool-call rules); the reasoning rule and cap need the block's end token
@@ -709,14 +783,18 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
             effective["max_reasoning_tokens"] = json!(ph.max_reasoning);
         }
     }
+    if ink {
+        effective["reasoning_effort"] = kwargs.get("reasoning_effort").cloned().unwrap_or_else(|| json!("template default 0.9"));
+    }
     effective["greedy_floor"] = json!(ph.greedy_floor);
     effective["loop_breaker"] = json!(ph.loop_breaker);
     let parser = ParserConfig {
-        thinking,
+        thinking: thinking && !ink,
         tools: template_tools.as_ref().map(|t| ToolSet::from_openai(t)),
         max_tool_calls: (req.parallel_tool_calls == Some(false)).then_some(1),
         dsml: s.template.dsml,
         forced,
+        inkling: ink,
     };
     let stream = req.stream.unwrap_or(false);
     Ok(Prepared {
@@ -858,6 +936,10 @@ struct Pipeline {
     dec: IncrementalDecoder,
     stop: StopMatcher,
     parser: Option<OutputParser>,
+    /// the Inkling reply markup: its special tokens go to the parser as sentinel characters (`crate::inkling::sentinel`)
+    ink: bool,
+    /// RUST_LOG=fe_server=debug: the raw reply with the markup spelled out, logged at the end
+    trace: Option<String>,
     max_tokens: usize,
     completion_tokens: usize,
     /// Set when the server ends the request itself (stop string or max_tokens).
@@ -876,6 +958,8 @@ impl Pipeline {
             dec: IncrementalDecoder::new(p.skip_special),
             stop: StopMatcher::new(p.stops.clone(), p.include_stop),
             parser: p.parser.clone().map(OutputParser::new),
+            ink: p.parser.as_ref().is_some_and(|c| c.inkling),
+            trace: tracing::enabled!(tracing::Level::DEBUG).then(String::new),
             max_tokens: p.params.max_tokens,
             completion_tokens: 0,
             server_finish: None,
@@ -896,25 +980,62 @@ impl Pipeline {
     }
 
     fn tokens(&mut self, tok: &Tok, ids: &[u32]) -> Result<Vec<Delta>, String> {
-        let mut text = String::new();
+        // token by token: a stop string or max_tokens that lands inside a batch (an accepted speculative-decoding block, a chunk of tokens)
+        // cuts at exactly that token; the tokens after it are neither counted nor parsed
+        let mut deltas = Vec::new();
         for &id in ids {
             if self.completion_tokens >= self.max_tokens {
                 self.server_finish = Some("length");
                 break;
             }
             self.completion_tokens += 1;
-            text.push_str(&self.dec.push(tok, id).map_err(|e| e.to_string())?);
+            let text = match tok.markup(id).and_then(crate::inkling::sentinel).filter(|_| self.ink) {
+                Some(mark) => {
+                    // a reply marker (never part of a character): what is pending is complete, then the marker
+                    let mut t = self.dec.flush(tok).map_err(|e| e.to_string())?;
+                    t.push_str(mark);
+                    t
+                }
+                None => self.dec.push(tok, id).map_err(|e| e.to_string())?,
+            };
+            if let Some(t) = &mut self.trace {
+                for c in text.chars() {
+                    match c {
+                        '\u{E000}' => t.push_str("<|message_model|>"),
+                        '\u{E001}' => t.push_str("<|content_thinking|>"),
+                        '\u{E002}' => t.push_str("<|content_text|>"),
+                        '\u{E003}' => t.push_str("<|content_invoke_tool_json|>"),
+                        '\u{E004}' => t.push_str("<|end_message|>"),
+                        '\u{E005}' => t.push_str("<|content_model_end_sampling|>"),
+                        '\u{E006}' => t.push_str("<|content_other|>"),
+                        c => t.push(c),
+                    }
+                }
+            }
+            let (emit, hit) = self.stop.push(&text);
+            let was = self.parser.as_ref().is_some_and(|p| p.in_reasoning());
+            deltas.extend(self.parse(&emit));
+            if self.parser.as_ref().is_some_and(|p| p.halted()) && self.server_finish.is_none() {
+                self.server_finish = Some("stop");
+                if hit {
+                    break;
+                }
+            }
+            if was || self.parser.as_ref().is_some_and(|p| p.in_reasoning()) {
+                self.reasoning_tokens += 1;
+            }
+            if hit {
+                self.server_finish = Some("stop");
+                break;
+            }
+            if self.server_finish.is_some() {
+                break;
+            }
         }
         if self.completion_tokens >= self.max_tokens && self.server_finish.is_none() {
             self.server_finish = Some("length");
         }
-        let (emit, hit) = self.stop.push(&text);
-        if hit {
-            self.server_finish = Some("stop");
-        }
-        let mut deltas = self.parse(&emit);
         if self.parser.as_ref().is_some_and(|p| p.in_reasoning()) {
-            self.reasoning_tokens += ids.len();
             if self.max_reasoning > 0 && self.reasoning_tokens > self.max_reasoning && self.server_finish.is_none() {
                 // a reasoning runaway (a 48K-token reasoning block with no answer was seen): end the request as length instead of burning the whole budget
                 tracing::warn!("reasoning cap reached ({} tokens): ending the request as length", self.reasoning_tokens);
@@ -948,6 +1069,9 @@ impl Pipeline {
         if let Some(p) = &mut self.parser {
             deltas.extend(p.finish());
         }
+        if let Some(t) = &self.trace {
+            tracing::debug!("raw reply ({} tokens): {t:?}", self.completion_tokens);
+        }
         Ok(deltas)
     }
 
@@ -962,6 +1086,8 @@ impl Pipeline {
 
 struct Outcome {
     finish_reason: &'static str,
+    /// generated tokens that were inside the reasoning block (reported in `usage.completion_tokens_details`; they are part of completion_tokens)
+    reasoning_tokens: usize,
     error: Option<String>,
     completion_tokens: usize,
     cached_prompt_tokens: usize,
@@ -1170,7 +1296,7 @@ impl Driver {
             ),
         }
         self.capture(Some(reason), error.as_deref(), completion_tokens, cached);
-        Outcome { finish_reason: reason, error, completion_tokens, cached_prompt_tokens: cached, timings: None }
+        Outcome { finish_reason: reason, reasoning_tokens: self.pipe.reasoning_tokens, error, completion_tokens, cached_prompt_tokens: cached, timings: None }
     }
 }
 
@@ -1190,6 +1316,7 @@ fn usage(prompt: usize, out: &Outcome) -> Json {
         "completion_tokens": out.completion_tokens,
         "total_tokens": prompt + out.completion_tokens,
         "prompt_tokens_details": {"cached_tokens": out.cached_prompt_tokens},
+        "completion_tokens_details": {"reasoning_tokens": out.reasoning_tokens},
     })
 }
 

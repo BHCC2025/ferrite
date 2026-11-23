@@ -12,6 +12,9 @@ pub struct Tok {
     /// For byte-level BPE (Qwen, GPT-2 style): every id's raw output bytes and whether it is a special
     /// token, so streaming can assemble UTF-8 exactly. `None` for other decoders.
     bytes: Option<ByteTable>,
+    /// special tokens written like `<|name|>`: id -> text (the Inkling reply markup is made of these)
+    markup: HashMap<u32, String>,
+    markup_texts: std::collections::HashSet<String>,
 }
 
 struct ByteTable {
@@ -29,7 +32,14 @@ impl Tok {
             .map_err(|e| anyhow!("loading {}: {e}", path.display()))?;
         let vocab_size = inner.get_vocab_size(true);
         let bytes = byte_table(&inner, vocab_size);
-        Ok(Self { inner, vocab_size, bytes })
+        let markup: HashMap<u32, String> = inner
+            .get_added_tokens_decoder()
+            .into_iter()
+            .filter(|(_, t)| t.special && t.content.starts_with("<|") && t.content.ends_with("|>"))
+            .map(|(id, t)| (id, t.content))
+            .collect();
+        let markup_texts = markup.values().cloned().collect();
+        Ok(Self { inner, vocab_size, bytes, markup, markup_texts })
     }
 
     /// Encode text as the chat template rendered it: special-token strings in the text become their
@@ -45,6 +55,16 @@ impl Tok {
 
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)
+    }
+
+    /// True if `s` is exactly the text of a special token written like `<|name|>`.
+    pub fn is_markup(&self, s: &str) -> bool {
+        self.markup_texts.contains(s)
+    }
+
+    /// The text of a special token written like `<|name|>`.
+    pub fn markup(&self, id: u32) -> Option<&str> {
+        self.markup.get(&id).map(String::as_str)
     }
 
     pub fn vocab_size(&self) -> usize {

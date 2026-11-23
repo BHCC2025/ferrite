@@ -120,6 +120,10 @@ impl Context {
         c.bind()?;
         Ok(c)
     }
+    /// Device ordinal of this context.
+    pub fn device_id(&self) -> i32 {
+        self.dev as i32
+    }
     /// Make this context current on the calling thread (needed once per thread).
     pub fn bind(&self) -> Result<()> {
         cu!(cuCtxSetCurrent(self.ctx))

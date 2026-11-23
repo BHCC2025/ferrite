@@ -119,9 +119,9 @@ Workflow for a real harness failure: turn request capture on, reproduce the fail
 
 ## Profiles
 
-A profile is JSON: model id, tool format (`tool_format`: `dsml` or `qwen`), context size, long-write sizes, the longest allowed silent
+A profile is JSON: model id, tool format (`tool_format`: `dsml`, `qwen` or `inkling`), context size, long-write sizes, the longest allowed silent
 gap, the reasoning cap, cold-prefill sizes, optionally `stop_set_max_tokens`, `argmax_sampling`, `single_stream`, `sampling_profiles`,
-`effective_sampling_header`, `long_write_max_tokens`, `long_write_rounds`, `wander_max_tokens` and `wander_stop_tokens`. Add one file per
+`effective_sampling_header`, `long_write_max_tokens`, `long_write_rounds`, `prompt_cache` (false: `multiturn_cache_8` does not check the cache hit rate), `wander_max_tokens` and `wander_stop_tokens`. Add one file per
 model. Model-specific facts belong there and nowhere else.
 
 ### Tested harness settings
@@ -136,6 +136,13 @@ Settings of the agent harness that go with each profile (what passed the suite e
 * `qwen3.8-flash-next` (Qwen3.8-Flash-Next on Ferrite's Flash-Next engine, two cards, four requests at once): the same protections and
   the same per-mode sampling; tool requests do not think by default. The server on the test machine reports the model id `flashnext`,
   so the runs there add `--model flashnext`.
+
+* `inkling-2-mini` (Inkling-2-Mini on Ferrite's own engine, one card, one stream, drafting with the model's own draft head): typed-message markup
+  with JSON tool calls (`tool_format: inkling`); reasoning in `reasoning_content`; no prompt cache (`prompt_cache: false`), no loop breaker, no
+  forced call opener for `tool_choice`. Run at `--sampling '{"temperature": 0}'`: 45 of 53 quick runs pass, the 8 that do not are the model's own
+  habits (it ends a turn after the announcing sentence in `preamble_then_call` with thinking off, answers `cut_off_call` with a short bash call, and
+  explores with `bash ls` before the first write in the long-write cases); the profile's context is the test server's 32768. Extra scripts next to the
+  suite: `ink_onoff.py` (drafting on vs off, streaming vs not), `ink_api_edge.py`, `ink_long_write.py`.
 
 The harness these were tested with sends `temperature: 0` and aborts a request after 300 s without bytes, so the server must send
 keep-alive comments during queueing and prompt processing (case `liveness_cold_prefill`). The harness-side settings are in

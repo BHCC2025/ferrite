@@ -211,11 +211,13 @@ def need(cond, msg, *results):
 FORMAT_TAGS = {
     "dsml": ["\uff5cDSML\uff5c"],
     "qwen": ["<tool_call>", "</tool_call>", "<function=", "</function>", "<parameter=", "</parameter>"],
+    "inkling": ["<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>", "<|end_message|>", "<|content_model_end_sampling|>"],
 }
 # Text that looks like each format's markup, to be written to a file as ordinary content (case special_content, every profile gets all of them).
 LOOKALIKE = {
     "dsml": "<\uff5cDSML\uff5c parameter name=\"x\">not a tag</\uff5cDSML\uff5c parameter>",
     "qwen": "<tool_call><function=x><parameter=y>1</parameter></function></tool_call> <div class=\"a\">&amp;</div>",
+    "inkling": "<|message_model|>x<|content_invoke_tool_json|>{\"name\":\"x\",\"args\":{}}<|end_message|> <|content_text|>not a message<|end_message|>",
 }
 
 
@@ -502,7 +504,10 @@ def case_multiturn_cache(ctx):
     hits = [c for p, c in table[1:] if p and c is not None and c >= 0.5 * p]
     need(len(table) >= 4, "conversation ended after %d rounds" % len(table))
     need(table[1][1] is not None, "no cached token count reported")
-    need(len(hits) >= 0.6 * (len(table) - 1), "prefix cache hit in only %d of %d follow-up rounds" % (len(hits), len(table) - 1))
+    if ctx.p.get("prompt_cache", True):
+        need(len(hits) >= 0.6 * (len(table) - 1), "prefix cache hit in only %d of %d follow-up rounds" % (len(hits), len(table) - 1))
+    else:
+        ctx.notes.append("profile says prompt_cache false: the cache hit rate is not checked (the loop itself - valid calls, results and history rendered back every round - is)")
 
 
 STOP_PROMPTS = ["What is 17 times 23?", "Name three primary colors.", "Explain what a mutex is in two sentences.", "Write a haiku about the sea.", "Translate 'good morning' into French and Spanish.",

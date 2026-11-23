@@ -32,6 +32,8 @@ pub struct ParserConfig {
     pub dsml: bool,
     /// The prompt ended with a call opener (tool_choice required / named): the output starts inside the call.
     pub forced: Option<ForcedCall>,
+    /// Inkling-2 message markup (`<|message_model|><|content_thinking|>..<|end_message|>`, JSON tool calls): see `crate::inkling`.
+    pub inkling: bool,
 }
 
 /// What the generation prompt was prefilled with to force a tool call (Qwen XML format).
@@ -224,6 +226,8 @@ fn typed_value(raw: &str, types: &[String]) -> serde_json::Value {
 }
 
 pub struct OutputParser {
+    /// the Inkling-2 parser, when the config asks for it (every method below hands over to it)
+    ink: Option<Box<crate::inkling::InklingParser>>,
     inv: Inv,
     /// DSML closing tags met with no call before them: the reply is not a valid tool call (see `malformed`)
     malformed: bool,
@@ -248,6 +252,7 @@ pub struct OutputParser {
 
 impl OutputParser {
     pub fn new(cfg: ParserConfig) -> Self {
+        let ink = cfg.inkling.then(|| Box::new(crate::inkling::InklingParser::new(cfg.tools.clone(), cfg.max_tool_calls)));
         let mut inv = Inv::default();
         let mut pending = Vec::new();
         let mut calls = 0;
@@ -266,6 +271,7 @@ impl OutputParser {
             None => Mode::Content,
         };
         let mut this = Self {
+            ink,
             reopen: !cfg.dsml && cfg.forced == Some(ForcedCall::Any),
             inv,
             pending,
@@ -293,20 +299,37 @@ impl OutputParser {
     /// True when DSML closing tags came with no call (the model wrote its answer as text and then only the end of a call block): the reply is passed
     /// as content, the server marks it so a client can retry.
     pub fn malformed(&self) -> bool {
-        self.malformed
+        match &self.ink {
+            Some(p) => p.malformed(),
+            None => self.malformed,
+        }
     }
 
     /// True while the parser is inside the model's reasoning block.
     pub fn in_reasoning(&self) -> bool {
-        self.mode == Mode::Reasoning
+        match &self.ink {
+            Some(p) => p.in_reasoning(),
+            None => self.mode == Mode::Reasoning,
+        }
+    }
+
+    /// The Inkling parser saw a tool call in a request that offered no tools: the request should end here.
+    pub fn halted(&self) -> bool {
+        self.ink.as_ref().is_some_and(|p| p.halted())
     }
 
     /// Number of tool calls reported so far.
     pub fn tool_calls(&self) -> usize {
-        self.reported_calls
+        match &self.ink {
+            Some(p) => p.tool_calls(),
+            None => self.reported_calls,
+        }
     }
 
     pub fn feed(&mut self, text: &str) -> Vec<Delta> {
+        if let Some(p) = &mut self.ink {
+            return p.feed(text);
+        }
         self.buf.push_str(text);
         let mut out = std::mem::take(&mut self.pending);
         while self.step(&mut out, false) {}
@@ -315,6 +338,9 @@ impl OutputParser {
 
     /// End of output: flush everything held back.
     pub fn finish(&mut self) -> Vec<Delta> {
+        if let Some(p) = &mut self.ink {
+            return p.finish();
+        }
         let mut out = std::mem::take(&mut self.pending);
         while self.step(&mut out, true) {}
         if !self.buf.is_empty() {
@@ -1090,7 +1116,7 @@ mod tests {
     }
 
     fn cfg(thinking: bool, tools_on: bool) -> ParserConfig {
-        ParserConfig { thinking, tools: tools_on.then(tools), max_tool_calls: None, dsml: false, forced: None }
+        ParserConfig { thinking, tools: tools_on.then(tools), max_tool_calls: None, dsml: false, forced: None, inkling: false }
     }
 
     fn call(name: &str, args: serde_json::Value) -> (String, String, String) {
@@ -1212,7 +1238,7 @@ mod tests {
     #[test]
     fn parallel_calls_off_keeps_first() {
         let text = "<tool_call>\n<function=search>\n<parameter=query>\na\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=search>\n<parameter=query>\nb\n</parameter>\n</function>\n</tool_call>";
-        let p = parse(ParserConfig { thinking: false, tools: Some(tools()), max_tool_calls: Some(1), dsml: false, forced: None }, text);
+        let p = parse(ParserConfig { thinking: false, tools: Some(tools()), max_tool_calls: Some(1), dsml: false, forced: None, inkling: false }, text);
         assert_eq!(p.tool_calls, vec![call("search", json!({"query": "a"}))]);
     }
 
@@ -1285,7 +1311,7 @@ mod tests {
     }
 
     fn dcfg() -> ParserConfig {
-        ParserConfig { thinking: false, tools: Some(tools()), max_tool_calls: None, dsml: true, forced: None }
+        ParserConfig { thinking: false, tools: Some(tools()), max_tool_calls: None, dsml: true, forced: None, inkling: false }
     }
 
     fn dcall(name: &str, body: &str) -> String {
@@ -1419,7 +1445,7 @@ mod tests {
     }
 
     fn pcfg() -> ParserConfig {
-        ParserConfig { thinking: false, tools: Some(pi_tools()), max_tool_calls: None, dsml: true, forced: None }
+        ParserConfig { thinking: false, tools: Some(pi_tools()), max_tool_calls: None, dsml: true, forced: None, inkling: false }
     }
 
     fn args_of(p: &Parsed, i: usize) -> serde_json::Value {
@@ -1564,7 +1590,7 @@ mod tests {
     /// DSML, tool_choice required / named: the prompt ended with the calls block opened, the output continues it.
     #[test]
     fn forced_call_openers_dsml() {
-        let base = || ParserConfig { thinking: false, tools: Some(tools()), max_tool_calls: None, dsml: true, forced: None };
+        let base = || ParserConfig { thinking: false, tools: Some(tools()), max_tool_calls: None, dsml: true, forced: None, inkling: false };
         assert_eq!(ForcedCall::Any.opener_for(true), "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"");
         assert_eq!(ForcedCall::Named("get_weather".into()).opener_for(true), "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n");
         let p = parse(ParserConfig { forced: Some(ForcedCall::Any), ..base() }, "get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>");

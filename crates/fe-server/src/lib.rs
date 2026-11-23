@@ -14,6 +14,9 @@ pub mod engine;
 pub mod fnext;
 #[cfg(feature = "ferrite")]
 pub mod ferrite;
+#[cfg(feature = "ink")]
+pub mod ink;
+pub mod inkling;
 pub mod guard;
 pub mod loopdet;
 pub mod mock;

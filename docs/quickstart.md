@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
    available memory (`FERRITE_MIN_FREE_GB`), and that the port is free or already serves Ferrite;
 2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the latest published release, which it asks the GitHub API for
-   (`FERRITE_VERSION=0.8.1` or `--version 0.8.1` pins one), built from source: a clone of the release's tag,
+   (`FERRITE_VERSION=0.9.0` or `--version 0.8.1` pins one), built from source: a clone of the release's tag,
    rustup, the pinned toolchains and `cargo build` (a few minutes the first time). Run inside a checkout, it uses
    that folder instead. Ferrite ships no prebuilt binaries;
 3. installs the Hugging Face CLI into `~/.venvs/hf`;
@@ -272,6 +272,7 @@ none. Set it to build for a card that is not in the build machine:
 | DGX Spark (GB10) | `sm_121a` (the default on aarch64) | `cargo build --release -p fe-server --features ferrite -p fe-cli` |
 | RTX 5080, RTX 5060 Ti, RTX PRO 4000 Blackwell (Qwen3.8-27B) | `sm_120a` | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ferrite -p fe-cli` |
 | RTX 5060 Ti (Qwen3.8-Flash-Next) | `sm_120a` | `FE_KARCH=sm_120a cargo build --release -p fe-server --features fnext` |
+| RTX PRO 4000 Blackwell or RTX 5060 Ti (Inkling-2-Mini) | `sm_120a` | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ink` ([inkling-2-mini.md](inkling-2-mini.md)) |
 | Both RTX engines in one binary | `sm_120a` | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ferrite,fnext -p fe-cli` |
 | Intel Arc Pro B70 | none (SPIR-V) | `cargo build --release --features xe -p fe-server` ([arc-b70.md](arc-b70.md)) |
 

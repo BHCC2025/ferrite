@@ -7,12 +7,27 @@ use serde_json::Value;
 
 /// `json.dumps(v, ensure_ascii=False)` or, with `indent`, `json.dumps(v, ensure_ascii=False, indent=n)`.
 pub fn dumps(v: &Value, indent: Option<usize>) -> String {
+    dumps_with(v, &Opts { indent, ..Opts::default() })
+}
+
+/// The `json.dumps` knobs chat templates use: `indent`, `separators=(item, key)`, `sort_keys`, `ensure_ascii`.
+#[derive(Clone, Debug, Default)]
+pub struct Opts {
+    pub indent: Option<usize>,
+    /// `(item separator, key separator)`; None = Python's default for the indent
+    pub separators: Option<(String, String)>,
+    pub sort_keys: bool,
+    pub ensure_ascii: bool,
+}
+
+pub fn dumps_with(v: &Value, o: &Opts) -> String {
     let mut out = String::new();
-    write_value(&mut out, v, indent, 0);
+    write_value(&mut out, v, o, 0);
     out
 }
 
-fn write_value(out: &mut String, v: &Value, indent: Option<usize>, level: usize) {
+fn write_value(out: &mut String, v: &Value, o: &Opts, level: usize) {
+    let indent = o.indent;
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -25,7 +40,7 @@ fn write_value(out: &mut String, v: &Value, indent: Option<usize>, level: usize)
                 out.push_str(&py_float_repr(n.as_f64().unwrap_or(f64::NAN)));
             }
         }
-        Value::String(s) => write_str(out, s),
+        Value::String(s) => write_str_with(out, s, o.ensure_ascii),
         Value::Array(items) => {
             if items.is_empty() {
                 out.push_str("[]");
@@ -33,8 +48,8 @@ fn write_value(out: &mut String, v: &Value, indent: Option<usize>, level: usize)
             }
             out.push('[');
             for (i, item) in items.iter().enumerate() {
-                sep(out, i, indent, level + 1);
-                write_value(out, item, indent, level + 1);
+                sep(out, i, o, level + 1);
+                write_value(out, item, o, level + 1);
             }
             close(out, indent, level);
             out.push(']');
@@ -45,11 +60,16 @@ fn write_value(out: &mut String, v: &Value, indent: Option<usize>, level: usize)
                 return;
             }
             out.push('{');
-            for (i, (k, item)) in map.iter().enumerate() {
-                sep(out, i, indent, level + 1);
-                write_str(out, k);
-                out.push_str(": ");
-                write_value(out, item, indent, level + 1);
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            if o.sort_keys {
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+            }
+            let key_sep = o.separators.as_ref().map(|s| s.1.as_str()).unwrap_or(": ");
+            for (i, (k, item)) in entries.into_iter().enumerate() {
+                sep(out, i, o, level + 1);
+                write_str_with(out, k, o.ensure_ascii);
+                out.push_str(key_sep);
+                write_value(out, item, o, level + 1);
             }
             close(out, indent, level);
             out.push('}');
@@ -57,16 +77,17 @@ fn write_value(out: &mut String, v: &Value, indent: Option<usize>, level: usize)
     }
 }
 
-fn sep(out: &mut String, i: usize, indent: Option<usize>, level: usize) {
-    match indent {
+fn sep(out: &mut String, i: usize, o: &Opts, level: usize) {
+    let item = |d: &str| o.separators.as_ref().map(|s| s.0.clone()).unwrap_or_else(|| d.to_string());
+    match o.indent {
         None => {
             if i > 0 {
-                out.push_str(", ");
+                out.push_str(&item(", "));
             }
         }
         Some(n) => {
             if i > 0 {
-                out.push(',');
+                out.push_str(&item(","));
             }
             out.push('\n');
             out.extend(std::iter::repeat_n(' ', n * level));
@@ -83,6 +104,11 @@ fn close(out: &mut String, indent: Option<usize>, level: usize) {
 
 /// Python's string escaping with `ensure_ascii=False`.
 pub fn write_str(out: &mut String, s: &str) {
+    write_str_with(out, s, false)
+}
+
+/// Python's string escaping; `ensure_ascii` writes every non-ASCII character as `\uXXXX` (surrogate pairs above the BMP).
+pub fn write_str_with(out: &mut String, s: &str, ensure_ascii: bool) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -94,6 +120,12 @@ pub fn write_str(out: &mut String, s: &str) {
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if ensure_ascii && (c as u32) > 0x7f => {
+                let mut b = [0u16; 2];
+                for u in c.encode_utf16(&mut b) {
+                    out.push_str(&format!("\\u{:04x}", u));
+                }
+            }
             c => out.push(c),
         }
     }

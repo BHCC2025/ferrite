@@ -25,6 +25,7 @@ fe-xe = { path = "../fe-xe", optional = true }
 fe-xdf = { path = "../fe-xdf", optional = true }
 fe-fnext = { path = "../fe-fnext", optional = true }
 fe-dsc = { path = "../fe-dsc", optional = true }
+fe-ink = { path = "../fe-ink", optional = true }
 fe-gguf = { path = "../fe-gguf", optional = true }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = "0.1.19"
@@ -42,6 +43,8 @@ xe-ref = ["xe", "fe-xe/ref-spv"]
 fnext = ["dep:fe-fnext"]
 # --features dsc: DeepSeek-V4.1-Flash Coder (GGUF) through crates/fe-dsc as --engine dsc
 dsc = ["dep:fe-dsc", "dep:fe-gguf"]
+# --features ink: Inkling-2-Mini (safetensors) through crates/fe-ink as --engine ink
+ink = ["dep:fe-ink"]
 
 [dev-dependencies]
 http-body-util = "0.1"

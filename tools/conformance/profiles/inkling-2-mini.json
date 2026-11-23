@@ -1,0 +1,24 @@
+{
+ "model": "inkling-2-mini",
+ "notes": "Inkling-2-Mini (NVFP4 / MXFP8, looped MoE) on Ferrite's own Rust engine (--engine ink), one RTX PRO 4000 Blackwell 24 GB, one request at a time, speculative decoding with the model's own draft head (lossless: greedy output is identical with INK_NODRAFT=1). Typed-message markup: reasoning in <|content_thinking|> messages (-> reasoning_content), tool calls as <|content_invoke_tool_json|> messages with {\"name\":..,\"args\":{..}} (-> tool_calls, arguments streamed as written); reasoning_effort / chat_template_kwargs.enable_thinking map onto the template's reasoning effort (off = 'none', which still reasons a little); tool_choice required / named is a system hint only (no forced opener). No server-side reasoning cap besides the 16384-token backstop (finish_reason length), no loop breaker, default sampling = the model's generation_config (temperature 1.0).",
+ "tool_format": "inkling",
+ "thinking_default_with_tools": true,
+ "context": 32768,
+ "long_write_lines": [
+  1000,
+  2500
+ ],
+ "max_gap_s": 20,
+ "stop_prompts_max_fraction": 0.5,
+ "reasoning_cap_tokens": 16384,
+ "cold_prefill_tokens": [
+  8000,
+  24000
+ ],
+ "single_stream": true,
+ "stop_set_max_tokens": 8192,
+ "effective_sampling_header": "x-sampling-effective",
+ "wander_max_tokens": 8000,
+ "wander_stop_tokens": 3600,
+ "prompt_cache": false
+}

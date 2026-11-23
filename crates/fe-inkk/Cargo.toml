@@ -1,0 +1,16 @@
+[package]
+name = "fe-inkk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Inkling-2-Mini kernels (k-ink) and their host API: native NVFP4 / MXFP8 expert MoE, FP8 dense, activation quantization"
+
+[dependencies]
+fe-cuda.workspace = true
+fe-fp4 = { path = "../fe-fp4" }
+fe-model.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+fe-kbuild.workspace = true
