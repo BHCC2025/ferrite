@@ -4,6 +4,20 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-11-23
+
+### Changed
+
+- **Documentation only: the README says what Ferrite is, what it does and who it is for.** It opens with those three answers
+  (and who it is not for), then one table, "What runs where", with every model, its hardware, a headline speed, the requests it
+  serves at once and its guide. New sections: "What you get", "Build, download, start" (the build, download and launcher command
+  of every setup, and what `scripts/` and `tools/` hold), "Requirements", and "Words used in these docs" (a glossary). The
+  Intel Arc Pro B70 and RTX 5080 sections moved into the table and their guides.
+- The DGX Spark parts are labelled as such: the README quick start, [docs/quickstart.md](docs/quickstart.md) (now with a table of
+  the pages of the other setups), `AGENTS.md` and the project page.
+- Corrected: Ferrite is no longer described as a single-model engine, and the limit of 4 requests at once is stated per setup
+  (Inkling-2-Mini serves one). No engine code and no figure changed. Version 0.9.1.
+
 ## [0.9.0] - 2026-11-23
 
 ### Added

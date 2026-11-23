@@ -4,6 +4,9 @@ Instructions for an AI coding agent asked to install Ferrite and start its serve
 steps in order, run each verification before going on, and when a stop condition applies, stop and ask the human
 instead of working around it.
 
+These steps are for a DGX Spark only. On any other hardware (RTX 5080, RTX 5060 Ti, RTX PRO 4000 Blackwell, Intel
+Arc Pro B70), stop and follow that hardware's guide from the table in [README.md](README.md#what-runs-where).
+
 When you are done, an OpenAI-compatible server answers at `http://<spark>:8000/v1` (and `http://127.0.0.1:8000/v1`
 on the Spark) with the model id `qwen3.8-27b` (Qwen3.8-27B, 128K context, up to 4 requests at once).
 

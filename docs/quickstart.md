@@ -1,11 +1,20 @@
-# Ferrite quickstart
+# Ferrite quickstart (DGX Spark)
 
 Ferrite serves Qwen3.8-27B from a Rust engine (host code and GPU kernels) on NVIDIA DGX Spark, with an
 OpenAI-compatible API: streaming, tool calls, thinking on/off, 128K context, a prompt cache, 4 concurrent streams
 and speculative decoding (DFlash2 or the model's MTP head). It runs on one Spark or on two over the RoCE link.
 
-Ferrite runs on Linux only; macOS and Windows are not supported. This page is for DGX Spark. The other targets have
-their own pages: [rtx-5080.md](rtx-5080.md) and [arc-b70.md](arc-b70.md).
+**This page is for Qwen3.8-27B on DGX Spark.** Ferrite runs on Linux only; macOS and Windows are not supported. Every
+other setup has its own page:
+
+| Your hardware | Model | Page |
+|---|---|---|
+| RTX 5080 or RTX 5060 Ti (16 GB) | Qwen3.8-27B | [rtx-5080.md](rtx-5080.md) |
+| RTX PRO 4000 Blackwell (24 GB) | Qwen3.8-27B | [rtx-pro-4000.md](rtx-pro-4000.md) |
+| Intel Arc Pro B70 (32 GB) | Qwen3.8-27B | [arc-b70.md](arc-b70.md) |
+| One or two RTX 5060 Ti (16 GB) | Qwen3.8-Flash-Next | [flash-next.md](flash-next.md) |
+| Three or four cards (24 GB each, an optional 16 GB) | DeepSeek-V4.1-Flash Coder | [deepseek-coder.md](deepseek-coder.md) |
+| One RTX PRO 4000 Blackwell or RTX 5060 Ti | Inkling-2-Mini | [inkling-2-mini.md](inkling-2-mini.md) |
 
 ## Requirements
 
@@ -31,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
    available memory (`FERRITE_MIN_FREE_GB`), and that the port is free or already serves Ferrite;
 2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the latest published release, which it asks the GitHub API for
-   (`FERRITE_VERSION=0.9.0` or `--version 0.8.1` pins one), built from source: a clone of the release's tag,
+   (`FERRITE_VERSION=0.9.1` or `--version 0.8.1` pins one), built from source: a clone of the release's tag,
    rustup, the pinned toolchains and `cargo build` (a few minutes the first time). Run inside a checkout, it uses
    that folder instead. Ferrite ships no prebuilt binaries;
 3. installs the Hugging Face CLI into `~/.venvs/hf`;

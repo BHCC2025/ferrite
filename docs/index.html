@@ -40,11 +40,14 @@
 <main id="main">
   <div class="hero">
     <div class="wrap">
-      <p class="eyebrow">Inference engine &middot; NVIDIA DGX Spark</p>
+      <p class="eyebrow">Local LLM server &middot; Rust down to the GPU kernels</p>
       <h1>Rust <span class="grad">all the way down.</span></h1>
-      <p class="lead"><strong>Ferrite</strong> is an LLM inference engine for NVIDIA DGX Spark (GB10), written in Rust from the
-        HTTP server down to the GPU kernels. It serves <strong>Qwen3.8-27B</strong> on one Spark or across two connected over
-        RoCE, behind an OpenAI-compatible API with streaming, thinking, tool calls, a prompt cache and 128K context.</p>
+      <p class="lead"><strong>Ferrite</strong> is a local LLM server written in Rust from the HTTP server down to the GPU kernels.
+        It serves <strong>Qwen3.8-27B</strong> on one NVIDIA DGX Spark or across two connected over RoCE, behind an
+        OpenAI-compatible API with streaming, thinking, tool calls, a prompt cache and 128K context. It also runs that
+        model on single RTX and Intel Arc cards, and three more models (Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash Coder,
+        Inkling-2-Mini) on RTX cards:
+        <a href="https://github.com/BHCC2025/ferrite#what-runs-where">what runs where</a>.</p>
       <div class="actions">
         <a class="btn primary" href="#quickstart">Quickstart</a>
         <a class="btn" href="https://github.com/BHCC2025/ferrite">Source on GitHub</a>
@@ -62,9 +65,10 @@
       <figure class="banner">
         <img src="assets/ferrite-banner.png" alt="ferrite: a Rust inference engine, down to the GPU kernels. Qwen3.8-27B on NVIDIA DGX Spark, one or two nodes: 467 tok/s code with 4 streams, 564 tok/s code edits, 128K context, KL 0.021 against BF16.">
       </figure>
-      <p class="note"><strong>Status: experimental.</strong> One model (Qwen3.8-27B), one GPU (GB10, <code>sm_121a</code>).
-        At most 4 requests run at once with DFlash2 drafting; more wait in a queue. It works, but expect rough edges.
-        Issues and measurements from other Sparks are welcome.</p>
+      <p class="note"><strong>Status: experimental.</strong> This page describes the main target, Qwen3.8-27B on DGX Spark (GB10,
+        <code>sm_121a</code>): at most 4 requests run at once with DFlash2 drafting; more wait in a queue. Linux only,
+        built from source, no API key. It works, but expect rough edges. Issues and measurements from other machines are
+        welcome.</p>
     </div>
   </div>
 
@@ -76,8 +80,8 @@
         <p>Ferrite started as an experiment by a <a href="https://github.com/ashhart/TensorFold">TensorFold</a> contributor:
           how far down the stack can Rust go in a real inference engine, all the way into the GPU kernels, and what does it
           cost? Much of what makes Ferrite work was learned from TensorFold and exllamav3 first.</p>
-        <p>If you want a mature engine that serves many models, use TensorFold. Ferrite is a focused, single-model look at
-          the Rust question.</p>
+        <p>If you want a mature engine that serves many models, use TensorFold. Ferrite is a focused look at the Rust
+          question: a few models, each tuned for particular hardware.</p>
       </div>
       <div class="card">
         <h3>What is Rust, and what is not</h3>
