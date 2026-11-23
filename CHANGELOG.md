@@ -4,6 +4,19 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-11-23
+
+### Fixed
+
+- **Inkling-2-Mini no longer stops at the first prompt when its kernels are built with the CUDA 13.0 toolkit, the one a DGX Spark
+  ships.** That toolkit's assembler (ptxas 13.0.88) dropped the upper half of an address in the short-convolution kernel
+  `ink_sconv`, so the first request ended with CUDA error 700. The kernel now computes the row index in 32 bits and widens it once,
+  as it already did for its state array. Addresses and results are the same, and a build with CUDA 13.3 behaves as before. With the
+  fix, `ink-run selftest` passes on a DGX Spark at 1,500, 2,048 and 2,600 tokens and at a depth of 32,768 tokens, with the draft
+  head on equal to off. The DGX Spark is not a documented Inkling-2-Mini target yet; to try it there, start `tools/serve-ink.sh`
+  with `INK_LAYOUT=24gb`, because that system does not report the card's total memory.
+- No measured figure changed. Version 0.9.4.
+
 ## [0.9.3] - 2026-11-23
 
 ### Changed

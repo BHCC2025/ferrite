@@ -77,12 +77,15 @@ pub unsafe extern "ptx-kernel" fn ink_sconv(out: *mut u16, ldo: u32, x: *const u
     const S5: f32 = 2.236068;
     let mut t = 0;
     while t < nt {
-        let xv = bf(*x.add(t as usize * ldx as usize + ch as usize));
+        // 32-bit element index, widened once (as for `state` below): with `t as usize * ld` ptxas 13.0 (V13.0.88, the
+        // DGX Spark toolkit) folds the unrolled `base + ld * 2` into a uniform ULEA without the ULEA.HI.X and drops the
+        // high half of the address (CUDA error 700 on the first prompt); ptxas 13.3 emits it. t * ld < 2^32 here.
+        let xv = bf(*x.add((t * ldx + ch) as usize));
         if spec != 0 {
             *state.add(((3 + t) * c + ch) as usize) = xv;
         }
         let acc = math::fma(w3, xv, math::fma(w2, r2, math::fma(w1, r1, w0 * r0)));
-        *out.add(t as usize * ldo as usize + ch as usize) = tb((acc + xv) / S5);
+        *out.add((t * ldo + ch) as usize) = tb((acc + xv) / S5);
         r0 = r1;
         r1 = r2;
         r2 = xv;
