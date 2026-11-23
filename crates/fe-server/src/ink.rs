@@ -1,5 +1,6 @@
 //! `--engine ink`: Inkling-2-Mini on one NVIDIA card (crates/fe-ink). One engine thread owns the model; requests run one at a
-//! time (max_batch 1). Prompt rows go through the prompt (tensor-core) family in chunks, generated tokens through the decode
+//! time (max_batch 1). A prompt that starts with tokens an earlier request prefilled resumes from the prompt cache (fe_ink::pcache;
+//! INK_PCACHE=0 turns it off) and prefills only the rest. Prompt rows go through the prompt (tensor-core) family in chunks, generated tokens through the decode
 //! graph. Greedy requests take the argmax of the bf16 logits (the final softcap is monotone), sampled ones the softcapped f32
 //! row through `crate::sampler`.
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use fe_ink::engine::Ink;
+use fe_ink::pcache::PCache;
 use fe_ink::sampler::{DevSampler, PenHist};
 use fe_ink::spec::{argmax, rng_next, SampleCfg, Spec};
 
@@ -64,6 +66,13 @@ impl InkEngine {
                 let mut head_failed = head_allowed && spec.is_none();
                 // device sampler for plain (non-drafted) decode: the same distribution code as the draft loop, no host softmax
                 let mut dsamp = DevSampler::new(ink.ctx.clone())?;
+                let mut pc = PCache::new(&ink);
+                if pc.on {
+                    tracing::info!("ink engine: prompt cache on: snapshots of {:.0} MiB in pinned host memory, up to {} ({:.2} GiB, INK_PCACHE_GB), marks at the prompt end and every {} tokens (INK_PCACHE_EVERY); INK_PCACHE=0 turns it off",
+                        pc.snap_bytes() as f64 / 1048576.0, pc.max_snaps, (pc.max_snaps * pc.snap_bytes()) as f64 / 1073741824.0, pc.every);
+                } else {
+                    tracing::info!("ink engine: prompt cache off (INK_PCACHE=0)");
+                }
                 let _ = ready_tx.send(Ok(()));
                 while let Ok(job) = rx.recv() {
                     let need = job.req.prompt_ids.len() + job.req.params.max_tokens;
@@ -73,12 +82,16 @@ impl InkEngine {
                         ink.draft_taps = false;
                         let _ = ink.s.sync();
                         if let Err(e) = ink.reset() { tracing::warn!("ink engine: reset after unloading the head: {e:#}"); }
+                        pc.clear();
                     } else if spec.is_none() && head_allowed && !head_failed && need <= max_head {
                         tracing::info!("ink engine: request of up to {need} tokens: loading the draft head");
                         spec = load_head(&mut ink);
                         head_failed = spec.is_none();
+                        // the cached snapshots carry no draft context: start over
+                        pc.clear();
                     }
-                    run(&mut ink, spec.as_mut(), &mut dsamp, job, chunk);
+                    let _ = chunk;
+                    run(&mut ink, spec.as_mut(), &mut dsamp, &mut pc, job);
                 }
                 Ok(())
             }));
@@ -114,13 +127,13 @@ impl Engine for InkEngine {
     }
 }
 
-fn run(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, job: Job, chunk: usize) {
+fn run(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, pc: &mut PCache, job: Job) {
     let Job { req, sink } = job;
     let p = &req.params;
-    let fin = |reason: FinishReason, t: Option<Timings>| Finish { reason, cached_prompt_tokens: 0, timings: t, events: Default::default() };
+    let fin0 = |reason: FinishReason, t: Option<Timings>| Finish { reason, cached_prompt_tokens: 0, timings: t, events: Default::default() };
     let n = req.prompt_ids.len();
     if n == 0 || n >= ink.cap {
-        return sink.finish(fin(FinishReason::Error(format!("prompt of {n} tokens does not fit the context {}", ink.cap)), None));
+        return sink.finish(fin0(FinishReason::Error(format!("prompt of {n} tokens does not fit the context {}", ink.cap)), None));
     }
     let t0 = Instant::now();
     // speculative decoding for every request except min_tokens (banned stop ids): greedy is bit-identical to plain decode, sampled requests (temperature,
@@ -129,36 +142,45 @@ fn run(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, job: 
     let mut rng: u64 = p.seed.unwrap_or_else(crate::util::random_u64) | 1;
     let cfg = SampleCfg { temperature: p.temperature, top_k: p.top_k as u32, top_p: p.top_p, min_p: p.min_p, rep: p.repetition_penalty, pres: p.presence_penalty,
         freq: p.frequency_penalty };
-    let r = if use_spec { spec.as_mut().unwrap().reset(ink) } else { ink.draft_taps = false; ink.reset() };
-    if let Err(e) = r {
-        return sink.finish(fin(FinishReason::Error(format!("{e:#}")), None));
+    // the draft context is fed by every prefill while the head is loaded and the cache is on (so every snapshot can resume a drafted
+    // request), else only by drafted requests (as before the cache)
+    let feed = use_spec || (pc.on && spec.is_some());
+    let from = match pc.begin(ink, if feed { spec.as_deref_mut() } else { None }, &req.prompt_ids) {
+        Ok(f) => f,
+        Err(e) => return sink.finish(fin0(FinishReason::Error(format!("{e:#}")), None)),
+    };
+    let fin = |reason: FinishReason, t: Option<Timings>| Finish { reason, cached_prompt_tokens: from, timings: t, events: Default::default() };
+    if !feed {
+        ink.draft_taps = false;
     }
-    ink.prompt = true;
-    let mut logits: Vec<u16> = Vec::new();
     if use_spec {
         spec.as_mut().unwrap().begin(cfg, &req.prompt_ids);
-        match spec.as_mut().unwrap().prefill(ink, &req.prompt_ids) {
-            Ok(l) => logits = l,
-            Err(e) => return sink.finish(fin(FinishReason::Error(format!("{e:#}")), None)),
-        }
-    } else {
-        let mut pos = 0;
-        while pos < n {
-            if req.cancel.is_cancelled() || sink.is_closed() {
-                return sink.finish(fin(FinishReason::Cancelled, None));
-            }
-            let t = (n - pos).min(chunk);
-            match ink.forward(&req.prompt_ids[pos..pos + t], 1, None, None) {
-                Ok(l) => logits = l,
-                Err(e) => return sink.finish(fin(FinishReason::Error(format!("{e:#}")), None)),
-            }
-            pos += t;
-            if pos < n {
-                sink.ping();
-            }
-        }
     }
+    let mut first_chunk = true;
+    let stop = || {
+        if req.cancel.is_cancelled() || sink.is_closed() {
+            return true;
+        }
+        if !first_chunk {
+            sink.ping();
+        }
+        first_chunk = false;
+        false
+    };
+    let logits: Vec<u16> = match pc.prefill(ink, if feed { spec.as_deref_mut() } else { None }, &req.prompt_ids, from, stop) {
+        Ok(Some(l)) => l,
+        Ok(None) => return sink.finish(fin(FinishReason::Cancelled, None)),
+        Err(e) => return sink.finish(fin(FinishReason::Error(format!("{e:#}")), None)),
+    };
     let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
+    if pc.on {
+        let st = &pc.last;
+        tracing::info!("ink pcache: {from} of {n} prompt tokens from the cache (common prefix {}, restore {:.1} ms), {} prefilled in {:.0} ms; {} snapshots taken ({:.1} ms), {} held, {:.2} GiB pinned host",
+            st.common, st.restore_ms, n - from, prompt_ms, st.snaps_taken, st.snap_ms, pc.len(), pc.host_bytes() as f64 / 1073741824.0);
+    }
+    if !use_spec {
+        ink.draft_taps = false;
+    }
     let t1 = Instant::now();
     let mut generated = 0usize;
     ink.prompt = false;
@@ -173,7 +195,7 @@ fn run(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, job: 
             // this request's drafting so far (the Spec's stats restart with each request): draft_n = drafted positions verified, draft_n_accepted = accepted ones
             let st = sp.stats.clone();
             let ds = Some(((st.rows - st.passes.min(st.rows)) as u64, st.accepted as u64));
-            let timings = |g: usize| Timings { prompt_n: n, cache_n: 0, prompt_ms, predicted_n: g, predicted_ms: t1.elapsed().as_secs_f64() * 1e3, draft: ds };
+            let timings = |g: usize| Timings { prompt_n: n - from, cache_n: from, prompt_ms, predicted_n: g, predicted_ms: t1.elapsed().as_secs_f64() * 1e3, draft: ds };
             let log_spec = |why: &str| tracing::info!("ink spec ({why}): {} passes, {} tokens ({:.2} a pass), {} drafts accepted of {} verified, {} plain tokens, {} suspensions", st.passes, st.tokens - st.plain_tokens,
                 (st.tokens - st.plain_tokens) as f64 / st.passes.max(1) as f64, st.accepted, st.rows - st.passes.min(st.rows), st.plain_tokens, st.suspensions);
             let mut batch = vec![];
@@ -226,7 +248,7 @@ fn run(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, job: 
         }
     };
     loop {
-        let timings = |g: usize| Timings { prompt_n: n, cache_n: 0, prompt_ms, predicted_n: g, predicted_ms: t1.elapsed().as_secs_f64() * 1e3, draft: None };
+        let timings = |g: usize| Timings { prompt_n: n - from, cache_n: from, prompt_ms, predicted_n: g, predicted_ms: t1.elapsed().as_secs_f64() * 1e3, draft: None };
         if p.stop_token_ids.contains(&tok) {
             return sink.finish(fin(FinishReason::Stop(tok), Some(timings(generated))));
         }

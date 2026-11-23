@@ -4,6 +4,32 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-11-23
+
+### Added
+
+- **Inkling-2-Mini has a prompt cache.** A request whose prompt starts with the text of the previous request resumes there and
+  prefills only the rest, so a chat or agent turn no longer prefills the whole conversation again. On an RTX PRO 4000, an agent
+  conversation of 104,573 tokens takes 131 s to prefill once; each of the next seven turns started its answer after 0.33 to 1.34 s
+  instead of 133 to 139 s, with replies identical to the same server with the cache off. The global layers' K/V stays on the card;
+  the state later rows overwrite is copied to pinned host memory at the prompt end and every 8,192 tokens (172 MiB a copy, up to
+  `INK_PCACHE_GB`, 2 GiB by default). It is on by default; `INK_PCACHE=0` turns it off. It follows one conversation: a different
+  conversation starts over. The server reports the reused tokens as `cached` in its log line and in
+  `usage.prompt_tokens_details.cached_tokens`. Details and limits: [docs/inkling-2-mini.md](docs/inkling-2-mini.md#prompt-cache).
+- `ink-run pcache`, the gate for it: resumed requests against requests prefilled from 0 (chat turns, an identical request, a shorter
+  one, a change at the first token, changes behind the 8,192 and 32,768 marks), greedy and sampled, draft head on and off. They are
+  bit-identical on the 24 GB layout with 6-bit and bf16 K/V and on the 16 GB layout.
+
+### Fixed
+
+- Inkling-2-Mini: the server's log line counted a keep-alive ping sent during a long prefill as the first token, so it could show
+  0.25 s to the first token for a prefill of 131 s. It now reports the first real token.
+
+### Changed
+
+- Cold requests on Inkling-2-Mini: decode speed is unchanged; the first prefill of a conversation is 0.3 to 1.8% slower in the
+  measurement, which is about the run-to-run difference of the previous build. Version 0.9.5.
+
 ## [0.9.4] - 2026-11-23
 
 ### Fixed

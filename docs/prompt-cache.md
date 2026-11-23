@@ -8,7 +8,7 @@ turns it off) and works with DFlash2 drafting, the default.
 **What this page covers.** Qwen3.8-27B on one or two DGX Sparks: the figures, the pool sizes (12 GB on one Spark, 24 GB
 a node on two) and the tests are from there. The RTX 5080 / RTX 5060 Ti preset runs the same cache with an 8 GB pool in
 host memory ([rtx-5080.md](rtx-5080.md)). The other engines have their own pages, which say what they keep between
-requests; Inkling-2-Mini has no prompt cache ([inkling-2-mini.md](inkling-2-mini.md)). Terms such as slot, K/V cache
+requests; Inkling-2-Mini keeps the conversation in progress ([inkling-2-mini.md](inkling-2-mini.md#prompt-cache)). Terms such as slot, K/V cache
 and drafting are in the README's [Words used in these docs](../README.md#words-used-in-these-docs).
 
 ## Results

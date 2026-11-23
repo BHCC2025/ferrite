@@ -168,6 +168,13 @@ impl Spec {
     pub fn reset(&mut self, ink: &mut Ink) -> Result<()> {
         ink.reset()?;
         self.draft.reset(&ink.s)?;
+        self.reset_policy();
+        Ok(())
+    }
+
+    /// The per-request part of [`Spec::reset`] (acceptance estimates, statistics, suspension) without touching the engine or the draft
+    /// context: a request that resumes from a prompt-cache snapshot starts here.
+    pub fn reset_policy(&mut self) {
         self.q = [0.8, 0.75, 0.83, 0.8, 0.75, 0.83, 0.8];
         self.stats = SpecStats::default();
         self.last_ptr = DevPtr(0);
@@ -183,7 +190,12 @@ impl Spec {
         self.acc_ms = 0.0;
         self.acc_n = 0;
         self.spec_rate = 0.0;
-        Ok(())
+    }
+
+    /// The taps of the last processed prompt position (a row of `Ink::dtaps`): the draft head's input for the first pass.
+    pub fn set_last_taps(&mut self, p: DevPtr) {
+        self.last_ptr = p;
+        self.staged = 0;
     }
 
     /// Run prompt rows (any count; chunks of tmax) from position `ink.len`, feeding the draft context. Returns the bf16 logits of the last row.

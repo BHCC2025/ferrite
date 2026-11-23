@@ -11,13 +11,21 @@
 //!                                         free-running KL(reference || engine) and perplexity against reference logits (DIR/NAME/taps.json + taps.bin,
 //!                                         `logprobs_f16` rows of the publisher's reference implementation)
 //!   ink-run fold                          compute (or show) the draft head's fold tables
+//!   ink-run pcache [--ref] [--ngen G] [--modes LIST]
+//!                                         prompt-cache gate: a fixed series of chat-like requests (consecutive turns, an identical request, a
+//!                                         shorter one, divergence at token 0, edits behind the 8,192 / 32,768 marks), each request greedy or
+//!                                         seeded-sampled with the draft head on or off (fixed 3 drafts a pass, no suspension); one line a request
+//!                                         with the hash of the first new position's logits, of the reply and the drafting counts. --ref runs the
+//!                                         same requests with the cache off (each prefilled from 0): the two outputs must be identical
 //!
 //! Options: --model DIR (default INK_DIR, else $FERRITE_MODELS/Inkling-2-Mini), --tmax N prompt rows per forward (default 256; 0 = sized from free
 //! memory). The engine switches of docs/inkling-2-mini.md (INK_G16, INK_KVQ6, ...) apply.
 use anyhow::{bail, Context, Result};
 use fe_ink::cpuref::{bf16_bits, bf16_f32};
 use fe_ink::engine::Ink;
-use fe_ink::spec::{argmax, Spec, EOS};
+use fe_ink::spec::{argmax, rng_next, Spec, EOS};
+use fe_ink::pcache::PCache;
+use fe_ink::sampler::{DevSampler, PenHist};
 use fe_ink::sampler::SampleCfg;
 use fe_ink::*;
 use serde_json::Value;
@@ -139,6 +147,75 @@ fn generate(ink: &mut Ink, spec: Option<&mut Spec>, ids: &[u32], n: usize) -> Re
     }
     out.truncate(n);
     Ok((out, tp, t1.elapsed().as_secs_f64()))
+}
+
+fn fnv16(v: &[u16]) -> u64 {
+    v.iter().flat_map(|x| x.to_le_bytes()).fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+/// One request the way fe-server's ink engine runs it (fe-server/src/ink.rs `run`): prompt cache begin + prefill, then drafted or plain
+/// decode, greedy or sampled. Returns (resume position, hash of the last prompt row's logits, reply, passes, accepted drafts, prefill s).
+#[allow(clippy::too_many_arguments)]
+fn pc_request(ink: &mut Ink, spec: Option<&mut Spec>, dsamp: &mut DevSampler, pc: &mut PCache, prompt: &[u32], sampled: bool, draft: bool,
+    ngen: usize) -> Result<(usize, u64, Vec<u32>, usize, usize, f64)> {
+    let cfg = if sampled { SampleCfg { temperature: 0.8, top_p: 0.95, ..SampleCfg::greedy() } } else { SampleCfg::greedy() };
+    let mut spec = spec;
+    let use_spec = draft && spec.is_some();
+    let feed = use_spec || (pc.on && spec.is_some());
+    let t0 = std::time::Instant::now();
+    let from = pc.begin(ink, if feed { spec.as_deref_mut() } else { None }, prompt)?;
+    if !feed {
+        ink.draft_taps = false;
+    }
+    if use_spec {
+        spec.as_deref_mut().unwrap().begin(cfg, prompt);
+    }
+    let lg = pc.prefill(ink, if feed { spec.as_deref_mut() } else { None }, prompt, from, || false)?.context("prefill stopped")?;
+    ink.s.sync()?;
+    let tp = t0.elapsed().as_secs_f64();
+    ink.prompt = false;
+    if !use_spec {
+        ink.draft_taps = false;
+    }
+    let lgh = fnv16(&lg);
+    let mut rng: u64 = 0x5eed_1234_u64 | 1;
+    let mut out = vec![];
+    let (mut passes, mut acc) = (0, 0);
+    if use_spec {
+        let sp = spec.unwrap();
+        let mut cur = sp.first_token(ink, &lg, &mut rng)?;
+        out.push(cur);
+        while out.len() < ngen && cur != EOS {
+            for t in sp.step(ink, cur, &mut rng)? {
+                out.push(t);
+                cur = t;
+                if t == EOS || out.len() >= ngen {
+                    break;
+                }
+            }
+        }
+        passes = sp.stats.passes;
+        acc = sp.stats.accepted;
+    } else {
+        let mut hist = PenHist::default();
+        hist.begin(&cfg, prompt);
+        let mut tok = if cfg.plain_greedy() {
+            argmax(&lg)
+        } else {
+            let p = dsamp.upload_row(&ink.s, &lg)?;
+            dsamp.sample_one(&ink.s, p, &cfg, &hist, &[], || rng_next(&mut rng))?
+        };
+        loop {
+            out.push(tok);
+            hist.push(tok);
+            if tok == EOS || out.len() >= ngen {
+                break;
+            }
+            let g = ink.decode_argmax(tok)?;
+            tok = if cfg.plain_greedy() { g } else { dsamp.sample_one(&ink.s, ink.logits_ptr(), &cfg, &hist, &[], || rng_next(&mut rng))? };
+        }
+    }
+    Ok((from, lgh, out, passes, acc, tp))
 }
 
 struct Checks {
@@ -381,11 +458,58 @@ fn main() -> Result<()> {
             println!("{set}: n={n} | KL(reference || engine) on {klcnt} logit rows {:.5}, top-1 agrees on {agree}/{klcnt} | perplexity {:.3} (nll {:.4}) | {:.1} s ({:.0} tok/s)",
                 klsum / klcnt.max(1) as f64, (nllsum / nllcnt.max(1) as f64).exp(), nllsum / nllcnt.max(1) as f64, t0.elapsed().as_secs_f64(), n as f64 / t0.elapsed().as_secs_f64());
         }
+        "pcache" => {
+            let ngen: usize = opt("--ngen").map(|s| s.parse().unwrap()).unwrap_or(48);
+            let refm = args.iter().any(|a| a == "--ref");
+            let modes_s = opt("--modes").unwrap_or("greedy-draft,greedy-plain,sampled-draft,sampled-plain".into());
+            let corpus = Corpus::new(&model)?;
+            // the request series: chat-like turns (previous prompt + a "re-rendered reply" + a new message, both from other text)
+            let a = corpus.context(34000, "code");
+            let b = corpus.context(3000, "prose");
+            let other = |off: usize, n: usize| -> Vec<u32> { (0..n).map(|i| corpus.prose[(off + i * 7) % corpus.prose.len()]).collect() };
+            let cat = |x: &[u32], y: &[u32]| -> Vec<u32> { let mut v = x.to_vec(); v.extend_from_slice(y); v };
+            let t1 = a[..3000].to_vec();
+            let t2 = cat(&cat(&t1, &other(11, 180)), &other(5000, 120));
+            let t3 = cat(&cat(&t2, &other(23, 150)), &other(7000, 100));
+            let t3s = t3[..t2.len() + 40].to_vec();
+            let s1 = b[2000..2600].to_vec();
+            let s2 = cat(&s1, &other(900, 300));
+            let d1 = a[..9000].to_vec();
+            let d2 = cat(&a[..8500], &other(1300, 400));
+            let d3 = cat(&d2, &a[9000..9000 + 25000]);
+            let d4 = cat(&d3[..32900], &other(3100, 300));
+            let d5 = cat(&d4, &other(4100, 200));
+            let series: Vec<(&str, Vec<u32>)> = vec![("t1", t1), ("t2", t2), ("t3", t3.clone()), ("t3-same", t3), ("t3-short", t3s), ("s1", s1), ("s2", s2),
+                ("d1", d1), ("d2", d2), ("d3", d3), ("d4", d4), ("d5", d5)];
+            let maxn = series.iter().map(|s| s.1.len()).max().unwrap();
+            let mut ink = Ink::load(&model, 0, maxn + ngen + 64, tmax)?;
+            let mut spec = load_spec(&mut ink, &model)?;
+            spec.fixed = Some(3);
+            spec.suspend = false;
+            let mut dsamp = DevSampler::new(ink.ctx.clone())?;
+            let mut pc = PCache::new(&ink);
+            if refm {
+                pc.on = false;
+            }
+            println!("pcache gate: {} mode, {} K/V, chunk {}, cap {}, snapshot {:.1} MiB, up to {}, marks every {}", if refm { "reference (cache off)" } else { "cache" },
+                if ink.kvq6 { "6-bit" } else { "bf16" }, ink.tmax, ink.cap, pc.snap_bytes() as f64 / 1048576.0, pc.max_snaps, pc.every);
+            for mode in modes_s.split(',') {
+                let sampled = mode.starts_with("sampled");
+                let draft = mode.ends_with("draft");
+                pc.clear();
+                spec.reset(&mut ink)?;
+                for (name, p) in &series {
+                    let (from, lgh, out, passes, acc, tp) = pc_request(&mut ink, Some(&mut spec), &mut dsamp, &mut pc, p, sampled, draft, ngen)?;
+                    println!("PC {mode} {name} n={} lg={lgh:016x} out={:016x} ntok={} passes={passes} acc={acc} | from={from} prefill {:.0} ms restore {:.1} ms snaps {} ({:.1} ms) held {:?}",
+                        p.len(), fnv(&out), out.len(), tp * 1e3, pc.last.restore_ms, pc.last.snaps_taken, pc.last.snap_ms, pc.marks());
+                }
+            }
+        }
         "fold" => {
             let p = fold::ensure(&model)?;
             println!("fold tables: {}", p.display());
         }
-        _ => bail!("usage: ink-run selftest [--n N] [--deep N] | bench [--ctx N] [--gen G] [--kind code|prose] [--draft on|off] | kl --ref DIR --set NAME --ids FILE.u32 | fold   (--model DIR, --tmax N)"),
+        _ => bail!("usage: ink-run selftest [--n N] [--deep N] | bench [--ctx N] [--gen G] [--kind code|prose] [--draft on|off] | kl --ref DIR --set NAME --ids FILE.u32 | pcache [--ref] [--ngen G] [--modes LIST] | fold   (--model DIR, --tmax N)"),
     }
     Ok(())
 }

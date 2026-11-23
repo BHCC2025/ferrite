@@ -191,7 +191,7 @@ Settings of the agent harness that go with each profile (what passed the suite e
   the same protections (reasoning closed at 8192 tokens, the loop breaker, no stop token first, `tool_choice` enforced) and per-mode
   sampling of temperature 1.0 / top-p 0.95 in both modes. No pass count is recorded here for it.
 * `inkling-2-mini` (Inkling-2-Mini on Ferrite's own engine, one card, one stream, drafting with the model's own draft head): typed-message markup
-  with JSON tool calls (`tool_format: inkling`); reasoning in `reasoning_content`; no prompt cache (`prompt_cache: false`), no loop breaker, no
+  with JSON tool calls (`tool_format: inkling`); reasoning in `reasoning_content`; the cache hit rate is not checked (`prompt_cache: false`: the profile was recorded before the engine had its prompt cache), no loop breaker, no
   forced call opener for `tool_choice`. Run at `--sampling '{"temperature": 0}'`: 45 of the 53 runs of the quick tier pass, the 8 that do not are the model's own
   habits (it ends a turn after the announcing sentence in `preamble_then_call` with thinking off, answers `cut_off_call` with a short bash call, and
   explores with `bash ls` before the first write in the long-write cases); the profile's context is the test server's 32768. Extra scripts next to the

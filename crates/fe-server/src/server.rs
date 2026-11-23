@@ -1216,7 +1216,8 @@ impl Driver {
         match ev {
             Some(GenEvent::Tokens(ids)) => {
                 self.t_last = Some(Instant::now());
-                if self.t_first.is_none() {
+                // an empty event is the engine's keep-alive ping during a long prefill, not the first token
+                if self.t_first.is_none() && !ids.is_empty() {
                     self.t_first = self.t_last;
                 }
                 match self.pipe.tokens(&tok, &ids) {

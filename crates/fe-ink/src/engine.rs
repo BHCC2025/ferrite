@@ -262,6 +262,24 @@ fn ring_of(li: usize, cap: usize, tmax: usize) -> usize {
     if is_full(li) { cap } else { (1024 + tmax).min(cap) }
 }
 
+/// Sliding-window rows a prompt-cache snapshot keeps (the window of the sliding layers).
+const SNAP_WIN: usize = 1024;
+/// Bytes of the three conv tails of one application (K, V, attention and MLP convolutions, f32).
+const CONV_SNAP: usize = 3 * (1024 + 1024 + D + D) * 4;
+
+/// Positions [q0, q0 + w) of a ring of `r` rows (row = position % r) as (ring row, host row, rows) segments, host row = position - q0.
+fn ring_segments(q0: usize, w: usize, r: usize) -> Vec<(usize, usize, usize)> {
+    let mut v = vec![];
+    let mut done = 0;
+    while done < w {
+        let row = (q0 + done) % r;
+        let n = (w - done).min(r - row);
+        v.push((row, done, n));
+        done += n;
+    }
+    v
+}
+
 fn at_ptr(p: DevPtr, off: usize) -> DevPtr {
     p.byte_add(off)
 }
@@ -756,6 +774,94 @@ impl Ink {
         self.len = self.len - p + keep;
         self.pending = 0;
         Ok(())
+    }
+
+    /// Bytes of one prompt-cache snapshot of the engine state (see [`Ink::snapshot`]): the sliding layers' K/V window and the conv tails.
+    pub fn snap_bytes(&self) -> usize {
+        let sliding = (0..NAPP).filter(|&i| !is_full(li_of(i))).count();
+        sliding * 2 * SNAP_WIN * 2048 + NAPP * CONV_SNAP
+    }
+
+    /// Copy the state at position `mark` that later rows overwrite into `dst` (pinned host memory, [`Ink::snap_bytes`] bytes): the K/V of
+    /// positions [mark - 1024, mark) of the 40 sliding-layer applications (their rings are reused modulo 1024 + chunk rows) and the three conv
+    /// tails of all 48 applications. The global applications' K/V is indexed by position and only appended to: its rows below `mark` stay
+    /// valid until a forward writes those positions again, so it is not copied. Two cases: no rows pending and mark == len, or the last
+    /// forward was a speculative chunk (its conv inputs kept after the 3 state rows) and mark lies in that chunk [len - pending, len].
+    pub fn snapshot(&self, dst: &mut [u8], mark: usize) -> Result<()> {
+        let c0 = self.len - self.pending;
+        ensure!(mark >= c0 && mark <= self.len && (self.pending > 0 || mark == self.len), "snapshot at {mark}: state at {} with {} pending rows", self.len, self.pending);
+        ensure!(dst.len() >= self.snap_bytes(), "snapshot buffer too small");
+        self.s.sync()?;
+        let row0 = mark - c0;
+        let w = mark.min(SNAP_WIN);
+        let mut off = 0;
+        for (i, a) in self.apps.iter().enumerate() {
+            if is_full(li_of(i)) {
+                continue;
+            }
+            let r = ring_of(li_of(i), self.cap, self.tmax);
+            for b in [&a.k, &a.v] {
+                for (dev_row, host_row, rows) in ring_segments(mark - w, w, r) {
+                    unsafe { self.s.memcpy_dtoh(&mut dst[off + host_row * 2048..off + (host_row + rows) * 2048], b.ptr().byte_add(dev_row * 2048))? };
+                }
+                off += SNAP_WIN * 2048;
+            }
+        }
+        for a in &self.apps {
+            for (b, c) in [(&a.conv_k, 1024usize), (&a.conv_v, 1024), (&a.conv_a, D), (&a.conv_m, D)] {
+                let n = 3 * c * 4;
+                unsafe { self.s.memcpy_dtoh(&mut dst[off..off + n], b.ptr().byte_add(row0 * c * 4))? };
+                off += n;
+            }
+        }
+        self.s.sync()?;
+        Ok(())
+    }
+
+    /// Put back a snapshot taken at `mark` (see [`Ink::snapshot`]): the engine continues at position `mark`. The global K/V rows below
+    /// `mark` must not have been written since the snapshot was taken (the prompt cache keeps that invariant).
+    pub fn restore(&mut self, src: &[u8], mark: usize) -> Result<()> {
+        ensure!(src.len() >= self.snap_bytes(), "snapshot buffer too small");
+        ensure!(mark < self.cap, "snapshot at {mark} beyond the cache {}", self.cap);
+        self.ctx.bind()?;
+        self.s.sync()?;
+        let plant = std::env::var("INK_PCACHE_PLANT").unwrap_or_default();
+        let w = mark.min(SNAP_WIN);
+        let mut off = 0;
+        for (i, a) in self.apps.iter().enumerate() {
+            if is_full(li_of(i)) {
+                continue;
+            }
+            let r = ring_of(li_of(i), self.cap, self.tmax);
+            for b in [&a.k, &a.v] {
+                for (dev_row, host_row, rows) in ring_segments(mark - w, w, r) {
+                    if plant == "ring" && i == 7 {
+                        continue;
+                    }
+                    unsafe { self.s.memcpy_htod(b.ptr().byte_add(dev_row * 2048), &src[off + host_row * 2048..off + (host_row + rows) * 2048])? };
+                }
+                off += SNAP_WIN * 2048;
+            }
+        }
+        for (i, a) in self.apps.iter().enumerate() {
+            for (b, c) in [(&a.conv_k, 1024usize), (&a.conv_v, 1024), (&a.conv_a, D), (&a.conv_m, D)] {
+                let n = 3 * c * 4;
+                if !(plant == "conv" && i == 20 && c == D) {
+                    unsafe { self.s.memcpy_htod(b.ptr(), &src[off..off + n])? };
+                }
+                off += n;
+            }
+        }
+        self.s.sync()?;
+        self.len = mark;
+        self.pending = 0;
+        self.spec = false;
+        Ok(())
+    }
+
+    /// Rows of the last forward still pending (a speculative chunk not yet committed).
+    pub fn pending_rows(&self) -> usize {
+        self.pending
     }
 
     /// Test hook: ink_headclip on one row (`heads` x `dh` bf16) at position `pos` (log scaling on/off).

@@ -7,8 +7,9 @@ with a **128K-token context on either**.
 
 - **Speed:** a short code request runs at 138 tokens/s on the 24 GB card and 110 on the 16 GB card
   ([Results](#results)).
-- **Text only, one request at a time, no prompt cache.** The published model also reads images; this engine does
-  not ([Limits](#limits)).
+- **Text only, one request at a time.** The published model also reads images; this engine does not ([Limits](#limits)).
+- **A prompt cache for the conversation in progress.** A follow-up turn prefills only what is new
+  ([Prompt cache](#prompt-cache)).
 - **It reasons by default.** Reasoning arrives in `reasoning_content`, and the effort setting lowers it without
   switching it off ([Using the server](#using-the-server)).
 
@@ -16,7 +17,7 @@ Terms such as K/V cache, experts, drafting, prefill and KL are explained in
 [Words used in these docs](../README.md#words-used-in-these-docs).
 
 > **Status: experimental.** One model, built from source only, on Linux. Measured on one machine (see Results). Text only,
-> one request at a time, no prompt cache. Reports and measurements from other cards are welcome.
+> one request at a time, with a prompt cache for the conversation in progress. Reports and measurements from other cards are welcome.
 
 ## Requirements
 
@@ -134,6 +135,25 @@ through `tools/serve-ink.sh` with `tools/conformance/ink_settings_bench.py`.)
   temperature 0, 0.7 and 1.0 (drafting does not slow sampled requests). Reasoning and answers about prose-like questions run at the plain speed
   (about 80 tokens/s on this card): the draft head gives no speed-up there.
 
+### Prompt cache
+
+A request whose prompt starts with the text of an earlier request resumes there and prefills only the rest: in a chat or agent session
+every turn repeats the previous prompt, so only the reply and the new message are prefilled. The server reports the reused tokens as
+`cached` in its log line, `usage.prompt_tokens_details.cached_tokens` and `timings.cache_n`.
+
+- **Measured** on an RTX PRO 4000 (draft on, 6-bit K/V, thinking on, tool calls): an agent conversation of 104,573 tokens takes 131 s
+  to prefill once. Each of the next seven turns (105K to 108K tokens, 200 to 616 new tokens each) started its answer after 0.33 to
+  1.34 s instead of 133 to 139 s, with replies identical to the same server with `INK_PCACHE=0`.
+- **What is kept.** The global layers' K/V stays in place on the card. What later rows overwrite (the sliding-window K/V, the
+  short-convolution states and the draft head's sliding layers) is copied to pinned host memory at the prompt end and every 8,192
+  tokens: 172 MiB each, about 7 ms, up to `INK_PCACHE_GB` (2 GiB by default, 11 copies). No card memory is added.
+- **What resumes.** A prompt that changes earlier in the history resumes from the last of those points before the change. A different
+  conversation starts over and replaces the cached one. A reply the model generated is prefilled again when the next request repeats
+  it: only prompt rows are reused.
+- **Same answers.** `ink-run pcache` checks resumed requests against requests prefilled from 0, greedy and sampled, draft head on and
+  off; they are bit-identical.
+- `INK_PCACHE=0` turns it off. The cache is in host memory only and is empty after a restart.
+
 ## Results
 
 **What to expect:** with the draft head on, a short code request runs at 138 tokens/s on the RTX PRO 4000 and 110 on the RTX 5060 Ti; prose
@@ -246,7 +266,9 @@ shipped formats is not bit-equal to the reference and costs a few thousandths of
 ## Limits
 
 - **Text only.** The published model reads images; the engine has no vision tower yet. A request with an image is answered without it (the prompt tells the model that an image was omitted).
-- **One request at a time.** A second request waits in the queue; there are no lanes, and no prompt cache: every request prefills its whole prompt.
+- **One request at a time.** A second request waits in the queue; there are no lanes. The prompt cache follows one conversation: a request
+  that starts with a different text (another conversation) prefills its whole prompt and replaces the cached one
+  (see [Prompt cache](#prompt-cache)).
 - **`tool_choice` is a hint.** `required` or a named function is not enforced. Tool calls follow the model's JSON format; a model that reaches
   for a tool the request did not offer is stopped (see [Using the server](#using-the-server)).
 - **It reasons by default.** `reasoning_effort` or `enable_thinking: false` lowers the reasoning without removing it.
@@ -288,6 +310,9 @@ These are the engine's own settings, its whole interface. The launcher sets them
 | `INK_DRAFT_FP8` (0, 1 or 2) | draft head precision: 0 bf16, 1 FP8 matrices, 2 FP8 matrices and the Markov head's tables [2 on a card under 20 GB, else 0] |
 | `INK_DRAFT_MAX_CTX=n` | the draft head is loaded only for requests of at most n tokens (prompt plus answer) [no limit] |
 | `INK_FOLD=file` | where the draft head's fold tables are kept [`$INK_DIR/fold.safetensors`] |
+| `INK_PCACHE=0` | prompt cache off: every request prefills its whole prompt [on] |
+| `INK_PCACHE_EVERY=n` | prompt-cache marks every n positions besides the prompt end [8192; `0` = the prompt end only] |
+| `INK_PCACHE_GB=x` | pinned host memory for prompt-cache snapshots, 172 MiB each [2: 11 snapshots] |
 | `INK_MEM_LOG`, `INK_SLOT_LOG` | print the card's memory by step while loading; print each expert-residency change |
 
 ## About the model

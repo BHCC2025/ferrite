@@ -48,6 +48,8 @@ pub const NDRAFT: usize = 7;
 
 /// rows of the K/V ring of the sliding draft layers (window 1024 needs 1024)
 const RING: usize = 1024;
+/// Bytes of a draft-context snapshot (two sliding layers, K and V rings of RING rows x 1024 bf16).
+pub const DRAFT_SNAP_BYTES: usize = 2 * 2 * RING * 1024 * 2;
 /// the growing K/V cache of the full draft layer and the RoPE tables grow in steps of this many positions
 const STEP_DEFAULT: usize = 4096;
 /// growth step (positions)
@@ -332,6 +334,51 @@ impl Draft {
     /// Device bytes held by the draft's growing buffers (full-layer K/V + RoPE tables) at the current size.
     pub fn grown_bytes(&self) -> usize {
         self.kv_rows * (2 * 1024 * 2 + 64 * 4 * 2)
+    }
+
+    /// Bytes of one prompt-cache snapshot of the draft context ([`DRAFT_SNAP_BYTES`]).
+    pub fn snap_bytes(&self) -> usize {
+        self.layers.iter().filter(|l| l.ring > 0).count() * 2 * RING * 1024 * 2
+    }
+
+    /// Copy the K/V rings of the sliding draft layers (positions [ctx_len - 1024, ctx_len)) into `dst` (pinned host); returns ctx_len. The full
+    /// draft layer's cache is position-indexed and only appended to, like the target's global K/V.
+    pub fn snapshot(&self, st: &Stream, dst: &mut [u8]) -> Result<usize> {
+        ensure!(dst.len() >= self.snap_bytes(), "draft snapshot buffer too small");
+        st.sync()?;
+        let n = RING * 1024 * 2;
+        let mut off = 0;
+        for l in self.layers.iter().filter(|l| l.ring > 0) {
+            for b in [&l.kcache, &l.vcache] {
+                unsafe { st.memcpy_dtoh(&mut dst[off..off + n], b.ptr())? };
+                off += n;
+            }
+        }
+        st.sync()?;
+        Ok(self.ctx_len)
+    }
+
+    /// Put back a snapshot of the draft context taken at `ctx_len` positions (see [`Draft::snapshot`]).
+    pub fn restore(&mut self, st: &Stream, src: &[u8], ctx_len: usize) -> Result<()> {
+        ensure!(src.len() >= self.snap_bytes(), "draft snapshot buffer too small");
+        ensure!(ctx_len <= self.kv_rows, "draft snapshot at {ctx_len} beyond the grown cache {}", self.kv_rows);
+        st.sync()?;
+        let n = RING * 1024 * 2;
+        let mut off = 0;
+        for l in self.layers.iter().filter(|l| l.ring > 0) {
+            for b in [&l.kcache, &l.vcache] {
+                unsafe { st.memcpy_htod(b.ptr(), &src[off..off + n])? };
+                off += n;
+            }
+        }
+        st.sync()?;
+        self.ctx_len = ctx_len;
+        Ok(())
+    }
+
+    /// Gate control only (INK_PCACHE_PLANT=draft): set the context length without restoring the rings.
+    pub fn restore_len_only(&mut self, ctx_len: usize) {
+        self.ctx_len = ctx_len;
     }
 
     pub fn reset(&mut self, st: &Stream) -> Result<()> {

@@ -6,6 +6,7 @@ pub mod draft;
 pub mod sampler;
 pub mod spec;
 pub mod engine;
+pub mod pcache;
 pub mod fold;
 pub mod weights;
 
