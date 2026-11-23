@@ -17,15 +17,15 @@ not). Licenses and the notices they require are in LICENSE and NOTICE.
 
 ## TensorFold
 
-**[TensorFold](https://github.com/ashhart/TensorFold)** (Apache-2.0 from 0.6.0, MIT before; NOTICE reproduces
-its notice)
+**[TensorFold](https://github.com/ashhart/TensorFold)** (Apache-2.0 from TensorFold 0.6.0, MIT before; NOTICE
+reproduces its notice)
 
 Ferrite grew out of work on TensorFold. TensorFold is the mature engine: a native Zig engine with CUDA and Metal
 backends, many model families, its own drafters and serving stack. Ferrite is a narrow experiment built on one of
 TensorFold's setups, Qwen3.8-27B as an NVFP4 + EXL3 hybrid on two DGX Sparks, to find out how much of it can be
 written in Rust, down to the GPU kernels. Most of what Ferrite does was worked out first, and ran first, in
-TensorFold. The project plan had everyone working on Ferrite read TensorFold's kernels as reference material and
-port ideas from them: `exl3_linear_wc`, `exl3_decode`, `exl3_prompt`, `gdn*`, `qwen35_attn*`, `prefill_attention`,
+TensorFold. Ferrite's authors read TensorFold's kernels as reference material and ported
+ideas from them: `exl3_linear_wc`, `exl3_decode`, `exl3_prompt`, `gdn*`, `qwen35_attn*`, `prefill_attention`,
 `prompt_lt`, `prompt16`, `roce_gather` and `norms*` (all in `zig/kernels/cuda/`). The ones not ported outright
 are tagged "studied" below: read as reference while writing Ferrite's own kernels.
 
@@ -43,7 +43,7 @@ are tagged "studied" below: read as reference while writing Ferrite's own kernel
 | the GDN kernels: `zig/kernels/cuda/gdn.cu`, `gdn_prefill.cu` | studied | read as reference while writing k-core's recurrence and kernels/k-gdn (whose chunked algorithm comes from the papers below) |
 | the attention kernels (`qwen35_attn*.cuh`, `prefill_attention.cu`), the norms (`norms*.cu`), the EXL3 prompt helpers (`exl3_prompt.cuh`) and the Qwen3.5 forward (`zig/src/families/qwen3_5/forward.zig`) | studied | read as reference while writing crates/fe-model and kernels/k-core; the methods are credited below |
 
-**[b12x](https://github.com/local-inference-lab/b12x)** RoCEnante (Apache-2.0; `b12x/comm/roce/`, PRs #295 and
+**[b12x](https://github.com/local-inference-lab/b12x)** RoCEnante, its RoCE transport (Apache-2.0; `b12x/comm/roce/`, PRs #295 and
 #315; NOTICE carries TensorFold's attribution line for it)
 
 - design, through TensorFold's adaptation: the one-shot two-rank RoCE all-gather protocol (a device-resident
@@ -55,11 +55,11 @@ are tagged "studied" below: read as reference while writing Ferrite's own kernel
 | model | license | kind | what Ferrite takes |
 |---|---|---|---|
 | [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), Qwen team, Alibaba Cloud | Apache-2.0 | format, used | The model: its `qwen3_5` architecture (Gated DeltaNet linear attention in 3 of every 4 layers, gated full attention with partial interleaved mRoPE, zero-centred RMSNorm, the MTP layer), tokenizer, chat template and generation config. The BF16 weights are the KL reference and the source of the EXL3 quant. |
-| [Qwen3.8-27B-EXL3-3.0bpw-mix](docs/model-card.md) | Apache-2.0 | used | The decode weights: our quant of the model above, made with exllamav3 (see its card). |
+| [Qwen3.8-27B-EXL3-3.0bpw-mix](docs/model-card.md) | Apache-2.0 | used | The decode weights: the Ferrite authors' quant of the model above, made with exllamav3 (see its card). |
 | [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4), NVIDIA, made with [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) 0.48 | Apache-2.0 | format, used | The prompt-row weights (`FE_PROMPT=fp4`): crates/fe-fp4 reads ModelOpt's layout (NVFP4 e2m1 codes with e4m3 block scales, `weight_scale_2`, `input_scale`; FP8 e4m3 per-tensor scales; `hf_quant_config.json`). Its NVFP4 lm_head is also the DFlash2 draft head. |
 | [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), a mirror of [incoai/Qwen3.8-27B-DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | Apache-2.0 (model card) | format, used | The DFlash2 drafter weights and config (DFlash below). |
-
 | [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), DeepSeek | MIT | format, used | The DeepSeek engine's model: its architecture (compressed sparse attention with the indexer, hyper-connections, the MoE with the shared expert, the Engram table), tokenizer marks, DSML tool-call format and chat template. |
+| [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF), IST Austria DAS Lab, of Qwen3.8-Flash-Next by the Qwen team | Qwen Community License 1.0 for the model; the repository's own terms for the IQ1_M files ([docs/flash-next.md](docs/flash-next.md#license)) | format, used | The Coder quant (GSQ-RCO, IQ1_M) the Flash-Next engine serves, loaded as published. |
 | [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF) and [-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), IST Austria DAS Lab | MIT | format, used | The Coder quant (expert pruning and GSQ-RCO mixed precision, IQ2_XXS) the DeepSeek engine serves, its chat template, and the Engram table. |
 | [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), Unsloth | MIT | format, used | The DSpark draft model (Q8_0) of the DeepSeek engine: crates/fe-dsc draft.rs implements its blocks, Markov head and confidence head. |
 | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), Thinking Machines Lab | Apache-2.0 | format, used | The Inkling engine's model: its architecture (looped layers with block attention residuals, sliding and global attention with a learned relative bias and sinks, short convolutions, the 128-expert MoE with sigmoid routing, the message gates), its NVFP4 / MXFP8 checkpoint and its draft head (`mtp.safetensors`). crates/fe-ink reads the checkpoint directly and implements the math in Rust. |
@@ -142,7 +142,7 @@ Toolchain and system libraries (NON-RUST.md has the reasons):
 - [Rust](https://www.rust-lang.org) nightly and its LLVM `nvptx64-nvidia-cuda` target: every GPU kernel.
 - NVIDIA CUDA 13.0: `ptxas` (build), the driver API `libcuda` (bound directly in crates/fe-cuda), cuBLASLt
   (baseline and opt-in fallback in crates/fe-fp4 only).
-- [NCCL](https://github.com/NVIDIA/nccl) 2.30.4 (dlopen'd): the TP2 collectives above the RoCE path's size.
+- [NCCL](https://github.com/NVIDIA/nccl) 2.30 or newer, tested with 2.32.6 (dlopen'd): the TP2 collectives above the RoCE path's size.
 - [rdma-core](https://github.com/linux-rdma/rdma-core) 50 `libibverbs`: the RoCE queue pairs.
 - PyTorch, exllamav3, vLLM and transformers (Python): test references only, never in the engine.
 

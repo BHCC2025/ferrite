@@ -19,7 +19,7 @@
 #   FERRITE_MODEL_ID  model id reported by /v1/models [deepseek-v4.1-flash-coder]
 #   FERRITE_CTX       context length [131072]
 #   FERRITE_SLOTS     requests at once, 1-4 [1]. One request alone is fastest; 4 gives more in total (code on four
-#                     cards: about 110-130 tok/s alone, about 140 in total over four), see docs/deepseek-coder.md
+#                     cards: about 114-129 tok/s alone, about 140 in total over four), see docs/deepseek-coder.md
 #   FERRITE_BIN       fe-server built with --features dsc [bin/fe-server, else target/release/fe-server]
 #   FERRITE_LOCK_WAIT 1: wait for busy cards instead of failing [0]
 #   DSC_CARDS         3 or 4: how many of the visible cards to use [4 when four are visible, else 3]

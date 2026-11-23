@@ -4,6 +4,30 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-11-23
+
+### Changed
+
+- **Documentation only: every guide now has the same shape and says first what it is, what you need and how to run it.** The guides
+  for the RTX 5080 / RTX 5060 Ti, the RTX PRO 4000 Blackwell, the Intel Arc Pro B70, Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash Coder and
+  Inkling-2-Mini open with a short summary, then requirements, the commands to build, download, start, test and stop, settings,
+  results, limits and troubleshooting; engine notes come last. The RTX PRO 4000 guide stands on its own. [TP2.md](TP2.md) opens with
+  what two-node mode is and how to serve; its development measurements are labelled as such.
+- The README lists one and two DGX Sparks as separate rows, says that Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash Coder are quants
+  made for code, and says which guides report accuracy (for those two it has not been measured). More terms in its glossary.
+- One home for repeated material: the two-node steps in TP2.md, the server settings and the build command of every setup in
+  [docs/quickstart.md](docs/quickstart.md), which also gained "Uninstall" and "Where the log is".
+- Figures are labelled with the release they were measured with where they were not re-measured.
+
+### Fixed
+
+- Commands and statements that disagreed between pages: the Flash-Next and Inkling-2-Mini build commands in the quickstart, the
+  `bin/fe-server` path left from the release packages, the pinned-version example, DFlash2 described as DGX Spark only (the Arc B70
+  uses it), "three rules" for four in the prompt-cache page, the DeepSeek single-request range (114 to 129 tokens/s, as its table
+  says), the later-turn time to first token (0.3 to 1.0 s, as measured), the NCCL version wording.
+- CREDITS.md: the models table rendered only in part; the Qwen3.8-Flash-Next quant is now credited.
+- Launcher messages that named a release package or an incomplete build command. No engine code and no figure changed. Version 0.9.2.
+
 ## [0.9.1] - 2026-11-23
 
 ### Changed

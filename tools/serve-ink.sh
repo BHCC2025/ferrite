@@ -48,7 +48,7 @@ bin=${FERRITE_BIN:-}
 if [ -z "$bin" ]; then
   if [ -x "$root/bin/fe-server" ]; then bin=$root/bin/fe-server; else bin=$root/target/release/fe-server; fi
 fi
-[ -x "$bin" ] || die "no fe-server at $bin (cargo build --release -p fe-server --features ink)"
+[ -x "$bin" ] || die "no fe-server at $bin (cargo build --release -p fe-server --features ink -p fe-ink)"
 
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found (NVIDIA driver)"
 card=$(fl_nvidia_cards | head -n 1)

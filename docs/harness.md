@@ -1,7 +1,13 @@
 # Agent harness settings
 
-A server can pass every API test and a coding session can still hang or fail on the harness side. This page lists
-the harness settings that were tested end to end with Ferrite, and the failure each one prevents.
+A harness is the program that drives the model in a coding session (the agent: it sends the requests and runs the
+tools). A server can pass every API test and a coding session can still hang or fail on the harness side. This page
+lists the harness settings that were tested end to end with Ferrite, and the failure each one prevents.
+
+**What this page covers.** One harness, the Pi coding agent, tested against Qwen3.8-27B. Other clients (Open WebUI,
+Continue, Cline) connect as described in [quickstart.md](quickstart.md#5-point-a-client-at-it) but were not tested
+the way this page describes. The server-side protections at the end apply to more than one model; the list there
+says which.
 
 The API-side checks (tool calls, streaming, stopping, loops, sampling defaults, caching, liveness) are covered by
 the conformance suite in [`tools/conformance`](../tools/conformance/README.md). This page covers what the suite
@@ -30,7 +36,15 @@ Tested with Pi 1.5.2 against `fe-server` (OpenAI-compatible chat completions).
 }
 ```
 
-Set `contextWindow` to the context the server was started with and keep `maxTokens` well below it.
+This is one provider's entry in `~/.pi/agent/models.json`; Pi's own documentation has the layout of the file around
+it. What the fields tell Pi:
+
+- `baseUrl`, `api`: where the server is, and that it speaks OpenAI chat completions;
+- `compat`: Pi's compatibility switches for this server, as tested: no `developer` role, no reasoning-effort field,
+  `supportsFinishReason` off, and thinking switched through the Qwen chat template;
+- `models[].id`: the model id the server reports (`qwen3.8-27b` by default, `FERRITE_MODEL_ID`);
+- `contextWindow`: set it to the context the server was started with (131,072 with the DGX Spark defaults; a
+  launcher that starts with a shorter context says so), and keep `maxTokens` well below it.
 
 ### Shell commands need a time limit
 
@@ -68,26 +82,29 @@ that think and one for replies that do not (the base model's published settings;
 [model-card.md](model-card.md#recommended-settings) and [flash-next.md](flash-next.md#recommended-settings)). A field
 the client sends always wins.
 
-A request that sends `temperature: 0` is decoded greedily, and the server adds no presence, frequency or repetition
-penalty to it (`greedy_keeps_fast_path`, on by default). Such a request keeps the fast greedy path with speculative
-decoding, so Pi needs no extra setting. A penalty that the client sends together with `temperature: 0` still
-applies, and takes the request off that path.
+A request that sends `temperature: 0` is decoded greedily (the most likely token every time), and the server adds
+no presence, frequency or repetition penalty to it (`greedy_keeps_fast_path` in `sampling.json`, on by default).
+That keeps the request on the fast path that works with speculative decoding, so Pi needs no extra setting. If the
+client itself sends a penalty together with `temperature: 0`, the penalty applies and the request leaves the fast
+path.
 
 The values a request ran with are returned in the `x-sampling-effective` response header and written to the server
 log, with the origin of each (client, profile, default, or withheld by the greedy rule).
 
-### Idle timeout
+### Idle timeouts
 
-Pi aborts a request after 300 s without bytes. `fe-server` sends an SSE keep-alive comment (`: keep-alive`) every
-10 s of silence on a streamed reply, from the moment the request is queued, so long prompts and queued requests stay
-alive.
+Two limits work in opposite directions:
 
-The server has a limit of its own in the other direction: a reply that has started and then produces no token for
-60 s is ended with `finish_reason: "length"` (`FE_NO_TOKEN_TIMEOUT`, seconds; `0` turns it off).
+| Who waits | Limit | What happens | What keeps it from firing |
+|---|---|---|---|
+| Pi, for bytes from the server | 300 s | Pi aborts the request | `fe-server` sends an SSE keep-alive comment (`: keep-alive`) every 10 s of silence on a streamed reply, from the moment the request is queued, so long prompts and queued requests stay alive |
+| `fe-server`, for the next token of a reply that has started | 60 s | the reply is ended with `finish_reason: "length"` | `FE_NO_TOKEN_TIMEOUT` sets the seconds; `0` turns it off |
 
 ### What the server does about runaway replies
 
-These apply to every harness, and none of them needs a harness setting:
+These apply whatever the harness, and none of them needs a harness setting. They run on Qwen3.8-27B (every setup),
+Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash Coder; each guide lists its own switches. Inkling-2-Mini differs: its
+`tool_choice` is only a hint to the model, and it has no loop breaker ([inkling-2-mini.md](inkling-2-mini.md)).
 
 - a reasoning block still open after 8,192 tokens is closed by the server and the model answers
   (`FE_MAX_REASONING_TOKENS`);
@@ -102,5 +119,11 @@ conformance suite's `--replay`.
 
 ## Other harnesses
 
-Not tested yet. The same three questions apply to any harness: does a shell command have a default time limit,
-what sampling values does it send, and how long does it wait without bytes before it aborts.
+Not tested yet. Reports are welcome. The same three questions apply to any harness:
+
+- does a shell command have a default time limit;
+- what sampling values does it send;
+- how long does it wait without bytes before it aborts.
+
+The API side of a new harness can be checked with the conformance suite
+([`tools/conformance`](../tools/conformance/README.md)), which can also replay a request the harness sent.

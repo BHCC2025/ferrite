@@ -32,7 +32,7 @@ if [ "$SLOTS" -gt 4 ] && [ "$DRAFT" = dflash ]; then
 fi
 M=$FERRITE_EXL3_DIR
 BIN=bin/fe-server; [ -x $BIN ] || BIN=target/release/fe-server
-[ -x $BIN ] || fl_die "no fe-server at bin/ or target/release/"
+[ -x $BIN ] || fl_die "no fe-server at target/release/ (build it: docs/quickstart.md, Build from source)"
 export FE_BIN=${FE_BIN:-$(dirname $BIN)/ferrite}
 DRY=0
 if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then

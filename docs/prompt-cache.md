@@ -5,11 +5,18 @@ system prompt (rules, tool definitions, project files). Ferrite's prompt cache k
 computed, so those tokens are not processed again. It is on by default in the launch scripts (`FERRITE_CACHE=0`
 turns it off) and works with DFlash2 drafting, the default.
 
+**What this page covers.** Qwen3.8-27B on one or two DGX Sparks: the figures, the pool sizes (12 GB on one Spark, 24 GB
+a node on two) and the tests are from there. The RTX 5080 / RTX 5060 Ti preset runs the same cache with an 8 GB pool in
+host memory ([rtx-5080.md](rtx-5080.md)). The other engines have their own pages, which say what they keep between
+requests; Inkling-2-Mini has no prompt cache ([inkling-2-mini.md](inkling-2-mini.md)). Terms such as slot, K/V cache
+and drafting are in the README's [Words used in these docs](../README.md#words-used-in-these-docs).
+
 ## Results
 
-Four agents at once on two Sparks (`tools/bench/agents.py --agents 4 --seed 1`, and `--think`: a shared ~13K-token
-system prompt, then 2-3 turns each of code, edit and tool-call tasks, greedy), against `tools/serve-tp2.sh` with
-`FERRITE_CACHE=0` and with the default cache on (measured 2026-11-15, Ferrite 0.6.1):
+Four agents at once on two Sparks, measured on 2026-11-15 with Ferrite 0.6.1 and not re-measured since. The agents
+share a ~13K-token system prompt, then each runs 2-3 turns of code, edit and tool-call tasks with greedy decoding
+(`tools/bench/agents.py --agents 4 --seed 1`, run once without and once with `--think`). The server is
+`tools/serve-tp2.sh`, once with `FERRITE_CACHE=0` and once with the default cache on:
 
 | | Cache off | Cache on |
 |---|---|---|
@@ -29,12 +36,13 @@ the previous turn instead of computing the whole history again. `tools/bench/ags
 **Snapshots at turn boundaries.** The server marks the end of the system message and the start of every assistant
 turn (`<|im_start|>assistant\n`). When a prompt chunk ends on one of those points, the slot's state is saved:
 
-- the recurrent state of the 48 Gated DeltaNet layers (about 77 MB per node), which cannot be rewound, so it has to
-  be saved where a later request may resume;
+- the recurrent state of the 48 Gated DeltaNet layers (about 77 MB per node). Most of Qwen3.8's layers are Gated
+  DeltaNet (GDN) layers: each keeps one fixed-size state per request that is updated token by token and cannot be
+  rewound, so it has to be saved where a later request may resume;
 - the DFlash2 drafter's window (about 21 MB);
 - the token ids up to that point.
 
-The attention KV rows stay where they are. A slot keeps its first snapshot and its last two.
+The attention K/V rows stay where they are. A slot keeps its first snapshot and its last two.
 
 **Longest-match resume.** A new request resumes from the longest snapshot whose tokens equal the start of its prompt.
 Three sources are checked, in this order of preference:
@@ -46,9 +54,9 @@ Three sources are checked, in this order of preference:
 With fewer than 1024 matching tokens the request starts cold. The response reports the reused tokens in
 `usage.prompt_tokens_details.cached_tokens`.
 
-**Parking.** When a slot is needed for another conversation, the old one's KV rows and snapshots are copied into a
+**Parking.** When a slot is needed for another conversation, the old one's K/V rows and snapshots are copied into a
 park pool instead of being dropped. A later turn of that conversation restores them into a free slot, which takes a
-few milliseconds of GPU copies. The pool is allocated once at start, in KV blocks of 2048 tokens (32 KB a token per
+few milliseconds of GPU copies. The pool is allocated once at start, in K/V blocks of 2048 tokens (32 KB a token per
 node): 12 GB on one Spark (about 90K parked tokens) and 24 GB on each node of two (`FERRITE_PARK_GB` overrides). As a
 backstop the engine shrinks it to keep `FE_PARK_RESERVE_GB` (20 GB) of memory available. The least recently used
 entries make room for new ones.
@@ -58,20 +66,25 @@ entry (at most `FE_PREFIX_ENTRIES`, default 4). New conversations with the same 
 
 **Requests that start with the same text.** Requests that are queued together and begin with the same tokens compute
 that part once, wherever it ends: at the end of the system prompt, or part way through the user message (parallel
-lanes of one job that share a brief and files, then each add a task of their own). No cache holds the common part
-when such requests arrive, so the first one is computed and the others wait in the queue. When the first one's
-prefill reaches the end of the common tokens it stores a prefix entry there, and the others resume from it. The
-common part must be at least 1024 tokens. A later request that starts with the same text (a fix round) resumes from
-the same entry. `usage.prompt_tokens_details.cached_tokens` reports the reused tokens, on streamed replies too
-(with `stream_options.include_usage`).
+requests of one job that share a brief and files, then each add a task of their own). No cache holds the common part
+when such requests arrive, so:
+
+1. the first request is computed and the others wait in the queue;
+2. when the first one's prompt processing reaches the end of the common tokens, it stores a prefix entry there;
+3. the others resume from that entry. The common part must be at least 1024 tokens;
+4. a later request that starts with the same text (a fix round) resumes from the same entry.
+
+`usage.prompt_tokens_details.cached_tokens` reports the reused tokens, on streamed replies too (with
+`stream_options.include_usage`).
 
 **Two nodes.** Node A's scheduler makes every decision. Each save, restore and park is mirrored to node B, which
 applies it to its half of the model.
 
 ## Same text, cached or not
 
-A reply resumed from the cache is the same, token for token, as the same request computed in full with the cache on.
-Three rules make that hold:
+A reply resumed from the cache is the same, token for token, as the same request computed in full with the cache on
+(the same cuts, no resume: `FE_CACHE_RESTORE=0`). The guarantee is relative to that run, not to a server started with
+`FERRITE_CACHE=0`, which cuts long prompts elsewhere (the last paragraph of this section). Four rules make it hold:
 
 - **Same chunk cuts.** Prompts are cut into chunks at the snapshot points in both paths, and the 32-row grid of the
   chunked Gated DeltaNet kernel restarts at each point. A restored state is therefore bitwise the state the full
@@ -89,9 +102,15 @@ Three rules make that hold:
 
 Checked on two nodes: every agent turn matched a run with the same cuts and no resume (thinking on and off, and 6
 conversations sharing 4 slots, with parking). Fresh single-turn prompts gave the same bytes with the cache on and off.
-Turning the cache off changes where long prompts are cut, which can move a late near-tie.
+
+Cache on against cache off (`FERRITE_CACHE=0`) is a different comparison: turning the cache off changes where long
+prompts are cut, so the arithmetic differs in its last bits, and that can move a late near-tie (a token whose two best
+candidates are almost equally likely) in a long prompt's reply.
 
 ## Settings and limits
+
+The launch scripts take `FERRITE_*` names and pass them to the server binary, which reads `FE_*` names; a setting
+that only has an `FE_*` name is read by the binary directly and can be set in the launcher's environment.
 
 | Setting | Default | |
 |---|---|---|
@@ -99,13 +118,13 @@ Turning the cache off changes where long prompts are cut, which can move a late 
 | `FERRITE_PARK_GB` (the engine reads `FE_PARK_GB`) | `12` on one node, `24` on two | the park pool per node, allocated at start |
 | `FE_PARK_RESERVE_GB` | `20` | memory the pool always leaves available: a smaller pool when the machine runs other things |
 | `FE_PREFIX_ENTRIES` | `4` | shared-prefix entries kept |
-| `FE_CACHE_TRACE` | off | `1` logs one line per cache decision |
+| `FE_CACHE_TRACE` | off | `1` logs one line per cache decision (resume, park, restore) in the server log: the way to watch the cache work |
 | `FE_CACHE_RESTORE` | `1` | `0` keeps the same cuts and snapshots but never resumes: the uncached reference for tests |
 
 - **4 requests at once.** Ferrite runs at most 4 requests at a time with DFlash2 drafting. More requests wait in a
   first-in, first-out queue. A waiting agent's conversation is parked and restored when it gets a slot.
 - **Every drafting mode.** The cache works with DFlash2 and with the model's MTP head (`FERRITE_DRAFT=mtp` or
   `auto`; the MTP head's K/V rows are parked with the model's). `FE_CACHE_MTP=0` turns it off for MTP drafting only.
-- **Memory.** The park pool comes on top of the model and the KV cache. Measured under agent load: one Spark with
+- **Memory.** The park pool comes on top of the model and the K/V cache. Measured under agent load: one Spark with
   4 x 128K slots and the 12 GB pool keeps about 34 GB available (a 24 GB pool would go down to about 20 GB); two
   Sparks with 24 GB pools keep 55-58 GB available per node.

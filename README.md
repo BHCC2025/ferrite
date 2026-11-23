@@ -31,12 +31,13 @@ replies faster without changing a single token of them.
 ## What runs where
 
 Find your hardware, then follow that row's guide. Speeds are generated tokens per second for one code request at a
-short context with the launcher's defaults; each guide has the full tables, the long-context figures and how they
-were measured.
+short context with the launcher's defaults. The test differs a little from row to row (the guide says exactly which),
+and each guide has the full tables, the long-context figures and how they were measured.
 
 | Model | Hardware | Code, tokens/s | Requests at once | Guide |
 |---|---|---|---|---|
-| **Qwen3.8-27B** | One or two NVIDIA DGX Spark | 267 (two Sparks); 467 in total with 4 requests | 4 | [docs/quickstart.md](docs/quickstart.md), two Sparks: [TP2.md](TP2.md) |
+| **Qwen3.8-27B** | One NVIDIA DGX Spark | 167; 287 in total with 4 requests | 4 | [docs/quickstart.md](docs/quickstart.md) |
+| Qwen3.8-27B | Two NVIDIA DGX Spark | 267; 467 in total with 4 requests | 4 | [docs/quickstart.md](docs/quickstart.md#two-nodes-tp2), [TP2.md](TP2.md) |
 | Qwen3.8-27B | One RTX 5080 (16 GB) | 298 | 1, up to 4 | [docs/rtx-5080.md](docs/rtx-5080.md) |
 | Qwen3.8-27B | One RTX 5060 Ti (16 GB) | 157 | 1, up to 4 | [docs/rtx-5080.md](docs/rtx-5080.md#on-an-rtx-5060-ti-16-gb) |
 | Qwen3.8-27B | One RTX PRO 4000 Blackwell (24 GB) | 200 | 1, up to 4 | [docs/rtx-pro-4000.md](docs/rtx-pro-4000.md) |
@@ -46,6 +47,8 @@ were measured.
 | **Inkling-2-Mini** | One RTX PRO 4000 Blackwell (24 GB) or one RTX 5060 Ti (16 GB) | 138 (24 GB), 110 (16 GB) | 1 | [docs/inkling-2-mini.md](docs/inkling-2-mini.md) |
 
 - Every row serves a context of up to 128K tokens (131,072).
+- **Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash Coder are run from quants made for code.** They are for coding work and
+  are weak at general chat; their guides say what was seen.
 - "1, up to 4" means one request at a time by default and up to four when you ask for more slots; further requests
   wait in a queue. Inkling-2-Mini serves one request at a time and is text only.
 - Each model is a separate engine inside the same server, `fe-server`. You build the engine for your row
@@ -61,15 +64,16 @@ were measured.
   gain the most, prose the least.
 - **Long contexts on small cards.** Where a model does not fit on the card, Ferrite keeps part of it in host memory
   and stores the attention cache compactly; each guide says what that costs.
-- **Measured accuracy.** Each guide reports how far Ferrite's output distribution is from the original model's (KL
-  divergence) for the formats it runs.
+- **Measured accuracy.** The Qwen3.8-27B and Inkling-2-Mini guides report how far Ferrite's output distribution is
+  from the original model's (KL divergence) for the formats it runs. For Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash
+  Coder that has not been measured; their guides say what is checked instead.
 - **Settings that suit coding agents.** Sampling defaults come from each model's publisher, a `temperature: 0`
-  request stays on the fast path, and tested agent settings are in [docs/harness.md](docs/harness.md).
+  request stays on the fast path, and the settings tested with the Pi agent are in [docs/harness.md](docs/harness.md).
 
 ## Build, download, start
 
 Every setup is the same three steps: build the engine for your row, download its model files, start its launcher.
-The commands for each row, with the folder to set and the disk space needed, are in its guide. On DGX Spark,
+Each guide has the commands for its row, with the folder to set and the disk space needed. On DGX Spark,
 [one command](#quick-start-dgx-spark) does all three.
 
 | Setup | Build | Download | Start |
@@ -81,10 +85,13 @@ The commands for each row, with the folder to set and the disk space needed, are
 | DeepSeek-V4.1-Flash Coder | `cargo build --release -p fe-server --features dsc -p fe-dsc` | `scripts/fetch-deepseek.sh` | `tools/serve-dsc.sh` |
 | Inkling-2-Mini | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ink -p fe-ink` | `scripts/fetch-inkling.sh` | `tools/serve-ink.sh` |
 
+- `FE_KARCH` names the card the GPU kernels are built for. It is needed only when the build machine does not hold
+  that card: without it the build uses the card `nvidia-smi` reports.
 - `scripts/check-deps.sh --build --install` checks the machine and installs the Rust toolchains before the build;
   what a clean machine needs is under [Building from source](#building-from-source).
 - `scripts/` holds what you run to install, download and serve the main model (`install.sh`, `fetch-*.sh`,
-  `serve.sh`, `ferritectl.sh` for a background server). `tools/` holds the launchers of the other engines and
+  `serve.sh`, and `ferritectl.sh`, which runs a server in the background, with `status`, `log` and `stop`; it covers
+  every setup except DeepSeek Coder and Inkling-2-Mini, whose launchers run in the foreground). `tools/` holds the launchers of the other engines and
   presets, the benchmark clients (`tools/bench`) and the API checks (`tools/conformance`). `tools/serve.sh` is
   `scripts/serve.sh` with short setting names.
 - Every launcher takes `--help`, runs in the foreground (Ctrl-C stops it) and serves on port 8000.
@@ -111,11 +118,14 @@ Point any OpenAI-compatible client at `http://<your machine>:8000/v1`.
 
 ## Results
 
-These are the DGX Spark figures. The figures for every other row of [What runs where](#what-runs-where) are in its guide.
+These are the figures for **two DGX Sparks**. One Spark runs at about 60% of them (code 167 tokens/s for one request,
+287 for four: [docs/benchmarks.md](docs/benchmarks.md)). The figures for every other row of
+[What runs where](#what-runs-where) are in its guide.
 
-Two DGX Sparks connected over RoCE, Qwen3.8-27B, `tools/serve-tp2.sh` defaults, greedy decoding, fixed prompts.
-Medians of 3-5 runs, in tokens per second (measured 2026-11-15, Ferrite 0.6.1). Generation figures are tokens per second while generating; prompt processing is listed separately. End-to-end
-figures that include the time to the first token are in [docs/benchmarks.md](docs/benchmarks.md#results).
+- Setup: two DGX Sparks connected over RoCE, Qwen3.8-27B, `tools/serve-tp2.sh` defaults, greedy decoding, fixed prompts.
+- Medians of 3-5 runs, in tokens per second. Measured 2026-11-15 with Ferrite 0.6.1 and not re-measured since.
+- Generation figures are tokens per second while generating; prompt processing is listed separately. End-to-end
+  figures that include the time to the first token are in [docs/benchmarks.md](docs/benchmarks.md#results).
 
 | | Ferrite |
 |---|---|
@@ -133,7 +143,7 @@ figures that include the time to the first token are in [docs/benchmarks.md](doc
 How these were measured, and what they leave out, is in [docs/benchmarks.md](docs/benchmarks.md). To reproduce the
 table on your own two Sparks, start the server (`tools/serve-tp2.sh`) and run
 `python3 tools/bench/sweep.py --url http://127.0.0.1:8000/v1 --out sweep` (about 20 minutes); `tools/bench/sweep.sh`
-does both. In short:
+does both. What these figures leave out:
 - Speculative decoding speed depends on the text. Code and edits are faster than prose.
 - The prose figure counts only replies that don't fall into echoing the prompt, which the standard benchmark prose
   prompt tends to cause.
@@ -150,7 +160,7 @@ Its pool is 12 GB on one Spark and 24 GB on each of two (`FERRITE_PARK_GB` overr
 Four agents at once on two Sparks, sharing a ~13K-token system prompt (`tools/bench/agents.py --agents 4`, 2-3 turns
 each), with the cache on instead of off (`FERRITE_CACHE=0`):
 - prompt tokens computed: 84% fewer (86% fewer with thinking on);
-- time to the first token on the first turn: 14.7 s to 5.0 s; on later turns about 0.4-1.0 s instead of 10 s;
+- time to the first token on the first turn: 14.7 s to 5.0 s; on later turns about 0.3-1.0 s instead of 10 s;
 - combined output over the run: 33.8 to 101 tok/s (thinking on: 41.1 to 113 tok/s).
 
 How it works and its limits: [docs/prompt-cache.md](docs/prompt-cache.md).
@@ -174,7 +184,7 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.1` pins one; a few minutes
+It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.2` pins one; a few minutes
 the first time: rustup, the pinned toolchains, `cargo build`) and puts the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the
@@ -193,7 +203,7 @@ scripts/check-deps.sh --build --install
 cargo build --release -p fe-server --features ferrite -p fe-cli
 
 # 2. download the models (about 38 GB) into $FERRITE_MODELS
-export FERRITE_MODELS=$HOME/models
+export FERRITE_MODELS=$HOME/models    # set it in every shell you start the server from; the default is /var/tmp/models
 scripts/fetch-models.sh
 
 # 3. serve an OpenAI-compatible API on :8000 (model id "qwen3.8-27b"), in the foreground (Ctrl-C stops it)
@@ -222,6 +232,8 @@ prompt speed, uses more memory, and defaults to 32K context.
 ### Configuration (Qwen3.8-27B launchers)
 
 Everything has a default; set only what differs on your machines. `tools/site.sh` prints the resolved settings.
+These are the settings of your site; the server settings (prompt weights, drafting, the prompt cache) are in
+[docs/quickstart.md](docs/quickstart.md).
 
 | Variable | Default | What it sets |
 |---|---|---|
@@ -260,8 +272,7 @@ Qwen3.8-27B on DGX Spark; each guide describes what its own engine does.
 Rust: every GPU kernel, the CUDA driver bindings, the model and scheduler, speculative decoding, the two-node fabric
 (RDMA over libibverbs), tokenizer and HTTP server. Not Rust: NVIDIA's `ptxas` assembler (build time), the CUDA driver
 itself, libibverbs, and NCCL for two-node prompt batches; on Intel Arc, the SPIR-V translator (build time), Intel's
-device compiler and the Level Zero loader. The full ledger, with reasons and replacement plans, is in
-[NON-RUST.md](NON-RUST.md).
+device compiler and the Level Zero loader. [NON-RUST.md](NON-RUST.md) lists every non-Rust part, why it is there and whether a replacement is planned.
 
 ## Words used in these docs
 
@@ -281,6 +292,14 @@ device compiler and the Level Zero loader. The full ledger, with reasons and rep
 | TP2 | Two DGX Sparks working as one server over the cable between them (RoCE). |
 | Prompt cache | Keeps what the server computed for a conversation so the next turn does not recompute it. |
 | Kernel | A small program that runs on the GPU. Ferrite's are written in Rust. |
+| Engine, `fe-server`, launcher | `fe-server` is the server program. An engine is the part of it that runs one model family; you choose engines when you build. A launcher is the script that starts `fe-server` with the right settings for your hardware. |
+| BF16 | The original model's 16-bit weights, before any quant. Accuracy is measured against it. |
+| Greedy decoding, sampling | Greedy (`temperature: 0`) always takes the most likely token, so a reply is repeatable. Sampling picks among likely tokens. |
+| Verify rows, verify tree | The drafted tokens the model checks in one pass, and the tree of alternative drafts they form. |
+| Time to first token | The wait before the reply starts: mostly prompt processing. |
+| Clean reply, echo | Some prose benchmark prompts make a model repeat the prompt (an echo). Prose speeds count only replies that do not (clean). |
+| GDN (Gated DeltaNet) | The layer type most of Qwen3.8 is made of. It keeps a small running state instead of looking back over the whole context. |
+| Host memory, device memory | The computer's RAM, and the memory on the graphics card. Pinned host memory is RAM locked in place so the card can read it quickly. |
 | `sm_120a`, `sm_121a`, `FE_KARCH` | The GPU architecture the kernels are built for: `sm_121a` on DGX Spark, `sm_120a` on the RTX cards. |
 
 ## Building from source

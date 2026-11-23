@@ -60,7 +60,7 @@ bin=${FERRITE_BIN:-}
 if [ -z "$bin" ]; then
   if [ -x "$root/bin/fe-server" ]; then bin=$root/bin/fe-server; else bin=$root/target/release/fe-server; fi
 fi
-[ -x "$bin" ] || fl_die "no fe-server binary at $bin (unpack a release, or build: docs/quickstart.md, Build from source)"
+[ -x "$bin" ] || fl_die "no fe-server binary at $bin (build it: docs/quickstart.md, Build from source)"
 
 # the GPU: a GB10 (DGX Spark) or an RTX 50 card (the small-memory preset)
 command -v nvidia-smi > /dev/null || fl_die "nvidia-smi not found: the NVIDIA driver is missing"
