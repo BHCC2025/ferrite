@@ -252,3 +252,53 @@ pub unsafe extern "ptx-kernel" fn ink_kvq_pack(packed: *mut u8, stg: *const u16,
         i += 1;
     }
 }
+
+/// `ink_sconv` for prompt chunks: the same per-row arithmetic (out[t] from x[t-3..t] and the 4 taps, fma order unchanged), but the rows are
+/// split over blocks instead of one thread walking all of them: grid = (ceil(C/256), ceil(nt/16)), block = 256, 16 rows a thread. Rows t < 3
+/// take x[t-3..] from the state; only grid row 0 reads the state, and it alone writes the new state (spec == 0) after its reads.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ink_sconv_par(out: *mut u16, ldo: u32, x: *const u16, ldx: u32, w: *const u16,
+    state: *mut f32, nt: u32, c: u32, spec: u32) {
+    crate::pdl_wait();
+    crate::pdl_trigger();
+    let ch = bid_x() * 256 + tid_x();
+    if ch >= c {
+        return;
+    }
+    const TB: u32 = 16;
+    let t0 = bid_y() * TB;
+    let t1 = if t0 + TB < nt { t0 + TB } else { nt };
+    let w0 = bf(*w.add(ch as usize * 4));
+    let w1 = bf(*w.add(ch as usize * 4 + 1));
+    let w2 = bf(*w.add(ch as usize * 4 + 2));
+    let w3 = bf(*w.add(ch as usize * 4 + 3));
+    // x at row j (j >= 0) or the state row 3 + j (j = -3..-1, oldest first), as the serial kernel holds it in r0..r2
+    let get = |j: i32| -> f32 {
+        if j >= 0 { bf(*x.add((j as u32 * ldx + ch) as usize)) } else { *state.add(((3 + j) as u32 * c + ch) as usize) }
+    };
+    let mut r0 = get(t0 as i32 - 3);
+    let mut r1 = get(t0 as i32 - 2);
+    let mut r2 = get(t0 as i32 - 1);
+    const S5: f32 = 2.236068;
+    let mut t = t0;
+    while t < t1 {
+        let xv = bf(*x.add((t * ldx + ch) as usize));
+        if spec != 0 {
+            *state.add(((3 + t) * c + ch) as usize) = xv;
+        }
+        let acc = math::fma(w3, xv, math::fma(w2, r2, math::fma(w1, r1, w0 * r0)));
+        *out.add((t * ldo + ch) as usize) = tb((acc + xv) / S5);
+        r0 = r1;
+        r1 = r2;
+        r2 = xv;
+        t += 1;
+    }
+    if spec == 0 && bid_y() == 0 {
+        // the new state = the last three inputs (x rows nt-3..nt-1, older state rows when nt < 3); this thread read its old state above
+        let n = nt as i32;
+        let (a, b, d) = (get(n - 3), get(n - 2), get(n - 1));
+        *state.add(ch as usize) = a;
+        *state.add((c + ch) as usize) = b;
+        *state.add((2 * c + ch) as usize) = d;
+    }
+}

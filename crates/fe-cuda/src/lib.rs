@@ -452,6 +452,66 @@ impl VmBuffer {
         Ok(n)
     }
 }
+/// Physical memory chunks taken out of a [`VmBuffer`] (`VmBuffer::detach`): kept allocated, mapped nowhere, until `VmBuffer::attach`
+/// maps them back or they are dropped (released).
+pub struct VmHandles {
+    chunks: Vec<(u64, usize)>,
+}
+unsafe impl Send for VmHandles {}
+impl VmHandles {
+    /// Bytes of physical memory held.
+    pub fn bytes(&self) -> usize {
+        self.chunks.iter().map(|c| c.1).sum()
+    }
+}
+impl Drop for VmHandles {
+    fn drop(&mut self) {
+        for &(h, _) in &self.chunks {
+            unsafe { cuMemRelease(h) };
+        }
+    }
+}
+impl VmBuffer {
+    /// Unmap every committed chunk but keep its physical memory: the chunks move to the caller and the range is left empty (the device is
+    /// synced first). `attach` maps them back at the same addresses with their contents.
+    pub fn detach(&mut self) -> Result<VmHandles> {
+        cu!(cuCtxSynchronize())?;
+        let mut off = 0u64;
+        for &(_, n) in &self.handles {
+            cu!(cuMemUnmap(self.base + off, n))?;
+            off += n as u64;
+        }
+        self.mapped = 0;
+        Ok(VmHandles { chunks: std::mem::take(&mut self.handles) })
+    }
+
+    /// Map chunks taken by `detach` (of this buffer or of one with the same reservation size) from the base; the range must be empty.
+    pub fn attach(&mut self, h: VmHandles) -> Result<()> {
+        if self.mapped != 0 {
+            return Err(CuError { code: 1, call: "VmBuffer::attach (range not empty)" });
+        }
+        let mut h = h;
+        let chunks = std::mem::take(&mut h.chunks);
+        let total: usize = chunks.iter().map(|c| c.1).sum();
+        if total > self.reserved {
+            return Err(CuError { code: 1, call: "VmBuffer::attach (chunks larger than the reservation)" });
+        }
+        let desc = CUmemAccessDesc {
+            location: CUmemLocation { type_: CU_MEM_LOCATION_TYPE_DEVICE, id: self.dev },
+            flags: CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+        };
+        let mut off = 0usize;
+        for (h, n) in chunks {
+            let at = self.base + off as u64;
+            cu!(cuMemMap(at, n, 0, h, 0))?;
+            cu!(cuMemSetAccess(at, n, &desc, 1))?;
+            self.handles.push((h, n));
+            off += n;
+        }
+        self.mapped = off;
+        Ok(())
+    }
+}
 impl VmBuffer {
     /// Unmap and release the committed chunks past `bytes` (whole chunks from the end; the device is synced first).
     /// Returns the bytes released.

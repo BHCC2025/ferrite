@@ -570,3 +570,423 @@ pub unsafe extern "ptx-kernel" fn ink_attn_gstat(stat: *const f32, gst: *mut f32
         *gst.add(e + 1) = ls;
     }
 }
+
+/// `ink_attn_tc` for prompt rows with one block per GROUP of super-tiles (the groups `ink_attn_comb2` / `ink_attn_gstat` sum in order:
+/// `gsz` = 8 for global layers, 16 for sliding layers). The block stages the query tile, its rotation and the A fragments once and then
+/// runs the super-tiles of its group in order with exactly the per-super-tile arithmetic of `ink_attn_tc`: phase 0 writes the same
+/// per-super-tile statistics; phase 1 adds each super-tile's partial (its 4 warps in warp order) into the group sum in super-tile order,
+/// starting from 0.0, as `ink_attn_comb2` does, and writes one partial a group [qtile][24][ng][16][128] (1/gsz of the traffic).
+/// qmode: 0 bf16 K/V (sliding rings), 1 6-bit K/V unpacked per tile, 2 bf16 K/V already unpacked by `ink_kv_unpack6` (rotated basis: Q is rotated
+/// as for 1). grid = (ng, 24, q tiles), block 128, smem ATC_SMEM. Not for the grouped-query decode form (gqa).
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ink_attn_tcg(stat: *mut f32, gst: *const f32, part: *mut f32, q: *const u16, kc: *const u16, vc: *const u16,
+    rsx: *const u16, proj: *const u16, pos: *const u32, window: u32, scaling: f32, ring: u32, ntok: u32, phase: u32, qt_off: u32, qmode: u32,
+    nsup: u32, gsz: u32, qorder: u32) {
+    if phase == 0 { tcg_body::<0>(stat, gst, part, q, kc, vc, rsx, proj, pos, window, scaling, ring, ntok, qt_off, qmode, nsup, gsz, qorder); } else { tcg_body::<1>(stat, gst, part, q, kc, vc, rsx, proj, pos, window, scaling, ring, ntok, qt_off, qmode, nsup, gsz, qorder); }
+}
+
+/// Phase 0 alone (no V tile: 28 KB of shared memory, phase 0's registers only, more blocks a SM); the same code as `ink_attn_tcg` phase 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ink_attn_tcg0(stat: *mut f32, gst: *const f32, part: *mut f32, q: *const u16, kc: *const u16, vc: *const u16,
+    rsx: *const u16, proj: *const u16, pos: *const u32, window: u32, scaling: f32, ring: u32, ntok: u32, _phase: u32, qt_off: u32, qmode: u32,
+    nsup: u32, gsz: u32, qorder: u32) {
+    tcg_body::<0>(stat, gst, part, q, kc, vc, rsx, proj, pos, window, scaling, ring, ntok, qt_off, qmode, nsup, gsz, qorder);
+}
+
+/// Phase 1 alone; the same code as `ink_attn_tcg` phase 1.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ink_attn_tcg1(stat: *mut f32, gst: *const f32, part: *mut f32, q: *const u16, kc: *const u16, vc: *const u16,
+    rsx: *const u16, proj: *const u16, pos: *const u32, window: u32, scaling: f32, ring: u32, ntok: u32, _phase: u32, qt_off: u32, qmode: u32,
+    nsup: u32, gsz: u32, qorder: u32) {
+    tcg_body::<1>(stat, gst, part, q, kc, vc, rsx, proj, pos, window, scaling, ring, ntok, qt_off, qmode, nsup, gsz, qorder);
+}
+
+/// Shared-memory bytes of `ink_attn_tcg0` (Q, K, bias table, row states, statistics; no V tile).
+pub const ATC0_SMEM: u32 = ATC_SMEM - 64 * PITCH;
+
+#[inline(always)]
+unsafe fn tcg_body<const PH: u32>(stat: *mut f32, gst: *const f32, part: *mut f32, q: *const u16, kc: *const u16, vc: *const u16,
+    rsx: *const u16, proj: *const u16, pos: *const u32, window: u32, scaling: f32, ring: u32, ntok: u32, qt_off: u32, qmode: u32,
+    nsup: u32, gsz: u32, qorder: u32) {
+    crate::pdl_wait();
+    crate::pdl_trigger();
+    // phase 0 has no V tile: the bias table, row states and statistics move down into its place
+    let (rl_off, rs_off, st_off) = if PH == 0 { (VS_OFF, VS_OFF + (RS_OFF - RL_OFF), VS_OFF + (ST_OFF - RL_OFF)) } else { (RL_OFF, RS_OFF, ST_OFF) };
+    let smem: Shared<u8> = dyn_base();
+    // INK_ATTN_ORDER (qorder != 0): grid = (q tiles, 24, ng), so consecutive blocks share a key range (cache reuse); else (ng, 24, q tiles)
+    let (ng, grp, h, qi) = if qorder != 0 { (gdim_z(), bid_z(), bid_y(), bid_x()) } else { (gdim_x(), bid_x(), bid_y(), bid_z()) };
+    let qbase = (qt_off + qi) * 16;
+    let kvh = h / 3;
+    let wid = warp_id();
+    let l = lane();
+    let g = l >> 2;
+    let t4 = l & 3;
+    let pos0 = *pos;
+    let t = tid_x();
+    let lo_of = |p: u32| if window > 0 && p + 1 > window { p + 1 - window } else { 0 };
+    let last_row = if qbase + 16 <= ntok { 15 } else { ntok - qbase - 1 };
+    let tile_lo = lo_of(pos0 + qbase);
+    let tile_hi = pos0 + qbase + last_row;
+    let sup0 = tile_lo / 128;
+    let j0 = grp * gsz;
+    let j1 = if j0 + gsz < nsup { j0 + gsz } else { nsup };
+    // ---- stage Q tile, relative states (once for the group) ----
+    let mut i = t;
+    while i < 16 * 16 {
+        let r = i >> 4;
+        let c = i & 15;
+        let row = qbase + r;
+        let d = smem.byte_add(QS_OFF + r * PITCH + c * 16).addr();
+        if row < ntok {
+            cp_async_16(d, q.add(row as usize * 3072 + h as usize * 128 + c as usize * 8) as *const u8);
+        } else {
+            cp_async_16_zfill(d, q as *const u8, 0);
+        }
+        i += 128;
+    }
+    cp_async_commit();
+    let rs: Shared<f32> = smem.byte_add(rs_off).cast();
+    let mut i = t;
+    while i < 256 {
+        let r = i >> 4;
+        let row = qbase + r;
+        rs.set(i, if row < ntok { bf(*rsx.add(row as usize * 384 + h as usize * 16 + (i & 15) as usize)) } else { 0.0 });
+        i += 128;
+    }
+    cp_async_wait_all();
+    sync_threads();
+    if qmode != 0 && t < 64 {
+        let (r, g) = (t >> 2, t & 3);
+        let qp = smem.byte_add(QS_OFF + r * PITCH + g * 64);
+        let mut v = [0.0f32; 32];
+        kcommon::unroll!(k in 16 => {
+            let w = <u32 as kcommon::smem::SmemIo>::lds(qp.byte_add(4 * k as u32).addr());
+            v[2 * k] = bf16::lo(w);
+            v[2 * k + 1] = bf16::hi(w);
+        });
+        kcommon::unroll!(st in [1, 2, 4, 8, 16] => {
+            kcommon::unroll!(i in 32 => {
+                if i & st == 0 {
+                    let a = v[i];
+                    let b = v[i + st];
+                    v[i] = a + b;
+                    v[i + st] = a - b;
+                }
+            });
+        });
+        kcommon::unroll!(k in 16 => {
+            <u32 as kcommon::smem::SmemIo>::sts(qp.byte_add(4 * k as u32).addr(), bf16::pack2(v[2 * k] * 0.176_776_7, v[2 * k + 1] * 0.176_776_7));
+        });
+    }
+    sync_threads();
+    let mut qf = [[0u32; 4]; 8];
+    kcommon::unroll!(ks in 8 => {
+        qf[ks] = ldmatrix_x4(smem.byte_add(QS_OFF + (l & 15) * PITCH + (ks as u32 * 2 + (l >> 4)) * 16).addr());
+    });
+    let (ra, rb_) = (g, g + 8);
+    let (pa, pb) = (pos0 + qbase + ra, pos0 + qbase + rb_);
+    let va = qbase + ra < ntok;
+    let vb = qbase + rb_ < ntok;
+    let (lo_a, lo_b) = (lo_of(pa), lo_of(pb));
+    let rl: Shared<u16> = smem.byte_add(rl_off).cast();
+    let ks_s: Shared<u8> = smem.byte_add(KS_OFF);
+    let vs_s: Shared<u8> = smem.byte_add(VS_OFF);
+    let st: Shared<f32> = smem.byte_add(st_off).cast();
+    let kcb = kc.add(kvh as usize * 128);
+    let vcb = vc.add(kvh as usize * 128);
+    const NEG: f32 = -3.0e38;
+    // global row statistics (phase 1), the same for every super-tile
+    let (gma, gla, gmb, glb) = if PH == 1 {
+        let rd = |r: u32| -> (f32, f32) { let e = (((qi * 24 + h) * 16 + r) * 2) as usize; (*gst.add(e), *gst.add(e + 1)) };
+        let (a1, a2) = rd(ra);
+        let (b1, b2) = rd(rb_);
+        (a1, a2, b1, b2)
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    };
+    let mut gacc = [0.0f32; 16];
+    let mut j = j0;
+    while j < j1 {
+        let idx = (qi * 24 + h) * nsup + j;
+        let cs = core::cmp::max((sup0 + j) * 2, tile_lo / 64);
+        let ce = core::cmp::min((sup0 + j) * 2 + 1, tile_hi / 64);
+        if cs > ce {
+            if PH == 0 {
+                if t < 32 {
+                    *stat.add((idx * 32 + t) as usize) = if t & 1 == 0 { -1.0e30 } else { 0.0 };
+                }
+            } else {
+                kcommon::unroll!(k in 16 => {
+                    gacc[k] = gacc[k] + 0.0;
+                });
+            }
+            j += 1;
+            continue;
+        }
+        // ---- bias table of this super-tile's distances ----
+        let (dmin, dmax) = {
+            let nv = if ntok - qbase < 16 { ntok - qbase } else { 16 };
+            let (pmin, pmax) = (pos0 + qbase, pos0 + qbase + nv - 1);
+            let (klo, khi) = (cs * 64, ce * 64 + 63);
+            let dmin = if pmin > khi { pmin - khi } else { 0 };
+            let dmx = if pmax >= klo { pmax - klo } else { 0 };
+            (dmin, if dmx > 1023 { 1023 } else { dmx })
+        };
+        let mut d = dmin + t;
+        while d <= dmax {
+            let mut pj = [0.0f32; 16];
+            kcommon::unroll!(jj in 16 => {
+                pj[jj] = bf(*proj.add(jj * 1024 + d as usize));
+            });
+            let nvalid = if ntok - qbase < 16 { ntok - qbase } else { 16 };
+            let mut r = 0;
+            while r < nvalid {
+                let mut b = 0.0f32;
+                kcommon::unroll!(jj in 16 => {
+                    b = math::fma(rs.at(r * 16 + jj as u32), pj[jj], b);
+                });
+                rl.set(r * 144 + (d - dmin), tb(b));
+                r += 1;
+            }
+            d += 128;
+        }
+        sync_threads();
+        macro_rules! scores {
+            ($kb:expr, $s:ident) => {
+                let mut $s = [[NEG; 4]; 2];
+                {
+                    let mut acc = [[0.0f32; 4]; 2];
+                    kcommon::unroll!(ks in 8 => {
+                        kcommon::unroll!(nt in 2 => {
+                            let bfr = ldmatrix_x2(ks_s.byte_add((wid * 16 + nt as u32 * 8 + (l & 7)) * PITCH + (ks as u32 * 2 + ((l >> 3) & 1)) * 16).addr());
+                            mma_bf16_16816(&mut acc[nt], qf[ks], bfr);
+                        });
+                    });
+                    kcommon::unroll!(nt in 2 => {
+                        kcommon::unroll!(e in 4 => {
+                            let (row_p, lo, valid, rr) = if e < 2 { (pa, lo_a, va, ra) } else { (pb, lo_b, vb, rb_) };
+                            let key = $kb + wid * 16 + nt as u32 * 8 + 2 * t4 + (e as u32 & 1);
+                            if valid && key >= lo && key <= row_p {
+                                let dist = row_p - key;
+                                let mut sv = rb(rb(acc[nt][e]) * scaling);
+                                if dist < 1024 {
+                                    sv = rb(sv + bf(rl.at(rr * 144 + (dist - dmin))));
+                                }
+                                $s[nt][e] = sv;
+                            }
+                        });
+                    });
+                }
+            };
+        }
+        if PH == 0 {
+            let (mut ma, mut la, mut mb, mut lb) = (-1.0e30f32, 0.0f32, -1.0e30f32, 0.0f32);
+            let mut c = cs;
+            while c <= ce {
+                if qmode == 1 { load_chunk_q(ks_s, kc as *const u8, kvh, c * 64, ring); } else { load_chunk(ks_s, kcb, c * 64, ring); }
+                cp_async_commit();
+                cp_async_wait_all();
+                sync_threads();
+                scores!(c * 64, s);
+                kcommon::unroll!(nt in 2 => {
+                    kcommon::unroll!(e in 4 => {
+                        let sv = s[nt][e];
+                        if sv > NEG {
+                            if e < 2 {
+                                if sv > ma { la = la * ex(ma - sv) + 1.0; ma = sv; } else { la += ex(sv - ma); }
+                            } else {
+                                if sv > mb { lb = lb * ex(mb - sv) + 1.0; mb = sv; } else { lb += ex(sv - mb); }
+                            }
+                        }
+                    });
+                });
+                sync_threads();
+                c += 1;
+            }
+            let quad = |m: f32, ls: f32| -> (f32, f32) {
+                let mut mm = -1.0e30f32;
+                let mut ms = [0.0f32; 4];
+                let mut lsv = [0.0f32; 4];
+                kcommon::unroll!(k in 4 => {
+                    ms[k] = warp::shfl_idx(m, (l & !3) + k as u32);
+                    lsv[k] = warp::shfl_idx(ls, (l & !3) + k as u32);
+                    if ms[k] > mm { mm = ms[k]; }
+                });
+                let mut tl = 0.0f32;
+                kcommon::unroll!(k in 4 => {
+                    tl += lsv[k] * ex(ms[k] - mm);
+                });
+                (mm, tl)
+            };
+            let (qma, qla) = quad(ma, la);
+            let (qmb, qlb) = quad(mb, lb);
+            if t4 == 0 {
+                st.set((wid * 16 + ra) * 2, qma);
+                st.set((wid * 16 + ra) * 2 + 1, qla);
+                st.set((wid * 16 + rb_) * 2, qmb);
+                st.set((wid * 16 + rb_) * 2 + 1, qlb);
+            }
+            sync_threads();
+            if t < 16 {
+                let mut m = -1.0e30f32;
+                kcommon::unroll!(w in 4 => {
+                    let mw = st.at((w as u32 * 16 + t) * 2);
+                    if mw > m { m = mw; }
+                });
+                let mut ls = 0.0f32;
+                kcommon::unroll!(w in 4 => {
+                    ls += st.at((w as u32 * 16 + t) * 2 + 1) * ex(st.at((w as u32 * 16 + t) * 2) - m);
+                });
+                *stat.add((idx * 32 + t * 2) as usize) = m;
+                *stat.add((idx * 32 + t * 2 + 1) as usize) = ls;
+            }
+            sync_threads();
+        } else {
+            let mut o = [[0.0f32; 4]; 16];
+            let mut c = cs;
+            while c <= ce {
+                if qmode == 1 {
+                    load_chunk_q(ks_s, kc as *const u8, kvh, c * 64, ring);
+                    load_chunk_q(vs_s, vc as *const u8, kvh, c * 64, ring);
+                } else {
+                    load_chunk(ks_s, kcb, c * 64, ring);
+                    load_chunk(vs_s, vcb, c * 64, ring);
+                }
+                cp_async_commit();
+                cp_async_wait_all();
+                sync_threads();
+                scores!(c * 64, s);
+                let mut pf = [0u32; 4];
+                {
+                    let pv = |sv: f32, m: f32, ls: f32| -> f32 { if sv > NEG { rb(ex(sv - m) / ls) } else { 0.0 } };
+                    pf[0] = bf16::pack2(pv(s[0][0], gma, gla), pv(s[0][1], gma, gla));
+                    pf[1] = bf16::pack2(pv(s[0][2], gmb, glb), pv(s[0][3], gmb, glb));
+                    pf[2] = bf16::pack2(pv(s[1][0], gma, gla), pv(s[1][1], gma, gla));
+                    pf[3] = bf16::pack2(pv(s[1][2], gmb, glb), pv(s[1][3], gmb, glb));
+                }
+                kcommon::unroll!(dp in 8 => {
+                    let vb4 = ldmatrix_x4_trans(vs_s.byte_add((wid * 16 + (l & 7) + 8 * ((l >> 3) & 1)) * PITCH + (dp as u32 * 16 + (l >> 4) * 8) * 2).addr());
+                    mma_bf16_16816(&mut o[2 * dp], pf, [vb4[0], vb4[1]]);
+                    mma_bf16_16816(&mut o[2 * dp + 1], pf, [vb4[2], vb4[3]]);
+                });
+                sync_threads();
+                c += 1;
+            }
+            let ob: Shared<f32> = smem.byte_add(KS_OFF).cast();
+            kcommon::unroll!(nt in 16 => {
+                let col = nt as u32 * 8 + 2 * t4;
+                ob.set(wid * 2048 + ra * 128 + col, o[nt][0]);
+                ob.set(wid * 2048 + ra * 128 + col + 1, o[nt][1]);
+                ob.set(wid * 2048 + rb_ * 128 + col, o[nt][2]);
+                ob.set(wid * 2048 + rb_ * 128 + col + 1, o[nt][3]);
+            });
+            sync_threads();
+            kcommon::unroll!(k in 16 => {
+                let i = t + 128 * k as u32;
+                let v = ((ob.at(i) + ob.at(2048 + i)) + ob.at(4096 + i)) + ob.at(6144 + i);
+                gacc[k] = gacc[k] + v;
+            });
+            sync_threads();
+        }
+        j += 1;
+    }
+    if PH == 1 {
+        kcommon::unroll!(k in 16 => {
+            let i = t + 128 * k as u32;
+            *part.add((((qi * 24 + h) * ng + grp) * 2048 + i) as usize) = gacc[k];
+        });
+    }
+}
+
+/// `ink_attn_comb2` over group partials written by `ink_attn_tcg` ([qtile][24][ng][16][128]): the group sums are read instead of formed
+/// (same values, same order of the group additions), then the same rotation back and gate. grid = (24, q tiles), block = 1024.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ink_attn_comb3(out: *mut u16, part: *const f32, gate: *const u16, ldg: u32, ng: u32, ntok: u32,
+    qt_off: u32, qmode: u32) {
+    crate::pdl_wait();
+    crate::pdl_trigger();
+    let gs: Shared<f32> = kcommon::static_shared!(cb3_gs, f32, 8 * 128 * 4);
+    let h = bid_x();
+    let qi = bid_y();
+    let d = tid_x() & 127;
+    let k = tid_x() >> 7;
+    let qbase = (qt_off + qi) * 16;
+    let mut r = 0;
+    while r < 16 {
+        if qbase + r < ntok {
+            let mut total = 0.0f32;
+            let mut b = 0;
+            while b < ng {
+                let g = b + k;
+                let gsum = if g < ng { *part.add((((qi * 24 + h) * ng + g) * 2048 + r * 128 + d) as usize) } else { 0.0 };
+                gs.set(k * 128 + d, gsum);
+                sync_threads();
+                if k == 0 {
+                    let n = core::cmp::min(8, ng - b);
+                    let mut kk = 0;
+                    while kk < n {
+                        total += gs.at(kk * 128 + d);
+                        kk += 1;
+                    }
+                }
+                sync_threads();
+                b += 8;
+            }
+            if qmode != 0 {
+                let mut x = total;
+                let mut m = 1;
+                while m < 32 {
+                    let p = warp::shfl_xor(x, m);
+                    x = if tid_x() & m == 0 { x + p } else { p - x };
+                    m <<= 1;
+                }
+                total = x * 0.176_776_7;
+            }
+            if k == 0 {
+                let a = rb(total);
+                let gv = *gate.add((qbase + r) as usize * ldg as usize + (h * 128 + d) as usize);
+                *out.add((qbase + r) as usize * 3072 + h as usize * 128 + d as usize) = tb(a * sigm(bf(gv)));
+            }
+        }
+        r += 1;
+    }
+}
+
+/// The 6-bit global K or V cache of positions [0, n) unpacked to bf16 [pos][8][128] exactly as `load_chunk_q` unpacks a chunk (same
+/// arithmetic, same rounding, still in the rotated basis), so the prompt attention can stage bf16 tiles instead of unpacking the same keys
+/// once per query tile and head. One (position, kv head, group of 32) job a thread. grid = ceil(n * 32 / 256), block 256.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn ink_kv_unpack6(dst: *mut u16, src: *const u8, n: u32) {
+    crate::pdl_wait();
+    crate::pdl_trigger();
+    let jid = bid_x() * 256 + tid_x();
+    if jid >= n * 32 {
+        return;
+    }
+    let row = jid >> 5;
+    let kvh = (jid >> 2) & 7;
+    let g = jid & 3;
+    let rec = src.add(((((row >> 6) * 8 + kvh) * 64 + (row & 63)) * 104) as usize);
+    let a0 = *(rec.add(24 * g as usize) as *const u64);
+    let a1 = *(rec.add(24 * g as usize + 8) as *const u64);
+    let a2 = *(rec.add(24 * g as usize + 16) as *const u64);
+    let sc = bf(*(rec.add(96 + 2 * g as usize) as *const u16)) * (1.0 / 64.0);
+    let mut v = [0.0f32; 32];
+    let words = [a0, a1, a2, 0u64];
+    kcommon::unroll!(k in 32 => {
+        const BP: usize = 6 * k;
+        const W: usize = BP >> 6;
+        const OFF: u32 = (BP & 63) as u32;
+        let mut x = words[W] >> OFF;
+        if OFF > 58 {
+            x |= words[W + 1] << (64 - OFF);
+        }
+        v[k] = (2 * ((x & 63) as i32) - 63) as f32 * sc;
+    });
+    let o = dst.add(row as usize * 1024 + kvh as usize * 128 + g as usize * 32) as *mut u32;
+    let mut j = 0;
+    while j < 16 {
+        *o.add(j) = bf16::pack2(v[2 * j], v[2 * j + 1]);
+        j += 1;
+    }
+}

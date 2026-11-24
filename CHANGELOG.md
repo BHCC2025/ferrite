@@ -4,6 +4,51 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] - 2026-11-24
+
+### Added
+
+- **Inkling-2-Mini serves several requests at once (lanes).** Four requests decode together on the 24 GB card and on a DGX Spark
+  (`INK_LANES`, 1 to 8; the 16 GB card keeps one by default, because every extra lane moves about 125 experts to host memory). Each
+  lane has its own K/V cache, short-convolution states, draft-head caches and prompt cache, one forward carries the rows of every lane,
+  and every stream's tokens are those of the same request alone. On an RTX PRO 4000, four short requests run at 159 to 188 tokens/s
+  together instead of 82 to 119 one after another, and the last one starts after at most 0.16 s instead of 6.3 s; one request alone runs
+  as fast as before. A long prompt arriving while others decode is prefilled beside them in chunks of `INK_LANE_PREFILL_ROWS` rows (128;
+  256 on a DGX Spark). Details: [docs/inkling-2-mini.md](docs/inkling-2-mini.md#several-requests-at-once-lanes).
+- **A park pool for more conversations than lanes.** A lane that has to take a new conversation parks the one it held (its global K/V,
+  draft context and newest prompt-cache snapshot) in pinned host memory (`FERRITE_PARK_GB`, 8 GB; 16 GB of host memory stays available),
+  and a request that continues it brings it back and resumes there. With 8 conversations taking turns on four lanes of an RTX PRO 4000,
+  an answer starts after 0.15 / 0.29 / 0.52 s at 10K / 41K / 94K tokens instead of 5.8 / 32 / 111 s. On a DGX Spark parked conversations
+  stay in place in its unified memory and are mapped back (16 GB): 0.15 / 0.18 / 0.26 s at 10K / 51K / 118K tokens instead of 5.1 / 39 /
+  152 s. `FERRITE_PARK_GB=0` turns it off.
+- **The DGX Spark is a supported Inkling-2-Mini target.** Built without `FE_KARCH` (sm_121a), `tools/serve-ink.sh` picks the 24 GB layout,
+  prompt chunks of 2,048 rows, four lanes and the park pool in unified memory. A short code request runs at 74 tokens/s with the draft
+  head and 43 without; four requests at once at 81 to 92 tokens/s together; the KL figures are those of the RTX build, and prompt logits
+  are the same bits at every chunk size. Figures and settings: [docs/inkling-2-mini.md](docs/inkling-2-mini.md#results).
+- Gates: `ink-run lanescheck` (multi-lane forwards against single-lane rows, with planted faults), `ink-run pcache --lane N` (the prompt
+  cache on a lane other than the first) and a planted fault for the park pool (`INK_PARK_PLANT`).
+
+### Changed
+
+- **Faster prompt processing on Inkling-2-Mini, same bits.** The prompt attention runs one block a group of key tiles and in two
+  kernels, the short convolution of a prompt chunk is split over its rows, and the small decode GEMMs stream wider k stages. On a DGX
+  Spark a cold 8K prompt prefills 17% faster, 34K 31% and 100K 53% (112 s instead of 172 s); every switch can be turned off for
+  comparisons (`INK_ATTN_GROUP`, `INK_ATTN_SPLIT`, `INK_ATTN_ORDER`, `INK_ATTN_UNPACK`, `INK_SCONV_PAR`, `INK_SGEMM_WIDE`).
+  On an RTX PRO 4000 a cold 10K prompt prefills at 2,040 tokens/s instead of 1,855 (10% faster) and a 41K prompt at 1,590 instead of
+  1,310 (21%); on an RTX 5060 Ti at 1,265 instead of 1,145 (10%) and 920 instead of 800 (15%). Decode without the draft head is 2% faster
+  on the RTX PRO 4000 and 3% on the RTX 5060 Ti, and decode with the draft head is as fast as before (within 1%): on these cards batches
+  of fewer than 64 rows keep the earlier attention path, which is the faster one for them (`INK_ATTN_GROUP_MIN`).
+- **Seeded sampling on Inkling-2-Mini gives the same tokens with the draft head on or off.** Each verified row now draws its token as plain
+  decode would and accepts the draft when the drawn token is the draft (as lossless as before: a draft is accepted with its probability).
+  Before, a seeded request with the draft head on could change from run to run, because the draft length follows measured times. Greedy
+  output and sampled output with the draft head off are unchanged.
+- Version 0.9.6.
+
+### Fixed
+
+- `ink-run pcache`: with prompt chunks of 2,048 rows the gate's replies were too short to overwrite the sliding window a resume restores,
+  so a broken restore of that window would have passed. The first reply of the series is now longer than the prompt chunk.
+
 ## [0.9.5] - 2026-11-23
 
 ### Added

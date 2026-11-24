@@ -81,6 +81,14 @@ struct DLayer {
     ring: usize,
 }
 
+/// A lane's draft context while another lane is the current one (see `Draft::select_lane`).
+struct DraftLane {
+    kc: Vec<GBuf>,
+    vc: Vec<GBuf>,
+    ctx_len: usize,
+    kv_rows: usize,
+}
+
 pub struct Draft {
     pub ctx: Arc<Context>,
     rms: Function,
@@ -154,6 +162,11 @@ pub struct Draft {
     pub ctx_len: usize,
     /// block attention mask: false = bidirectional (reference default), true = causal inside the block
     pub causal: bool,
+    /// lanes: the layers' caches, `ctx_len` and `kv_rows` belong to lane `cur`; the others are parked (None at `cur`)
+    cur: usize,
+    parked: Vec<Option<DraftLane>>,
+    /// positions the shared RoPE tables hold
+    tab_rows: usize,
 }
 
 /// NeoX RoPE tables (f32 bytes) for positions lo..hi: cos then sin, [pos][64].
@@ -320,6 +333,9 @@ impl Draft {
             cap,
             kv_rows: init_rows,
             ctx_len: 0,
+            cur: 0,
+            parked: vec![None],
+            tab_rows: init_rows,
             causal: false,
             ctx,
         };
@@ -329,6 +345,98 @@ impl Draft {
         }
         s.sync()?;
         Ok(dr)
+    }
+
+    /// Give the head `n` lanes in all (each its own K/V caches: two rings + the growing full layer).
+    pub fn add_lanes(&mut self, n: usize) -> Result<()> {
+        let dev = self.ctx.device_id();
+        let init_rows = self.cap.min(step());
+        while self.parked.len() < n {
+            let (mut kc, mut vc) = (vec![], vec![]);
+            for l in &self.layers {
+                if l.ring > 0 {
+                    kc.push(GBuf::P(alloc(RING * 1024 * 2)?));
+                    vc.push(GBuf::P(alloc(RING * 1024 * 2)?));
+                } else {
+                    kc.push(vm((self.cap + 32) * 1024 * 2, init_rows * 1024 * 2, dev)?);
+                    vc.push(vm((self.cap + 32) * 1024 * 2, init_rows * 1024 * 2, dev)?);
+                }
+            }
+            self.parked.push(Some(DraftLane { kc, vc, ctx_len: 0, kv_rows: init_rows }));
+        }
+        Ok(())
+    }
+
+    /// The full draft layer's K and V caches with the bytes of positions [0, m).
+    pub fn full_prefix(&self, m: usize) -> Vec<(DevPtr, usize)> {
+        let mut v = vec![];
+        for l in self.layers.iter().filter(|l| l.ring == 0) {
+            v.push((l.kcache.ptr(), m * 1024 * 2));
+            v.push((l.vcache.ptr(), m * 1024 * 2));
+        }
+        v
+    }
+
+    /// Take the physical memory of the current lane's full draft layer out (see `Ink::kv_detach`); returns it with the positions it holds.
+    /// The lane gets fresh memory for one growth step.
+    pub fn full_detach(&mut self, st: &Stream) -> Result<(Vec<fe_cuda::VmHandles>, usize)> {
+        st.sync()?;
+        let mut v = vec![];
+        for l in self.layers.iter_mut().filter(|l| l.ring == 0) {
+            for b in [&mut l.kcache, &mut l.vcache] {
+                match b {
+                    GBuf::V(vb) => v.push(vb.detach()?),
+                    GBuf::P(_) => anyhow::bail!("full_detach: the full layer cache is not a mapped range"),
+                }
+            }
+        }
+        let rows = self.kv_rows;
+        self.kv_rows = 0;
+        self.ctx_len = 0;
+        self.ensure_capacity(st, 1)?;
+        Ok((v, rows))
+    }
+
+    /// Put memory taken by `full_detach` back (the lane's own is released first); `rows` = the positions it holds.
+    pub fn full_attach(&mut self, st: &Stream, h: Vec<fe_cuda::VmHandles>, rows: usize) -> Result<()> {
+        st.sync()?;
+        let mut it = h.into_iter();
+        for l in self.layers.iter_mut().filter(|l| l.ring == 0) {
+            for b in [&mut l.kcache, &mut l.vcache] {
+                match b {
+                    GBuf::V(vb) => {
+                        vb.shrink(0)?;
+                        vb.attach(it.next().ok_or_else(|| anyhow::anyhow!("full_attach: too few buffers"))?)?;
+                    }
+                    GBuf::P(_) => anyhow::bail!("full_attach: the full layer cache is not a mapped range"),
+                }
+            }
+        }
+        self.kv_rows = rows;
+        Ok(())
+    }
+
+    /// Lanes the head has caches for.
+    pub fn n_lanes(&self) -> usize {
+        self.parked.len()
+    }
+
+    /// Make lane `i`'s draft context the current one (a swap of the cache objects, no device work).
+    pub fn select_lane(&mut self, i: usize) -> Result<()> {
+        ensure!(i < self.parked.len(), "draft lane {i} of {}", self.parked.len());
+        if i == self.cur {
+            return Ok(());
+        }
+        let mut st = self.parked[i].take().unwrap();
+        for (j, l) in self.layers.iter_mut().enumerate() {
+            std::mem::swap(&mut l.kcache, &mut st.kc[j]);
+            std::mem::swap(&mut l.vcache, &mut st.vc[j]);
+        }
+        std::mem::swap(&mut self.ctx_len, &mut st.ctx_len);
+        std::mem::swap(&mut self.kv_rows, &mut st.kv_rows);
+        self.parked[self.cur] = Some(st);
+        self.cur = i;
+        Ok(())
     }
 
     /// Device bytes held by the draft's growing buffers (full-layer K/V + RoPE tables) at the current size.
@@ -391,8 +499,12 @@ impl Draft {
                 l.kcache.shrink(init_rows * 1024 * 2)?;
                 l.vcache.shrink(init_rows * 1024 * 2)?;
             }
-            self.cos.shrink(init_rows * 64 * 4)?;
-            self.sin.shrink(init_rows * 64 * 4)?;
+            // the RoPE tables are shared by the lanes: they shrink only with one lane
+            if self.parked.len() == 1 {
+                self.cos.shrink(init_rows * 64 * 4)?;
+                self.sin.shrink(init_rows * 64 * 4)?;
+                self.tab_rows = init_rows;
+            }
             self.kv_rows = init_rows;
         }
         Ok(())
@@ -413,12 +525,15 @@ impl Draft {
             l.kcache.grow(new_rows * 1024 * 2)?;
             l.vcache.grow(new_rows * 1024 * 2)?;
         }
-        let (c, sn) = rope_tables(self.kv_rows, new_rows);
-        self.cos.grow(new_rows * 64 * 4)?;
-        self.sin.grow(new_rows * 64 * 4)?;
-        unsafe {
-            st.memcpy_htod(self.cos.ptr().byte_add(self.kv_rows * 64 * 4), &c)?;
-            st.memcpy_htod(self.sin.ptr().byte_add(self.kv_rows * 64 * 4), &sn)?;
+        if new_rows > self.tab_rows {
+            let (c, sn) = rope_tables(self.tab_rows, new_rows);
+            self.cos.grow(new_rows * 64 * 4)?;
+            self.sin.grow(new_rows * 64 * 4)?;
+            unsafe {
+                st.memcpy_htod(self.cos.ptr().byte_add(self.tab_rows * 64 * 4), &c)?;
+                st.memcpy_htod(self.sin.ptr().byte_add(self.tab_rows * 64 * 4), &sn)?;
+            }
+            self.tab_rows = new_rows;
         }
         st.sync()?;
         self.kv_rows = new_rows;

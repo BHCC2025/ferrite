@@ -11,9 +11,10 @@
 //!                                         free-running KL(reference || engine) and perplexity against reference logits (DIR/NAME/taps.json + taps.bin,
 //!                                         `logprobs_f16` rows of the publisher's reference implementation)
 //!   ink-run fold                          compute (or show) the draft head's fold tables
-//!   ink-run pcache [--ref] [--ngen G] [--modes LIST]
+//!   ink-run pcache [--ref] [--ngen G] [--modes LIST] [--lane N]
 //!                                         prompt-cache gate: a fixed series of chat-like requests (consecutive turns, an identical request, a
-//!                                         shorter one, divergence at token 0, edits behind the 8,192 / 32,768 marks), each request greedy or
+//!                                         shorter one, divergence at token 0, edits behind the 8,192 / 32,768 marks; the first reply is longer
+//!                                         than the prefill chunk, so the ring window of the next resume is really overwritten), each request greedy or
 //!                                         seeded-sampled with the draft head on or off (fixed 3 drafts a pass, no suspension); one line a request
 //!                                         with the hash of the first new position's logits, of the reply and the drafting counts. --ref runs the
 //!                                         same requests with the cache off (each prefilled from 0): the two outputs must be identical
@@ -112,6 +113,19 @@ fn fnv(v: &[u32]) -> u64 {
 }
 
 /// Greedy generation of `n` tokens after `ids`, with the draft head (`spec`) or plain. Returns (tokens, prefill s, decode s).
+static LHASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xcbf29ce484222325);
+fn lhash_add(v: &[u16]) {
+    let mut h = LHASH.load(std::sync::atomic::Ordering::Relaxed);
+    for &x in v {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    LHASH.store(h, std::sync::atomic::Ordering::Relaxed);
+}
+fn lhash_take() -> u64 {
+    LHASH.swap(0xcbf29ce484222325, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn generate(ink: &mut Ink, spec: Option<&mut Spec>, ids: &[u32], n: usize) -> Result<(Vec<u32>, f64, f64)> {
     let t0 = std::time::Instant::now();
     let mut spec = spec;
@@ -142,11 +156,19 @@ fn generate(ink: &mut Ink, spec: Option<&mut Spec>, ids: &[u32], n: usize) -> Re
             }
         } else {
             let lg = ink.forward(&[*out.last().unwrap()], 1, None, None)?;
+            lhash_add(&lg);
             out.push(argmax(&lg));
         }
     }
     out.truncate(n);
     Ok((out, tp, t1.elapsed().as_secs_f64()))
+}
+
+fn ensure_lanes(ink: &Ink, n: usize) -> Result<()> {
+    if ink.n_lanes() < n {
+        bail!("needs INK_LANES >= {n} (and INK_KV_LAZY=1); the engine has {} lane(s)", ink.n_lanes());
+    }
+    Ok(())
 }
 
 fn fnv16(v: &[u16]) -> u64 {
@@ -373,7 +395,16 @@ fn main() -> Result<()> {
             let mut spec = if draft { Some(load_spec(&mut ink, &model)?) } else { None };
             // two runs: the first warms the expert residency on cards that keep experts in host memory; the second is the one reported
             for run in 0..2 {
+                lhash_take();
                 let (out, tp, td) = generate(&mut ink, spec.as_mut(), &ids, ngen)?;
+                println!("decode logits hash {:016x}", lhash_take());
+                if let Some(sp) = spec.as_mut() {
+                    let st = &sp.stats;
+                    let p = st.passes.max(1) as f64;
+                    println!("spec: {} passes, {:.2} rows a pass, {:.2} tokens a pass, hist {:?}, ms a pass: draft {:.2} verify {:.2} commit {:.2}, plain tokens {} suspensions {}",
+                        st.passes, st.rows as f64 / p, st.tokens as f64 / p, st.hist, st.t_draft * 1e3 / p, st.t_verify * 1e3 / p, st.t_commit * 1e3 / p, st.plain_tokens, st.suspensions);
+                    sp.stats = Default::default();
+                }
                 let hosted = ink.host_experts();
                 println!("run {}: {kind} context {} tokens, chunk {}, draft {}: prefill {:.0} tok/s ({tp:.2} s); {} tokens decoded at {:.1} tok/s{}{}; hash {:016x}",
                     run + 1, ids.len(), ink.tmax, if draft { "on" } else { "off" }, ids.len() as f64 / tp, out.len(), out.len() as f64 / td,
@@ -414,6 +445,7 @@ fn main() -> Result<()> {
             while pos < n {
                 let t = (n - pos).min(tmax);
                 let logits = ink.forward(&ids[pos..pos + t], t, None, None)?;
+                lhash_add(&logits);
                 let res: Vec<(f64, f64, bool)> = std::thread::scope(|sc| {
                     let hs: Vec<_> = (0..t).step_by(8).map(|r0| {
                         let (logits, ids, lp16, rowof, top1) = (&logits, &ids, lp16, &rowof, &top1);
@@ -455,6 +487,7 @@ fn main() -> Result<()> {
                 }
                 pos += t;
             }
+            println!("{set}: prompt logits hash {:016x}", lhash_take());
             println!("{set}: n={n} | KL(reference || engine) on {klcnt} logit rows {:.5}, top-1 agrees on {agree}/{klcnt} | perplexity {:.3} (nll {:.4}) | {:.1} s ({:.0} tok/s)",
                 klsum / klcnt.max(1) as f64, (nllsum / nllcnt.max(1) as f64).exp(), nllsum / nllcnt.max(1) as f64, t0.elapsed().as_secs_f64(), n as f64 / t0.elapsed().as_secs_f64());
         }
@@ -486,12 +519,20 @@ fn main() -> Result<()> {
             let mut spec = load_spec(&mut ink, &model)?;
             spec.fixed = Some(3);
             spec.suspend = false;
+            // --lane N: run the series on lane N of a multi-lane engine (lanes 1.. cut prefill chunks at the marks instead of speculative chunks)
+            let lane: usize = opt("--lane").map(|s| s.parse().unwrap()).unwrap_or(0);
+            if lane > 0 {
+                ensure_lanes(&ink, lane + 1)?;
+                spec.add_lanes(ink.n_lanes())?;
+                ink.select_lane(lane)?;
+                spec.select_lane(lane)?;
+            }
             let mut dsamp = DevSampler::new(ink.ctx.clone())?;
             let mut pc = PCache::new(&ink);
             if refm {
                 pc.on = false;
             }
-            println!("pcache gate: {} mode, {} K/V, chunk {}, cap {}, snapshot {:.1} MiB, up to {}, marks every {}", if refm { "reference (cache off)" } else { "cache" },
+            println!("pcache gate: lane {lane} of {}, {} mode, {} K/V, chunk {}, cap {}, snapshot {:.1} MiB, up to {}, marks every {}", ink.n_lanes(), if refm { "reference (cache off)" } else { "cache" },
                 if ink.kvq6 { "6-bit" } else { "bf16" }, ink.tmax, ink.cap, pc.snap_bytes() as f64 / 1048576.0, pc.max_snaps, pc.every);
             for mode in modes_s.split(',') {
                 let sampled = mode.starts_with("sampled");
@@ -499,11 +540,116 @@ fn main() -> Result<()> {
                 pc.clear();
                 spec.reset(&mut ink)?;
                 for (name, p) in &series {
-                    let (from, lgh, out, passes, acc, tp) = pc_request(&mut ink, Some(&mut spec), &mut dsamp, &mut pc, p, sampled, draft, ngen)?;
+                    let (from, lgh, out, passes, acc, tp) = {
+                        // t1's reply is longer than the chunk, so the rows after its mark overwrite the ring window that t2's resume needs
+                        let g = if *name == "t1" { ngen.max(ink.tmax + 64) } else { ngen };
+                        pc_request(&mut ink, Some(&mut spec), &mut dsamp, &mut pc, p, sampled, draft, g)?
+                    };
                     println!("PC {mode} {name} n={} lg={lgh:016x} out={:016x} ntok={} passes={passes} acc={acc} | from={from} prefill {:.0} ms restore {:.1} ms snaps {} ({:.1} ms) held {:?}",
                         p.len(), fnv(&out), out.len(), tp * 1e3, pc.last.restore_ms, pc.last.snaps_taken, pc.last.snap_ms, pc.marks());
                 }
             }
+        }
+        "lanescheck" => {
+            // multi-lane forwards against single-lane decode rows: 4 lanes at different depths, passes mixing plain rows, speculative chunks with
+            // rollback and more than 16 rows; then the lanes go on alone (their own CUDA graphs). Needs INK_LANES >= 4 (and INK_KV_LAZY).
+            let corpus = Corpus::new(&model)?;
+            let lens = [1500usize, 2600, 300, 5000];
+            let kinds = ["code", "prose", "code", "prose"];
+            let refn = 24usize;
+            let prompts: Vec<Vec<u32>> = lens.iter().zip(kinds).enumerate().map(|(i, (&n, k))| {
+                let mut v = corpus.context(n + 300 * i, k);
+                v.drain(..300 * i);
+                v
+            }).collect();
+            let mut ink = Ink::load(&model, 0, 5000 + refn + 64, tmax)?;
+            ensure_lanes(&ink, 4)?;
+            let mut ck = Checks { failed: 0 };
+            // reference: lane 0 alone, prompt rows then refn single decode rows (graph path)
+            let mut refs: Vec<Vec<Vec<u16>>> = vec![];
+            for p in &prompts {
+                ink.select_lane(0)?;
+                ink.reset()?;
+                let m = p.len() - refn;
+                prefill(&mut ink, &p[..m], 1)?;
+                ink.prompt = false;
+                let mut rows = vec![];
+                for i in 0..refn {
+                    rows.push(ink.forward(&p[m + i..m + i + 1], 1, None, None)?);
+                }
+                refs.push(rows);
+            }
+            // the lanes: prompt rows on every lane, then multi-lane passes
+            for (l, p) in prompts.iter().enumerate() {
+                ink.select_lane(l)?;
+                ink.reset()?;
+                prefill(&mut ink, &p[..p.len() - refn], 1)?;
+            }
+            ink.prompt = false;
+            let mut used = [0usize; 4];
+            // (lane, rows, speculative, rows kept after the pass)
+            let plan: Vec<Vec<(usize, usize, bool, usize)>> = vec![
+                vec![(0, 1, false, 1), (1, 1, false, 1), (2, 1, false, 1), (3, 1, false, 1)],
+                vec![(1, 3, true, 2), (3, 2, true, 2), (0, 1, false, 1)],
+                vec![(2, 5, true, 1), (1, 1, false, 1), (3, 4, true, 4)],
+                vec![(0, 8, true, 8), (1, 8, true, 3), (3, 4, true, 1)],
+                vec![(3, 1, false, 1), (2, 1, false, 1)],
+                vec![(2, 7, true, 6), (0, 3, true, 0), (1, 6, true, 6), (3, 8, true, 5)],
+            ];
+            let mut bad_rows = 0usize;
+            let mut total_rows = 0usize;
+            for (pi, pass) in plan.iter().enumerate() {
+                // the 16 GB layout keeps logits for 16 rows: its passes stop there
+                if ink.slot_dev_bytes() > 0 && pass.iter().map(|p| p.1).sum::<usize>() > 16 {
+                    println!("pass {pi}: skipped (more than 16 rows on the host-expert layout)");
+                    continue;
+                }
+                let segs: Vec<(usize, Vec<u32>, bool)> = pass.iter().map(|&(l, r, sp, _)| (l, prompts[l][prompts[l].len() - refn + used[l]..][..r].to_vec(), sp)).collect();
+                let segr: Vec<(usize, &[u32], bool)> = segs.iter().map(|s| (s.0, s.1.as_slice(), s.2)).collect();
+                let rows: usize = segs.iter().map(|s| s.1.len()).sum();
+                ink.forward_multi(&segr, rows, false)?;
+                let lg = ink.logits_rows(0, rows)?;
+                let mut off = 0;
+                let mut bad = 0;
+                for &(l, r, sp, keep) in pass {
+                    for j in 0..r {
+                        total_rows += 1;
+                        if lg[(off + j) * VOCAB..(off + j + 1) * VOCAB] != refs[l][used[l] + j][..] {
+                            bad += 1;
+                        }
+                    }
+                    if sp {
+                        ink.select_lane(l)?;
+                        ink.rollback(keep)?;
+                    }
+                    used[l] += keep;
+                    off += r;
+                }
+                bad_rows += bad;
+                println!("pass {pi}: {rows} rows over {} lanes, {bad} rows differ", pass.len());
+            }
+            ck.report("multi-lane rows == single-lane decode rows", bad_rows == 0, format!("{bad_rows} of {total_rows} rows differ"));
+            // each lane goes on alone (single-lane decode, its own graph)
+            let mut bad = 0;
+            let mut n = 0;
+            for l in 0..4 {
+                ink.select_lane(l)?;
+                while used[l] < refn {
+                    let p = &prompts[l];
+                    let i = p.len() - refn + used[l];
+                    if ink.forward(&p[i..i + 1], 1, None, None)? != refs[l][used[l]] {
+                        bad += 1;
+                    }
+                    n += 1;
+                    used[l] += 1;
+                }
+            }
+            ck.report("lanes continue alone after multi-lane passes", bad == 0, format!("{bad} of {n} rows differ"));
+            if ck.failed > 0 {
+                println!("lanescheck: {} check(s) FAILED", ck.failed);
+                std::process::exit(1);
+            }
+            println!("lanescheck: all checks passed");
         }
         "fold" => {
             let p = fold::ensure(&model)?;

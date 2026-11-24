@@ -16,6 +16,8 @@ pub mod fnext;
 pub mod ferrite;
 #[cfg(feature = "ink")]
 pub mod ink;
+#[cfg(feature = "ink")]
+pub mod ink_lanes;
 pub mod inkling;
 pub mod guard;
 pub mod loopdet;

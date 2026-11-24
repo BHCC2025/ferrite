@@ -44,7 +44,7 @@ and each guide has the full tables, the long-context figures and how they were m
 | Qwen3.8-27B | One Intel Arc Pro B70 (32 GB), **no longer maintained** | 170 (measured with 0.6.0) | 1, up to 4 | [docs/arc-b70.md](docs/arc-b70.md) |
 | **Qwen3.8-Flash-Next** | One or two RTX 5060 Ti (16 GB), 32 GB of host memory | 93-99 (one card), 131-146 (two) | 1 to 4, by host memory | [docs/flash-next.md](docs/flash-next.md) |
 | **DeepSeek-V4.1-Flash Coder** | Three 24 GB cards, optionally a fourth of 16 GB | 103 (three cards), 114 (four) | 1, up to 4 | [docs/deepseek-coder.md](docs/deepseek-coder.md) |
-| **Inkling-2-Mini** | One RTX PRO 4000 Blackwell (24 GB) or one RTX 5060 Ti (16 GB) | 138 (24 GB), 110 (16 GB) | 1 | [docs/inkling-2-mini.md](docs/inkling-2-mini.md) |
+| **Inkling-2-Mini** | One RTX PRO 4000 Blackwell (24 GB), one RTX 5060 Ti (16 GB) or one DGX Spark | 138 (24 GB), 110 (16 GB), 74 (DGX Spark) | 4 (24 GB, DGX Spark), 1 (16 GB) | [docs/inkling-2-mini.md](docs/inkling-2-mini.md) |
 
 - **The Intel Arc Pro B70 row is no longer maintained.** The test card is gone, so that engine is not built or tested
   on later versions; the last one run on the card is 0.7.1. Its code, guide and model stay available
@@ -53,7 +53,8 @@ and each guide has the full tables, the long-context figures and how they were m
 - **Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash Coder are run from quants made for code.** They are for coding work and
   are weak at general chat; their guides say what was seen.
 - "1, up to 4" means one request at a time by default and up to four when you ask for more slots; further requests
-  wait in a queue. Inkling-2-Mini serves one request at a time and is text only.
+  wait in a queue. Inkling-2-Mini serves four requests at once on the 24 GB card and on a DGX Spark, one on the 16 GB card, and is
+  text only.
 - Each model is a separate engine inside the same server, `fe-server`. You build the engine for your row
   ([Build, download, start](#build-download-start)).
 - Operating systems, drivers and memory for each row are under [Requirements](#requirements).
@@ -86,7 +87,7 @@ Each guide has the commands for its row, with the folder to set and the disk spa
 | Qwen3.8-27B on Arc Pro B70 | `cargo build --release --features xe -p fe-server` | `scripts/fetch-models.sh xq draft` | `scripts/serve-xe.sh` |
 | Qwen3.8-Flash-Next | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ferrite,fnext` | `scripts/fetch-flashnext.sh` | `tools/serve-fnext.sh` |
 | DeepSeek-V4.1-Flash Coder | `cargo build --release -p fe-server --features dsc -p fe-dsc` | `scripts/fetch-deepseek.sh` | `tools/serve-dsc.sh` |
-| Inkling-2-Mini | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ink -p fe-ink` | `scripts/fetch-inkling.sh` | `tools/serve-ink.sh` |
+| Inkling-2-Mini | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ink -p fe-ink` (on a DGX Spark without `FE_KARCH`) | `scripts/fetch-inkling.sh` | `tools/serve-ink.sh` |
 
 - `FE_KARCH` names the card the GPU kernels are built for. It is needed only when the build machine does not hold
   that card: without it the build uses the card `nvidia-smi` reports.
@@ -116,7 +117,7 @@ Point any OpenAI-compatible client at `http://<your machine>:8000/v1`.
 | NVIDIA RTX PRO 4000 Blackwell 24 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 24 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas` and cuBLASLt | From source: [docs/rtx-pro-4000.md](docs/rtx-pro-4000.md) |
 | Qwen3.8-Flash-Next on RTX 5060 Ti, one or two (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas`; 32 GB of memory | From source: [docs/flash-next.md](docs/flash-next.md) |
 | DeepSeek-V4.1-Flash Coder on three 24 GB cards, plus an optional fourth of 16 GB (experimental) | Linux; tested on Ubuntu 24.04 | x86_64 | tested on RTX PRO 4000 Blackwell (+ RTX 5060 Ti), NVIDIA driver 580 or later, CUDA 13 `ptxas`; tested with 128 GB of memory, ~191 GB of SSD for the files | From source: [docs/deepseek-coder.md](docs/deepseek-coder.md) |
-| Inkling-2-Mini on one RTX PRO 4000 Blackwell 24 GB or one RTX 5060 Ti 16 GB (experimental; text only, one request at a time) | Linux; tested on Ubuntu 24.04 | x86_64 | 16 GB or 24 GB, NVIDIA driver 580 or later (tested 595.99), CUDA 13 `ptxas`; 32 GB of host memory on the 16 GB card | From source: [docs/inkling-2-mini.md](docs/inkling-2-mini.md) |
+| Inkling-2-Mini on one RTX PRO 4000 Blackwell 24 GB, one RTX 5060 Ti 16 GB or one DGX Spark (experimental; text only) | Linux; tested on Ubuntu 24.04 and DGX OS | x86_64, or aarch64 on a DGX Spark | 16 GB or 24 GB card or a GB10, NVIDIA driver 580 or later (tested 595.99, 580.178 on a DGX Spark), CUDA 13 `ptxas`; 32 GB of host memory on the 16 GB card | From source: [docs/inkling-2-mini.md](docs/inkling-2-mini.md) |
 | Intel Arc Pro B70 (no longer maintained, last tested with 0.7.1) | Linux with the `xe` kernel driver; tested on Arch Linux | x86_64 | 32 GB, Level Zero loader 1.32+ | From source: [docs/arc-b70.md](docs/arc-b70.md) |
 
 ## Results
@@ -187,7 +188,7 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.5` pins one; a few minutes
+It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.6` pins one; a few minutes
 the first time: rustup, the pinned toolchains, `cargo build`) and puts the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the

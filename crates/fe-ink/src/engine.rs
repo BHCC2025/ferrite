@@ -20,12 +20,18 @@ pub struct Kern {
     pub copy_rows: Function,
     pub headclip: Function,
     pub sconv: Function,
+    pub sconv_par: Function,
     pub sconv_dyn: Function,
     pub argmax_rows: Function,
     pub conv_commit: Function,
     pub headnorm: Function,
     pub kvq_pack: Function,
     pub attn_tc: Function,
+    pub attn_tcg: Function,
+    pub attn_tcg0: Function,
+    pub kv_unpack6: Function,
+    pub attn_tcg1: Function,
+    pub attn_comb3: Function,
     pub dg_k: Function,
     pub dg_v: Function,
     pub dg_comb: Function,
@@ -41,12 +47,60 @@ pub struct Kern {
     pub router_pick: Function,
     pub gemm_s: Function,
     pub gemm_s8: Function,
+    pub gemm_sw: Function,
+    pub gemm_s8w: Function,
     pub dequant: Function,
 }
 
 const GEMM_SMEM: u32 = 3 * 2 * 128 * 32 * 2;
 const SGEMM_SMEM: u32 = 4 * 48 * 144;
 const SGEMM8_SMEM: u32 = 4 * (32 * 80 + 16 * 144) + 2 * 32 * 144;
+// wide-K small GEMMs (k-inkm gemm.rs): 3 stages of 256-wide k tiles, same mma sequence and bits as the 64-wide ones
+const WBK: usize = 256;
+const WST: u32 = 3;
+const SGEMMW_SMEM: u32 = WST * 48 * (WBK as u32 * 2 + 16);
+const SGEMM8W_SMEM: u32 = WST * (32 * (WBK as u32 + 16) + 16 * (WBK as u32 * 2 + 16)) + 2 * 32 * (WBK as u32 * 2 + 16);
+/// INK_ATTN_GROUP=0 keeps one block a super-tile in the prompt attention (A/B; same bits: ink_attn_tcg runs a block per comb2 group).
+fn attn_group() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_ATTN_GROUP").map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no")).unwrap_or(true))
+}
+/// INK_ATTN_GROUP_MIN=n: a segment of fewer than n rows keeps the one-block-a-super-tile prompt attention (draft verification and other small
+/// batches, where it is the faster of the two on a discrete card); n rows or more take the grouped kernels (prompt chunks). Decided per segment
+/// from its own row count, so a lane's choice never depends on the other lanes; both paths give the same bits. INK_ATTN_GROUP=0 keeps the old
+/// path everywhere. Default 64 on a discrete card, measured on an RTX PRO 4000 with a 10K prompt by chunk rows (old path against grouped:
+/// 16 rows +8%, 32 +3%, 64 equal, 128 -3%, 256 -8%; drafted decode at 8K+ context +6% with the old path); 2 on an integrated GPU (DGX Spark),
+/// where the grouped kernels were tuned and gated for every row count.
+fn attn_group_min(integrated: bool) -> usize {
+    std::env::var("INK_ATTN_GROUP_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if integrated { 2 } else { 64 }).max(2)
+}
+/// INK_ATTN_SPLIT=0 runs both prompt-attention phases through the one ink_attn_tcg kernel (A/B; same code, same bits).
+fn attn_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_ATTN_SPLIT").map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no")).unwrap_or(true))
+}
+/// INK_ATTN_ORDER=0 keeps the (group, head, q tile) block order of the grouped prompt attention (A/B; the order of blocks changes no bits).
+fn attn_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_ATTN_ORDER").map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no")).unwrap_or(true))
+}
+/// INK_ATTN_UNPACK=0 keeps the per-tile 6-bit unpack in the grouped prompt attention of the global layers (A/B; same values, same bits).
+fn attn_unpack() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_ATTN_UNPACK").map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no")).unwrap_or(true))
+}
+/// INK_SCONV_PAR=0 keeps the one-thread-a-channel short convolution for prompt chunks (A/B; same bits).
+fn sconv_par() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_SCONV_PAR").map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no")).unwrap_or(true))
+}
+/// INK_SGEMM_WIDE=0 keeps the 64-wide k stages for the small decode GEMMs (A/B; the bits are the same either way).
+fn sgemm_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INK_SGEMM_WIDE").map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no")).unwrap_or(true))
+}
+/// k-inkm attn_tc.rs ATC0_SMEM (phase 0 of the grouped prompt attention: no V tile)
+const ATC0_SMEM: u32 = 45440 - 64 * 272;
 /// k-inkm attn_tc.rs ATC_SMEM
 const ATC_SMEM: u32 = 16 * 272 + 2 * 64 * 272 + 16 * 144 * 2 + 16 * 16 * 4 + 4 * 16 * 2 * 4 + 16 * 4 * 2;
 
@@ -96,6 +150,46 @@ struct App {
     conv_v: Buf,
     conv_a: Buf,
     conv_m: Buf,
+}
+
+/// A lane's per-sequence state while another lane is the current one (see `Ink::select_lane`).
+struct LaneSt {
+    apps: Vec<App>,
+    len: usize,
+    pending: usize,
+    crow: usize,
+}
+
+/// Device pointers of one layer application of a lane: K, V, conv tails of K, V, attention, MLP.
+#[derive(Clone, Copy)]
+struct AppPtrs {
+    k: DevPtr,
+    v: DevPtr,
+    ck: DevPtr,
+    cv: DevPtr,
+    ca: DevPtr,
+    cm: DevPtr,
+}
+
+/// One lane's rows of a multi-lane forward: rows [off, off + t) of the pass are positions pos0.. of the lane.
+struct MultiSeg {
+    apps: Vec<AppPtrs>,
+    pos0: usize,
+    posbuf: DevPtr,
+    t: usize,
+    off: usize,
+    spec: bool,
+}
+
+/// What `apply` needs of a row segment (one for a single-lane forward).
+#[derive(Clone, Copy)]
+struct SegCtx {
+    a: AppPtrs,
+    pos0: usize,
+    posbuf: DevPtr,
+    t: usize,
+    off: usize,
+    spec: bool,
 }
 
 struct Scratch {
@@ -194,8 +288,8 @@ pub struct Ink {
     fit_floor: Option<usize>,
     capturing: bool,
     posbuf: Buf,
-    /// captured 1-row forwards keyed by (draft_taps, spec): the flags are baked into the captured kernels
-    graphs: std::collections::HashMap<(bool, bool), fe_cuda::Graph>,
+    /// captured 1-row forwards keyed by (lane, draft_taps, spec): the flags and the lane's buffers are baked into the captured kernels
+    graphs: std::collections::HashMap<(usize, bool, bool), fe_cuda::Graph>,
     pub use_graph: bool,
     /// global K/V in the 6-bit record form (INK_KVQ6=1): staging rows + packer
     pub kvq6: bool,
@@ -211,6 +305,19 @@ pub struct Ink {
     last: std::cell::Cell<Option<std::time::Instant>>,
     /// G16 expert slots (INK_HOST_EXPERTS=N): staging / adaptation runtime
     slots: Option<SlotRt>,
+    /// lanes (INK_LANES): `apps` / `len` / `pending` belong to lane `cur`; the other lanes' state is parked here (None at `cur`)
+    cur: usize,
+    parked: Vec<Option<LaneSt>>,
+    /// speculative rows the current lane's conv buffers can hold (tmax for lane 0, INK_LANE_SPEC_ROWS for the others)
+    crow: usize,
+    /// row segments of the multi-lane forward in progress (empty = single-lane forward)
+    multi: Vec<MultiSeg>,
+    /// position words of the multi-lane segments, 16 bytes each
+    posarr: Buf,
+    /// bf16 copy of one global application's K and V for the prompt attention (INK_ATTN_UNPACK), [2][cap][1024]
+    kvu: Option<Buf>,
+    /// rows from which a segment takes the grouped prompt attention (INK_ATTN_GROUP_MIN)
+    agmin: usize,
     /// last: the context outlives every buffer, stream and graph above
     pub ctx: Arc<Context>,
 }
@@ -294,6 +401,16 @@ fn mk_kv(li: usize, cap: usize, tmax: usize, kvq6: bool, lazy: bool, dev: i32) -
     Ok(KvBuf::Plain(alloc(ring_of(li, cap, tmax) * 1024 * 2)?))
 }
 
+/// INK_LANES: number of lanes (concurrent sequences) [1]. Lanes beyond the first need the lazily mapped K/V (INK_KV_LAZY).
+fn lanes_setting(_cap: usize, kv_lazy: bool) -> usize {
+    let n: usize = std::env::var("INK_LANES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1).clamp(1, 8);
+    if n > 1 && !kv_lazy {
+        eprintln!("ink: INK_LANES={n} needs INK_KV_LAZY=1 (each lane reserves the whole context): 1 lane");
+        return 1;
+    }
+    n
+}
+
 fn alloc(bytes: usize) -> Result<Buf> {
     Ok(Buf::alloc(bytes.max(16))?)
 }
@@ -334,6 +451,7 @@ impl Ink {
             copy_rows: m.function("ink_copy_rows")?,
             headclip: m.function("ink_headclip")?,
             sconv: m.function("ink_sconv")?,
+            sconv_par: m.function("ink_sconv_par")?,
             sconv_dyn: m.function("ink_sconv_dyn")?,
             argmax_rows: Module::load(K_DRAFT_CUBIN)?.function("dr_argmax_rows")?,
             conv_commit: m.function("ink_conv_commit")?,
@@ -341,6 +459,19 @@ impl Ink {
             kvq_pack: m.function("ink_kvq_pack")?,
             attn_tc: {
                 let f = m.function("ink_attn_tc")?;
+                f.set_max_dynamic_smem(ATC_SMEM)?;
+                f
+            },
+            attn_tcg: {
+                let f = m.function("ink_attn_tcg")?;
+                f.set_max_dynamic_smem(ATC_SMEM)?;
+                f
+            },
+            attn_comb3: m.function("ink_attn_comb3")?,
+            attn_tcg0: m.function("ink_attn_tcg0")?,
+            kv_unpack6: m.function("ink_kv_unpack6")?,
+            attn_tcg1: {
+                let f = m.function("ink_attn_tcg1")?;
                 f.set_max_dynamic_smem(ATC_SMEM)?;
                 f
             },
@@ -375,6 +506,16 @@ impl Ink {
             router_pick: m.function("ink_router_pick")?,
             gemm_s: m.function("ink_gemm_s")?,
             gemm_s8: m.function("ink_gemm_s8")?,
+            gemm_sw: {
+                let f = m.function("ink_gemm_sw")?;
+                f.set_max_dynamic_smem(SGEMMW_SMEM)?;
+                f
+            },
+            gemm_s8w: {
+                let f = m.function("ink_gemm_s8w")?;
+                f.set_max_dynamic_smem(SGEMM8W_SMEM)?;
+                f
+            },
             dequant: kk.module.function("ink_dequant_fp8")?,
         };
         let mut ck = Ckpt::open(&model_dir.join("model-00001-of-00001.safetensors"))?;
@@ -414,6 +555,25 @@ impl Ink {
             });
         }
         mem_mark(&ctx, &format!("K/V + rings + conv (cap {cap})"), &last);
+        // lanes 1.. (INK_LANES): own rings, lazily mapped global K/V and conv tails sized for verify rows (INK_LANE_SPEC_ROWS, 16)
+        let nlanes = lanes_setting(cap, kv_lazy);
+        let lrow: usize = std::env::var("INK_LANE_SPEC_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16).clamp(8, tmax);
+        let mut parked: Vec<Option<LaneSt>> = vec![None];
+        for _ in 1..nlanes {
+            let mut la = Vec::new();
+            for i in 0..NAPP {
+                la.push(App {
+                    k: mk_kv(li_of(i), cap, tmax, kvq6, kv_lazy, dev)?,
+                    v: mk_kv(li_of(i), cap, tmax, kvq6, kv_lazy, dev)?,
+                    conv_k: Buf::from_slice(&vec![0u8; (3 + lrow) * 1024 * 4])?, conv_v: Buf::from_slice(&vec![0u8; (3 + lrow) * 1024 * 4])?,
+                    conv_a: Buf::from_slice(&vec![0u8; (3 + lrow) * D * 4])?, conv_m: Buf::from_slice(&vec![0u8; (3 + lrow) * D * 4])?,
+                });
+            }
+            parked.push(Some(LaneSt { apps: la, len: 0, pending: 0, crow: lrow }));
+        }
+        if nlanes > 1 {
+            mem_mark(&ctx, &format!("{} more lanes (rings, conv, K/V reserved)", nlanes - 1), &last);
+        }
         let t = tmax;
         let sc = Scratch {
             hs: [alloc(t * D * 2)?, alloc(t * D * 2)?], pre_hs: alloc(t * D * 2)?, prev12: alloc(t * D * 2)?,
@@ -438,11 +598,17 @@ impl Ink {
         let pf_scr = fe_inkk::PrefillScratch::new(tmax)?;
         mem_mark(&ctx, &format!("prefill MoE scratch (tmax {tmax})"), &last);
         let me = Ink { ctx, s, k, w, ck, apps, sc, cap, tmax, len: 0, prof_on: false, kk, prompt: true, spec: false, argmax_only: false, last_argmax: vec![], am_out: alloc(64 * 4)?, pending: 0, draft_taps: false, dtaps: alloc(tmax * 4 * D * 2)?,
-            dq: alloc(6528 * 2304 * 2)?, ast: alloc(16 << 20)?, apt: if kv_lazy { KvBuf::Lazy(fe_cuda::VmBuffer::reserve(att_bytes, dev)?) } else { KvBuf::Plain(alloc(att_bytes)?) }, fit_floor: std::env::var("INK_FIT_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20), dg: true, dg_slide: false, dg2: true, att_mb, apt_reserved: att_bytes, capturing: false, posbuf: alloc(16)?, graphs: std::collections::HashMap::new(), kvq6, kstg: alloc(if kvq6 { tmax * 2048 } else { 16 })?, vstg: alloc(if kvq6 { tmax * 2048 } else { 16 })?, posbuf0: Buf::from_slice(&[0u8; 16])?, use_graph: true, pf_scr,
+            dq: alloc(6528 * 2304 * 2)?, ast: alloc(16 << 20)?, apt: if kv_lazy { KvBuf::Lazy(fe_cuda::VmBuffer::reserve(att_bytes, dev)?) } else { KvBuf::Plain(alloc(att_bytes)?) }, fit_floor: std::env::var("INK_FIT_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20), dg: true, dg_slide: false, dg2: true, att_mb, apt_reserved: att_bytes, capturing: false, posbuf: alloc(16)?, graphs: std::collections::HashMap::new(), kvq6, kstg: alloc(if kvq6 { tmax * 2048 } else { 16 })?, vstg: alloc(if kvq6 { tmax * 2048 } else { 16 })?, posbuf0: Buf::from_slice(&[0u8; 16])?, use_graph: true, pf_scr, cur: 0, parked, crow: tmax, multi: vec![], posarr: alloc(64 * 16)?,
             aux: [Stream::new()?, Stream::new()?], ev_fork: fe_cuda::Event::new_no_timing()?,
             ev_join: [fe_cuda::Event::new_no_timing()?, fe_cuda::Event::new_no_timing()?],
-            prof: Default::default(), evs: Default::default(), last: Default::default(), slots: None };
+            prof: Default::default(), evs: Default::default(), last: Default::default(), slots: None, kvu: None, agmin: 2 };
         let mut me = me;
+        me.agmin = attn_group_min(me.ctx.attribute(18).unwrap_or(0) != 0);
+        // INK_ATTN_UNPACK (default on unified-memory GPUs such as GB10, where 2 x cap x 2 KiB is cheap): the bf16 scratch of one global
+        // application's K and V for the prompt attention
+        if me.kvq6 && attn_unpack() && me.ctx.attribute(18).unwrap_or(0) != 0 {
+            me.kvu = Some(alloc(2 * me.cap * 2048)?);
+        }
         let nmax = me.w.layers.iter().filter_map(|l| if let Experts::Slot { sl, .. } = &*l.experts { Some(sl.lock().unwrap().n_host()) } else { None }).max();
         if let Some(nmax) = nmax {
             me.slots = Some(SlotRt {
@@ -662,6 +828,181 @@ impl Ink {
     }
     pub fn prof_clear(&mut self) {
         self.prof.borrow_mut().clear();
+    }
+
+    /// Number of lanes (INK_LANES).
+    pub fn n_lanes(&self) -> usize {
+        self.parked.len()
+    }
+
+    /// The lane whose state `forward`, `reset`, `rollback`, `snapshot`, ... act on.
+    pub fn lane(&self) -> usize {
+        self.cur
+    }
+
+    /// Make lane `i` the current one (its K/V, rings, conv tails, length): a swap of the state objects, no device work.
+    pub fn select_lane(&mut self, i: usize) -> Result<()> {
+        ensure!(i < self.parked.len(), "lane {i} of {}", self.parked.len());
+        if i == self.cur {
+            return Ok(());
+        }
+        let mut st = self.parked[i].take().unwrap();
+        std::mem::swap(&mut st.apps, &mut self.apps);
+        std::mem::swap(&mut st.len, &mut self.len);
+        std::mem::swap(&mut st.pending, &mut self.pending);
+        std::mem::swap(&mut st.crow, &mut self.crow);
+        self.parked[self.cur] = Some(st);
+        self.cur = i;
+        Ok(())
+    }
+
+    /// Positions held by lane `i`.
+    pub fn lane_len(&self, i: usize) -> usize {
+        if i == self.cur { self.len } else { self.parked[i].as_ref().unwrap().len }
+    }
+
+    /// Speculative rows the current lane's conv buffers keep (a speculative chunk / verify forward may have at most this many rows).
+    pub fn spec_rows(&self) -> usize {
+        self.crow
+    }
+
+    fn lane_app_ptrs(&self, i: usize) -> Vec<AppPtrs> {
+        let apps = if i == self.cur { &self.apps } else { &self.parked[i].as_ref().unwrap().apps };
+        apps.iter().map(|a| AppPtrs { k: a.k.ptr(), v: a.v.ptr(), ck: a.conv_k.ptr(), cv: a.conv_v.ptr(), ca: a.conv_a.ptr(), cm: a.conv_m.ptr() }).collect()
+    }
+
+    /// One forward over the rows of several lanes: `segs` = (lane, token ids at the lane's next positions, speculative), each lane at most once.
+    /// Rows of one numeric definition whatever the row count and the neighbours (dense / expert GEMMs, router, gates, norms run over all rows;
+    /// K/V writes, short convolutions, attention and the position-dependent clip run per segment with that lane's state), so every row has the
+    /// bits of the same row in a single-lane forward. Returns the greedy token of each of the last `nl` rows (`argmax`) or their bf16 logits; the
+    /// logits of those rows stay on the device either way (`logits_ptr`). Every lane advances by its rows; a speculative segment is pending
+    /// (`rollback` after `select_lane`).
+    pub fn forward_multi(&mut self, segs: &[(usize, &[u32], bool)], nl: usize, argmax: bool) -> Result<Vec<u32>> {
+        let t: usize = segs.iter().map(|s| s.1.len()).sum();
+        ensure!(t >= 1 && t <= self.tmax && nl <= t && segs.len() <= 64, "multi forward of {t} rows ({} segments)", segs.len());
+        ensure!(nl <= 16 || self.slots.is_none(), "INK_HOST_EXPERTS: logits are kept for at most 16 rows");
+        for (i, s) in segs.iter().enumerate() {
+            ensure!(!s.1.is_empty() && segs[..i].iter().all(|o| o.0 != s.0), "multi forward: empty segment or lane {} twice", s.0);
+        }
+        self.ctx.bind()?;
+        let back = self.cur;
+        for s in segs {
+            self.select_lane(s.0)?;
+            if self.pending > 0 {
+                let p = self.pending;
+                self.commit(p)?;
+                self.pending = 0;
+            }
+            ensure!(!s.2 || s.1.len() <= self.crow, "lane {}: {} speculative rows, its conv buffers keep {}", s.0, s.1.len(), self.crow);
+            ensure!(self.len + s.1.len() <= self.cap, "lane {}: context {} + {} exceeds the cache {}", s.0, self.len, s.1.len(), self.cap);
+            let need = self.len + s.1.len();
+            self.ensure_kv(need)?;
+        }
+        self.select_lane(back)?;
+        let prompt = self.prompt;
+        self.prompt = false;
+        self.slot_hook(t)?;
+        let mut raw = vec![0u8; t * D * 2];
+        let mut pos = vec![0u32; segs.len() * 4];
+        let mut ms = Vec::with_capacity(segs.len());
+        let mut off = 0;
+        for (i, s) in segs.iter().enumerate() {
+            for (j, &id) in s.1.iter().enumerate() {
+                let r = self.ck.read_range("model.llm.embed.weight", id as usize * D * 2, D * 2)?;
+                raw[(off + j) * D * 2..(off + j + 1) * D * 2].copy_from_slice(&r);
+            }
+            let pos0 = self.lane_len(s.0);
+            pos[i * 4] = pos0 as u32;
+            ms.push(MultiSeg { apps: self.lane_app_ptrs(s.0), pos0, posbuf: at(&self.posarr, i * 16), t: s.1.len(), off, spec: s.2 });
+            off += s.1.len();
+        }
+        self.s.sync()?;
+        unsafe {
+            self.s.memcpy_htod(self.sc.x[0].ptr(), &raw)?;
+            self.s.memcpy_htod(self.posarr.ptr(), &pos)?;
+        }
+        self.multi = ms;
+        let r = self.body(t, nl, None, None);
+        self.multi.clear();
+        self.prompt = prompt;
+        r?;
+        self.s.sync()?;
+        let out = if argmax {
+            unsafe { self.s.launch(&self.k.argmax_rows, nl as u32, 1024u32, 0, (self.am_out.ptr(), self.sc.logits.ptr(), VOCAB as u32))? };
+            let mut ids = vec![0u32; nl];
+            self.s.sync()?;
+            fe_cuda::memcpy_dtoh(&mut ids, self.am_out.ptr())?;
+            ids
+        } else {
+            vec![]
+        };
+        for s in segs {
+            self.select_lane(s.0)?;
+            self.len += s.1.len();
+            self.pending = if s.2 { s.1.len() } else { 0 };
+        }
+        self.select_lane(back)?;
+        Ok(out)
+    }
+
+    /// The current lane's global K/V buffers (8 applications x K, V) with the bytes that hold its positions [0, m) (6-bit records are
+    /// stored in chunks of 64 positions: whole chunks).
+    pub fn kv_prefix(&self, m: usize) -> Vec<(DevPtr, usize)> {
+        let per = if self.kvq6 { m.div_ceil(64) * 64 * 832 } else { m * 2048 };
+        let mut v = vec![];
+        for (i, a) in self.apps.iter().enumerate() {
+            if is_full(li_of(i)) {
+                v.push((a.k.ptr(), per.min(a.k.mapped())));
+                v.push((a.v.ptr(), per.min(a.v.mapped())));
+            }
+        }
+        v
+    }
+
+    /// Take the physical memory of the current lane's global K/V out of its address range (lazily mapped K/V only); the lane is left
+    /// with none mapped (`ensure_kv` maps fresh memory as it grows). For a park pool that keeps conversations in device memory.
+    pub fn kv_detach(&mut self) -> Result<Vec<fe_cuda::VmHandles>> {
+        self.s.sync()?;
+        let mut v = vec![];
+        for (i, a) in self.apps.iter_mut().enumerate() {
+            if is_full(li_of(i)) {
+                for b in [&mut a.k, &mut a.v] {
+                    match b {
+                        KvBuf::Lazy(vb) => v.push(vb.detach()?),
+                        KvBuf::Plain(_) => anyhow::bail!("kv_detach needs the lazily mapped K/V (INK_KV_LAZY)"),
+                    }
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    /// Put memory taken by `kv_detach` back into the current lane's global K/V (its own mapping is released first).
+    pub fn kv_attach(&mut self, h: Vec<fe_cuda::VmHandles>) -> Result<()> {
+        self.s.sync()?;
+        let mut it = h.into_iter();
+        for (i, a) in self.apps.iter_mut().enumerate() {
+            if is_full(li_of(i)) {
+                for b in [&mut a.k, &mut a.v] {
+                    match b {
+                        KvBuf::Lazy(vb) => {
+                            vb.shrink(0)?;
+                            vb.attach(it.next().ok_or_else(|| anyhow::anyhow!("kv_attach: too few buffers"))?)?;
+                        }
+                        KvBuf::Plain(_) => anyhow::bail!("kv_attach needs the lazily mapped K/V (INK_KV_LAZY)"),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Host copy of `rows` bf16 logit rows of the last forward from row `r0` (multi-lane forwards keep them on the device).
+    pub fn logits_rows(&self, r0: usize, rows: usize) -> Result<Vec<u16>> {
+        let mut out = vec![0u16; rows * VOCAB];
+        self.s.sync()?;
+        fe_cuda::memcpy_dtoh(&mut out, at(&self.sc.logits, r0 * VOCAB * 2))?;
+        Ok(out)
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -910,7 +1251,10 @@ impl Ink {
     /// same bits as the 128x128 kernel), more rows the tensor-core tile kernel.
     pub fn gemm(&self, st: &Stream, c: DevPtr, a: DevPtr, w: DevPtr, m: usize, n: usize, k: usize, lda: usize, ldc: usize) -> Result<()> {
         unsafe {
-            if (m <= 16 || n <= 128) && k % 64 == 0 {
+            if m <= 16 && k % WBK == 0 && sgemm_wide() {
+                fe_inkk::pdl::launch(st, &self.k.gemm_sw, ((n as u32 + 31) / 32, (m as u32 + 15) / 16), 128u32, SGEMMW_SMEM,
+                    (c, a, w, m as u32, n as u32, k as u32, lda as u32, ldc as u32))?;
+            } else if (m <= 16 || n <= 128) && k % 64 == 0 {
                 // same mma and k order as the tile kernel: bits do not depend on which of the two runs
                 fe_inkk::pdl::launch(st, &self.k.gemm_s, ((n as u32 + 31) / 32, (m as u32 + 15) / 16), 128u32, SGEMM_SMEM,
                     (c, a, w, m as u32, n as u32, k as u32, lda as u32, ldc as u32))?;
@@ -931,8 +1275,13 @@ impl Ink {
         if m <= 16 && l.k % 64 == 0 {
             // FP8 weights through the same mma and k order as dequantise-then-GEMM: bits of the prompt family, half the bytes
             unsafe {
-                fe_inkk::pdl::launch(st, &self.k.gemm_s8, ((l.n as u32 + 31) / 32, 1u32), 128u32, SGEMM8_SMEM,
-                    (y, x, f.w8.ptr(), f.scale.ptr(), m as u32, l.n as u32, l.k as u32, lda as u32, ldy as u32))?;
+                if l.k % WBK == 0 && sgemm_wide() {
+                    fe_inkk::pdl::launch(st, &self.k.gemm_s8w, ((l.n as u32 + 31) / 32, 1u32), 128u32, SGEMM8W_SMEM,
+                        (y, x, f.w8.ptr(), f.scale.ptr(), m as u32, l.n as u32, l.k as u32, lda as u32, ldy as u32))?;
+                } else {
+                    fe_inkk::pdl::launch(st, &self.k.gemm_s8, ((l.n as u32 + 31) / 32, 1u32), 128u32, SGEMM8_SMEM,
+                        (y, x, f.w8.ptr(), f.scale.ptr(), m as u32, l.n as u32, l.k as u32, lda as u32, ldy as u32))?;
+                }
             }
         } else {
             ensure!(l.n * l.k <= 6528 * 2304, "dense scratch too small");
@@ -1002,10 +1351,16 @@ impl Ink {
         Ok(())
     }
 
-    fn sconv(&self, st: &Stream, out: DevPtr, x: DevPtr, w: DevPtr, state: DevPtr, t: usize, c: usize) -> Result<()> {
+    fn sconv_s(&self, st: &Stream, out: DevPtr, x: DevPtr, w: DevPtr, state: DevPtr, t: usize, c: usize, spec: bool) -> Result<()> {
         unsafe {
-            fe_inkk::pdl::launch(st, &self.k.sconv, (c as u32 + 255) / 256, 256u32, 0,
-                (out, c as u32, x, c as u32, w, state, t as u32, c as u32, self.spec as u32))?;
+            if t > 16 && sconv_par() {
+                // prompt chunks: rows split over blocks (same per-row arithmetic)
+                fe_inkk::pdl::launch(st, &self.k.sconv_par, ((c as u32 + 255) / 256, (t as u32 + 15) / 16), 256u32, 0,
+                    (out, c as u32, x, c as u32, w, state, t as u32, c as u32, spec as u32))?;
+            } else {
+                fe_inkk::pdl::launch(st, &self.k.sconv, (c as u32 + 255) / 256, 256u32, 0,
+                    (out, c as u32, x, c as u32, w, state, t as u32, c as u32, spec as u32))?;
+            }
         }
         Ok(())
     }
@@ -1016,6 +1371,22 @@ impl Ink {
         pos0: usize, forced: Option<&[i32]>, tap: Option<&mut Tap>) -> Result<()> {
         let lw = &self.w.layers[li];
         let app = &self.apps[app_index(li, pass)];
+        let ai = app_index(li, pass);
+        // row segments: one (the current lane) for a single-lane forward, one per lane for a multi-lane forward
+        let segs: Vec<SegCtx> = if self.multi.is_empty() {
+            vec![SegCtx { a: AppPtrs { k: app.k.ptr(), v: app.v.ptr(), ck: app.conv_k.ptr(), cv: app.conv_v.ptr(), ca: app.conv_a.ptr(), cm: app.conv_m.ptr() },
+                pos0, posbuf: self.posbuf.ptr(), t, off: 0, spec: self.spec }]
+        } else {
+            let plant = std::env::var("INK_LANES_PLANT").ok().as_deref() == Some("conv");
+            let ca0 = self.multi[0].apps[ai].ca;
+            self.multi.iter().map(|m| {
+                let mut a = m.apps[ai];
+                if plant {
+                    a.ca = ca0;
+                }
+                SegCtx { a, pos0: m.pos0, posbuf: m.posbuf, t: m.t, off: m.off, spec: m.spec }
+            }).collect()
+        };
         let sc = &self.sc;
         let full = lw.full;
         let boundary = li % 6 == 0;
@@ -1025,7 +1396,7 @@ impl Ink {
         let (kw, vw, wp, wr) = if q6 { (self.kstg.ptr(), self.vstg.ptr(), self.posbuf0.ptr(), self.tmax as u32) } else { (app.k.ptr(), app.v.ptr(), self.posbuf.ptr(), ring) };
         let nq = if full { 3 } else { 1 };
         let s = &self.s;
-        let dec = !self.prompt && t <= 16;
+        let dec = !self.prompt && t <= 16 && self.multi.is_empty();
         // G16 prompt chunks (> 32 rows): stage this layer's host experts into spare slots on the copy stream while its attention runs
         let stage_par: Option<usize> = if self.prompt && t > 32 && self.slots.is_some() && matches!(&*lw.experts, Experts::Slot { .. }) {
             let rt = self.slots.as_ref().unwrap();
@@ -1067,7 +1438,7 @@ impl Ink {
         self.tick("attn_in_res");
         if msgs {
             let gates = lw.gates.as_ref().unwrap();
-            if !self.prompt && t <= 16 {
+            if dec {
                 // decode: the three gates are independent, run them on three streams (joined before the projections)
                 s.record(&self.ev_fork)?;
                 for slot in 0..3 {
@@ -1104,9 +1475,7 @@ impl Ink {
         self.tick("in_norm");
         let (xk, xv) = if full || msgs { (xk, xv) } else { (xq, xq) };
         // 2. attention
-        let fork = !self.prompt && t <= 16;
-        let hb = (t as u32 * 24 + 7) / 8;
-        let nbk = (t as u32 * 8 + 7) / 8;
+        let fork = dec;
         // k and v chains: projection, (dynamic weights), short convolution, head norm into the cache. Independent of the query chain and of
         // each other: in decode they run on the two aux streams.
         let kchain = |st: &Stream| -> Result<()> {
@@ -1124,15 +1493,21 @@ impl Ink {
             }
             if full {
                 self.gemm(st, sc.dynk.ptr(), xk, lw.kdyn.as_ref().unwrap().ptr(), t, 32, D, D, 32)?;
-                unsafe {
-                    fe_inkk::pdl::launch(st, &self.k.sconv_dyn, 4u32, 256u32, 0, (sc.kcv.ptr(), 1024u32, sc.klin.ptr(), 1024u32, lw.kconv.ptr(),
-                        sc.dynk.ptr(), app.conv_k.ptr(), t as u32, 1024u32, self.spec as u32))?;
-                }
-            } else {
-                self.sconv(st, sc.kcv.ptr(), sc.klin.ptr(), lw.kconv.ptr(), app.conv_k.ptr(), t, 1024)?;
             }
-            unsafe {
-                fe_inkk::pdl::launch(st, &self.k.headnorm, nbk, 256u32, 0, (kw, sc.kcv.ptr(), 0u32, 22.627417f32, wp, t as u32, wr))?;
+            for g in &segs {
+                let (kcv, klin) = (at(&sc.kcv, g.off * 2048), at(&sc.klin, g.off * 2048));
+                if full {
+                    unsafe {
+                        fe_inkk::pdl::launch(st, &self.k.sconv_dyn, 4u32, 256u32, 0, (kcv, 1024u32, klin, 1024u32, lw.kconv.ptr(),
+                            at(&sc.dynk, g.off * 64), g.a.ck, g.t as u32, 1024u32, g.spec as u32))?;
+                    }
+                } else {
+                    self.sconv_s(st, kcv, klin, lw.kconv.ptr(), g.a.ck, g.t, 1024, g.spec)?;
+                }
+                let (kw, wp, wr) = if q6 { (at(&self.kstg, g.off * 2048), self.posbuf0.ptr(), self.tmax as u32) } else { (g.a.k, g.posbuf, ring) };
+                unsafe {
+                    fe_inkk::pdl::launch(st, &self.k.headnorm, (g.t as u32 * 8 + 7) / 8, 256u32, 0, (kw, kcv, 0u32, 22.627417f32, wp, g.t as u32, wr))?;
+                }
             }
             Ok(())
         };
@@ -1149,15 +1524,21 @@ impl Ink {
             }
             if full {
                 self.gemm(st, sc.dynv.ptr(), xv, lw.vdyn.as_ref().unwrap().ptr(), t, 32, D, D, 32)?;
-                unsafe {
-                    fe_inkk::pdl::launch(st, &self.k.sconv_dyn, 4u32, 256u32, 0, (sc.vcv.ptr(), 1024u32, sc.vlin.ptr(), 1024u32, lw.vconv.ptr(),
-                        sc.dynv.ptr(), app.conv_v.ptr(), t as u32, 1024u32, self.spec as u32))?;
-                }
-            } else {
-                self.sconv(st, sc.vcv.ptr(), sc.vlin.ptr(), lw.vconv.ptr(), app.conv_v.ptr(), t, 1024)?;
             }
-            unsafe {
-                fe_inkk::pdl::launch(st, &self.k.headnorm, nbk, 256u32, 0, (vw, sc.vcv.ptr(), 1u32, 0.0f32, wp, t as u32, wr))?;
+            for g in &segs {
+                let (vcv, vlin) = (at(&sc.vcv, g.off * 2048), at(&sc.vlin, g.off * 2048));
+                if full {
+                    unsafe {
+                        fe_inkk::pdl::launch(st, &self.k.sconv_dyn, 4u32, 256u32, 0, (vcv, 1024u32, vlin, 1024u32, lw.vconv.ptr(),
+                            at(&sc.dynv, g.off * 64), g.a.cv, g.t as u32, 1024u32, g.spec as u32))?;
+                    }
+                } else {
+                    self.sconv_s(st, vcv, vlin, lw.vconv.ptr(), g.a.cv, g.t, 1024, g.spec)?;
+                }
+                let (vw, wp, wr) = if q6 { (at(&self.vstg, g.off * 2048), self.posbuf0.ptr(), self.tmax as u32) } else { (g.a.v, g.posbuf, ring) };
+                unsafe {
+                    fe_inkk::pdl::launch(st, &self.k.headnorm, (g.t as u32 * 8 + 7) / 8, 256u32, 0, (vw, vcv, 1u32, 0.0f32, wp, g.t as u32, wr))?;
+                }
             }
             Ok(())
         };
@@ -1168,11 +1549,14 @@ impl Ink {
                     full, self.posbuf.ptr(), t);
             }
             self.gemm(st, sc.slin.ptr(), xq, lw.sink.ptr(), t, 24, D, D, 24)?;
-            unsafe {
-                fe_inkk::pdl::launch(st, &self.k.headclip, hb, 256u32, 0, (sc.qp.ptr(), sc.qgr.ptr(), 6528u32, lw.q_scale.ptr(), 24u32, 128u32,
-                    22.627417f32, full as u32, self.posbuf.ptr(), t as u32, 8192.0f32, 0.1f32))?;
-                fe_inkk::pdl::launch(st, &self.k.headclip, hb, 256u32, 0, (sc.rsx.ptr(), at(&sc.qgr, 6144 * 2), 6528u32, lw.rel_scale.ptr(), 24u32, 16u32,
-                    8.0f32, full as u32, self.posbuf.ptr(), t as u32, 8192.0f32, 0.1f32))?;
+            for g in &segs {
+                let hb = (g.t as u32 * 24 + 7) / 8;
+                unsafe {
+                    fe_inkk::pdl::launch(st, &self.k.headclip, hb, 256u32, 0, (at(&sc.qp, g.off * 3072 * 2), at(&sc.qgr, g.off * 6528 * 2), 6528u32, lw.q_scale.ptr(), 24u32, 128u32,
+                        22.627417f32, full as u32, g.posbuf, g.t as u32, 8192.0f32, 0.1f32))?;
+                    fe_inkk::pdl::launch(st, &self.k.headclip, hb, 256u32, 0, (at(&sc.rsx, g.off * 384 * 2), at(&sc.qgr, (g.off * 6528 + 6144) * 2), 6528u32, lw.rel_scale.ptr(), 24u32, 16u32,
+                        8.0f32, full as u32, g.posbuf, g.t as u32, 8192.0f32, 0.1f32))?;
+                }
             }
             Ok(())
         };
@@ -1193,85 +1577,128 @@ impl Ink {
             vchain(s)?;
         }
         self.tick("clip_conv");
-        unsafe {
-            if q6 {
-                let nb = ((t * 8 + 7) / 8) as u32;
-                s.launch(&self.k.kvq_pack, nb, 256u32, 0, (app.k.ptr(), self.kstg.ptr(), self.posbuf.ptr(), t as u32))?;
-                s.launch(&self.k.kvq_pack, nb, 256u32, 0, (app.v.ptr(), self.vstg.ptr(), self.posbuf.ptr(), t as u32))?;
-            }
-            // tensor-core attention in three launches over super-tiles of 512 keys (same bits for a row whatever the chunking)
-            let nsup = if !full { 10u32 } else if self.capturing { self.cap.div_ceil(128) as u32 } else { ((pos0 + t - 1) / 128 + 1) as u32 };
-            let ntiles = (t + 15) / 16;
-            let qtb = ntiles.min((self.apt.mapped() / (24 * nsup as usize * 8192)).max(1));
-            let window = if full { 0u32 } else { 1024u32 };
-            let mut qt0 = 0;
-            // 1..=8 rows (decode, verify): grouped-query scan (K read once for all rows and the three heads of a kv head, scores kept for the V pass); sliding layers
-            // use the same kernels over their window (one group of 16 super-tiles, ring cache)
-            let gsz = if full { 8usize } else { 16 };
-            let ngr = (nsup as usize + gsz - 1) / gsz;
-            let nch = if full { self.cap / 64 + 1 } else { 24 };
-            let gp_bytes = (8 * 24 * (self.cap.div_ceil(128) + 1).div_ceil(8) * 512).next_multiple_of(4096);
-            let dg_need = gp_bytes + 2 * nch * 16384;
-            // (the sliding layers keep ink_attn_tc: with one block a kv head the grouped scan is slower than its 80 blocks)
-            if self.dg && (full || self.dg_slide) && t <= 8 && qt0 == 0 && dg_need <= self.apt.mapped() {
-                let gp = self.apt.ptr();
-                let scr0 = self.apt.ptr().byte_add(gp_bytes);
-                let gst = self.ast.ptr().byte_add(8 << 20);
-                // 6..=8 rows of a global layer: two row groups in ONE scan (else two slices of 4 rows, two scans)
-                let one_scan = full && t >= 6 && self.dg2;
-                let slices: &[(u32, u32)] = if one_scan { &[(0, 0)] } else if t <= 5 { &[(0, t as u32)] } else { &[(0, 4), (4, t as u32 - 4)] };
-                for (si, &(row0, nr)) in slices.iter().enumerate() {
-                    let scr = scr0.byte_add(si * nch * 16384);
-                    if one_scan {
-                        fe_inkk::pdl::launch(s, &self.k.dg2_k, (ngr as u32, 8u32), 128u32, if q6 { 58624u32 } else { 56064u32 }, (self.ast.ptr(), scr, sc.qp.ptr(), app.k.ptr(), sc.rsx.ptr(), lw.proj.ptr(),
-                            self.posbuf.ptr(), 0.088388346f32, ring, nsup, t as u32, nch as u32, q6 as u32))?;
+        for g in &segs {
+            let (t, pos0) = (g.t, g.pos0);
+            unsafe {
+                if q6 {
+                    let nb = ((t * 8 + 7) / 8) as u32;
+                    s.launch(&self.k.kvq_pack, nb, 256u32, 0, (g.a.k, at(&self.kstg, g.off * 2048), g.posbuf, t as u32))?;
+                    s.launch(&self.k.kvq_pack, nb, 256u32, 0, (g.a.v, at(&self.vstg, g.off * 2048), g.posbuf, t as u32))?;
+                }
+                // tensor-core attention in three launches over super-tiles of 512 keys (same bits for a row whatever the chunking)
+                let nsup = if !full { 10u32 } else if self.capturing { self.cap.div_ceil(128) as u32 } else { ((pos0 + t - 1) / 128 + 1) as u32 };
+                let ntiles = (t + 15) / 16;
+                let qtb = ntiles.min((self.apt.mapped() / (24 * nsup as usize * 8192)).max(1));
+                let window = if full { 0u32 } else { 1024u32 };
+                let mut qt0 = 0;
+                // 1..=8 rows (decode, verify): grouped-query scan (K read once for all rows and the three heads of a kv head, scores kept for the V pass); sliding layers
+                // use the same kernels over their window (one group of 16 super-tiles, ring cache)
+                let gsz = if full { 8usize } else { 16 };
+                let ngr = (nsup as usize + gsz - 1) / gsz;
+                let nch = if full { self.cap / 64 + 1 } else { 24 };
+                let gp_bytes = (8 * 24 * (self.cap.div_ceil(128) + 1).div_ceil(8) * 512).next_multiple_of(4096);
+                let dg_need = gp_bytes + 2 * nch * 16384;
+                // (the sliding layers keep ink_attn_tc: with one block a kv head the grouped scan is slower than its 80 blocks)
+                if self.dg && (full || self.dg_slide) && t <= 8 && qt0 == 0 && dg_need <= self.apt.mapped() {
+                    let gp = self.apt.ptr();
+                    let scr0 = self.apt.ptr().byte_add(gp_bytes);
+                    let gst = self.ast.ptr().byte_add(8 << 20);
+                    // 6..=8 rows of a global layer: two row groups in ONE scan (else two slices of 4 rows, two scans)
+                    let one_scan = full && t >= 6 && self.dg2;
+                    let slices: &[(u32, u32)] = if one_scan { &[(0, 0)] } else if t <= 5 { &[(0, t as u32)] } else { &[(0, 4), (4, t as u32 - 4)] };
+                    for (si, &(row0, nr)) in slices.iter().enumerate() {
+                        let scr = scr0.byte_add(si * nch * 16384);
+                        if one_scan {
+                            fe_inkk::pdl::launch(s, &self.k.dg2_k, (ngr as u32, 8u32), 128u32, if q6 { 58624u32 } else { 56064u32 }, (self.ast.ptr(), scr, at(&sc.qp, g.off * 3072 * 2), g.a.k, at(&sc.rsx, g.off * 384 * 2), lw.proj.ptr(),
+                                g.posbuf, 0.088388346f32, ring, nsup, t as u32, nch as u32, q6 as u32))?;
+                        } else {
+                            fe_inkk::pdl::launch(s, &self.k.dg_k, (ngr as u32, 8u32), 128u32, if q6 { 48128u32 } else { 45568u32 }, (self.ast.ptr(), scr, at(&sc.qp, g.off * 3072 * 2), g.a.k, at(&sc.rsx, g.off * 384 * 2), lw.proj.ptr(),
+                                g.posbuf, 0.088388346f32, ring, nsup, nr, row0, t as u32, nch as u32, q6 as u32, window))?;
+                        }
+                    }
+                    self.tick(if full { "G_k_stats" } else { "S_k_stats" });
+                    fe_inkk::pdl::launch(s, &self.k.attn_gstat, (24u32, 1u32), 128u32, 0, (self.ast.ptr(), gst, at(&sc.slin, g.off * 24 * 2), 24u32, nsup, t as u32, 0u32, window, 0u32))?;
+                    self.tick(if full { "G_gstat" } else { "S_gstat" });
+                    for (si, &(row0, nr)) in slices.iter().enumerate() {
+                        let scr = scr0.byte_add(si * nch * 16384);
+                        if one_scan {
+                            fe_inkk::pdl::launch(s, &self.k.dg2_v, (ngr as u32, 8u32), 128u32, (if q6 { 17408u32 + 4 * 8064 } else { 34816u32 + 4 * 2048 }) + 24576,
+                                (gp, scr, gst, g.a.v, g.posbuf, ring, nsup, ngr as u32, t as u32, nch as u32, q6 as u32))?;
+                        } else {
+                            fe_inkk::pdl::launch(s, &self.k.dg_v, (ngr as u32, 8u32), 128u32, (if q6 { 17408u32 + 4 * 6528 } else { 34816u32 + 4096 }) + 4 * 3 * nr * 128 * 4,
+                                (gp, scr, gst, g.a.v, g.posbuf, ring, nsup, ngr as u32, nr, row0, t as u32, nch as u32, q6 as u32, window))?;
+                        }
+                    }
+                    self.tick(if full { "G_kv_pass" } else { "S_kv_pass" });
+                    fe_inkk::pdl::launch(s, &self.k.dg_comb, (24u32, t as u32), 128u32, 0, (at(&sc.gat, g.off * 3072 * 2), gp, at(&sc.qgr, (g.off * 6528 + 3072) * 2), 6528u32, ngr as u32, q6 as u32))?;
+                    self.tick(if full { "G_comb" } else { "S_comb" });
+                    qt0 = ntiles;
+                }
+                if qt0 < ntiles && t >= self.agmin && attn_group() {
+                    // prompt rows: one block a group of super-tiles (8 global / 16 sliding: the groups comb2 and gstat sum in order), one partial a group
+                    let gst = self.ast.ptr().byte_add(8 << 20);
+                    // 6-bit global K/V: unpack positions [0, pos0 + t) of this lane to bf16 once for this layer application (INK_ATTN_UNPACK, same values as the per-tile unpack)
+                    let (kp, vp, qm) = if let (true, Some(kb)) = (q6, self.kvu.as_ref()) {
+                        let npos = pos0 + t;
+                        let ku = kb.ptr();
+                        let vu = ku.byte_add(self.cap * 2048);
+                        fe_inkk::pdl::launch(s, &self.k.kv_unpack6, ((npos * 32 + 255) / 256) as u32, 256u32, 0, (ku, g.a.k, npos as u32))?;
+                        fe_inkk::pdl::launch(s, &self.k.kv_unpack6, ((npos * 32 + 255) / 256) as u32, 256u32, 0, (vu, g.a.v, npos as u32))?;
+                        self.tick("kv_unpack");
+                        (ku, vu, 2u32)
                     } else {
-                        fe_inkk::pdl::launch(s, &self.k.dg_k, (ngr as u32, 8u32), 128u32, if q6 { 48128u32 } else { 45568u32 }, (self.ast.ptr(), scr, sc.qp.ptr(), app.k.ptr(), sc.rsx.ptr(), lw.proj.ptr(),
-                            self.posbuf.ptr(), 0.088388346f32, ring, nsup, nr, row0, t as u32, nch as u32, q6 as u32, window))?;
+                        (g.a.k, g.a.v, q6 as u32)
+                    };
+                    let (n0, ng, n1, nc) = if full { ("G_k_stats", "G_gstat", "G_kv_pass", "G_comb") } else { ("S_k_stats", "S_gstat", "S_kv_pass", "S_comb") };
+                    let qtg = ntiles.min((self.apt.mapped() / (24 * ngr * 8192)).max(1)).min(((8usize << 20) / (24 * nsup as usize * 128)).max(1));
+                    while qt0 < ntiles {
+                        let qc = (ntiles - qt0).min(qtg) as u32;
+                        for phase in 0..2u32 {
+                            if phase == 1 {
+                                fe_inkk::pdl::launch(s, &self.k.attn_gstat, (24u32, qc), 128u32, 0, (self.ast.ptr(), gst,
+                                    at(&sc.slin, g.off * 24 * 2), 24u32, nsup, t as u32, qt0 as u32, window, 0u32))?;
+                                self.tick(ng);
+                            }
+                            // INK_ATTN_SPLIT=0: one kernel for both phases (phase 0 then needs the V tile's shared memory and phase 1's registers)
+                            let (kf, smem_b) = if !attn_split() { (&self.k.attn_tcg, ATC_SMEM) } else if phase == 0 { (&self.k.attn_tcg0, ATC0_SMEM) } else { (&self.k.attn_tcg1, ATC_SMEM) };
+                            let qo = attn_order();
+                            let grid = if qo { (qc, 24u32, ngr as u32) } else { (ngr as u32, 24u32, qc) };
+                            fe_inkk::pdl::launch(s, kf, grid, 128u32, smem_b, (self.ast.ptr(), gst, self.apt.ptr(), at(&sc.qp, g.off * 3072 * 2),
+                                kp, vp, at(&sc.rsx, g.off * 384 * 2), lw.proj.ptr(), g.posbuf, window, 0.088388346f32, ring, t as u32, phase,
+                                qt0 as u32, qm, nsup, gsz as u32, qo as u32))?;
+                            self.tick(if phase == 0 { n0 } else { n1 });
+                        }
+                        fe_inkk::pdl::launch(s, &self.k.attn_comb3, (24u32, qc), 1024u32, 0, (at(&sc.gat, g.off * 3072 * 2), self.apt.ptr(), at(&sc.qgr, (g.off * 6528 + 3072) * 2), 6528u32,
+                            ngr as u32, t as u32, qt0 as u32, q6 as u32))?;
+                        self.tick(nc);
+                        qt0 += qc as usize;
                     }
                 }
-                self.tick(if full { "G_k_stats" } else { "S_k_stats" });
-                fe_inkk::pdl::launch(s, &self.k.attn_gstat, (24u32, 1u32), 128u32, 0, (self.ast.ptr(), gst, sc.slin.ptr(), 24u32, nsup, t as u32, 0u32, window, 0u32))?;
-                self.tick(if full { "G_gstat" } else { "S_gstat" });
-                for (si, &(row0, nr)) in slices.iter().enumerate() {
-                    let scr = scr0.byte_add(si * nch * 16384);
-                    if one_scan {
-                        fe_inkk::pdl::launch(s, &self.k.dg2_v, (ngr as u32, 8u32), 128u32, (if q6 { 17408u32 + 4 * 8064 } else { 34816u32 + 4 * 2048 }) + 24576,
-                            (gp, scr, gst, app.v.ptr(), self.posbuf.ptr(), ring, nsup, ngr as u32, t as u32, nch as u32, q6 as u32))?;
-                    } else {
-                        fe_inkk::pdl::launch(s, &self.k.dg_v, (ngr as u32, 8u32), 128u32, (if q6 { 17408u32 + 4 * 6528 } else { 34816u32 + 4096 }) + 4 * 3 * nr * 128 * 4,
-                            (gp, scr, gst, app.v.ptr(), self.posbuf.ptr(), ring, nsup, ngr as u32, nr, row0, t as u32, nch as u32, q6 as u32, window))?;
+                while qt0 < ntiles {
+                    let qc = (ntiles - qt0).min(qtb) as u32;
+                    let gqa = (t == 1) as u32;
+                    let gst = self.ast.ptr().byte_add(8 << 20);
+                    let (n0, ng, n1, nc) = if full { ("G_k_stats", "G_gstat", "G_kv_pass", "G_comb") } else { ("S_k_stats", "S_gstat", "S_kv_pass", "S_comb") };
+                    for phase in 0..2u32 {
+                        if phase == 1 {
+                            fe_inkk::pdl::launch(s, &self.k.attn_gstat, (24u32, if gqa != 0 { 1u32 } else { qc }), 128u32, 0, (self.ast.ptr(), gst,
+                                at(&sc.slin, g.off * 24 * 2), 24u32, nsup, t as u32, qt0 as u32, window, gqa))?;
+                            self.tick(ng);
+                        }
+                        fe_inkk::pdl::launch(s, &self.k.attn_tc, (nsup, if gqa != 0 { 8u32 } else { 24u32 }, if gqa != 0 { 1u32 } else { qc }), 128u32, ATC_SMEM, (self.ast.ptr(), gst, self.apt.ptr(), at(&sc.qp, g.off * 3072 * 2), g.a.k,
+                            g.a.v, at(&sc.rsx, g.off * 384 * 2), lw.proj.ptr(), at(&sc.slin, g.off * 24 * 2), 24u32, g.posbuf, window, 0.088388346f32, ring,
+                            t as u32, phase, qt0 as u32, gqa, q6 as u32))?;
+                        self.tick(if phase == 0 { n0 } else { n1 });
                     }
+                    fe_inkk::pdl::launch(s, &self.k.attn_comb2, (24u32, qc), 1024u32, 0, (at(&sc.gat, g.off * 3072 * 2), self.apt.ptr(), at(&sc.qgr, (g.off * 6528 + 3072) * 2), 6528u32, nsup, t as u32,
+                        qt0 as u32, window, q6 as u32, if gqa != 0 { 128u32 } else { 2048u32 }))?;
+                    self.tick(nc);
+                    qt0 += qc as usize;
                 }
-                self.tick(if full { "G_kv_pass" } else { "S_kv_pass" });
-                fe_inkk::pdl::launch(s, &self.k.dg_comb, (24u32, t as u32), 128u32, 0, (sc.gat.ptr(), gp, at(&sc.qgr, 3072 * 2), 6528u32, ngr as u32, q6 as u32))?;
-                self.tick(if full { "G_comb" } else { "S_comb" });
-                qt0 = ntiles;
-            }
-            while qt0 < ntiles {
-                let qc = (ntiles - qt0).min(qtb) as u32;
-                let gqa = (t == 1) as u32;
-                let gst = self.ast.ptr().byte_add(8 << 20);
-                let (n0, ng, n1, nc) = if full { ("G_k_stats", "G_gstat", "G_kv_pass", "G_comb") } else { ("S_k_stats", "S_gstat", "S_kv_pass", "S_comb") };
-                for phase in 0..2u32 {
-                    if phase == 1 {
-                        fe_inkk::pdl::launch(s, &self.k.attn_gstat, (24u32, if gqa != 0 { 1u32 } else { qc }), 128u32, 0, (self.ast.ptr(), gst,
-                            sc.slin.ptr(), 24u32, nsup, t as u32, qt0 as u32, window, gqa))?;
-                        self.tick(ng);
-                    }
-                    fe_inkk::pdl::launch(s, &self.k.attn_tc, (nsup, if gqa != 0 { 8u32 } else { 24u32 }, if gqa != 0 { 1u32 } else { qc }), 128u32, ATC_SMEM, (self.ast.ptr(), gst, self.apt.ptr(), sc.qp.ptr(), app.k.ptr(),
-                        app.v.ptr(), sc.rsx.ptr(), lw.proj.ptr(), sc.slin.ptr(), 24u32, self.posbuf.ptr(), window, 0.088388346f32, ring,
-                        t as u32, phase, qt0 as u32, gqa, q6 as u32))?;
-                    self.tick(if phase == 0 { n0 } else { n1 });
+                if false {
+                    fe_inkk::pdl::launch(s, &self.k.gate_mul, ((t * 3072) as u32 + 255) / 256, 256u32, 0, (at(&sc.gat, g.off * 3072 * 2), at(&sc.att, g.off * 3072 * 2), at(&sc.qgr, (g.off * 6528 + 3072) * 2), 6528u32,
+                        (t * 3072) as u32))?;
                 }
-                fe_inkk::pdl::launch(s, &self.k.attn_comb2, (24u32, qc), 1024u32, 0, (sc.gat.ptr(), self.apt.ptr(), at(&sc.qgr, 3072 * 2), 6528u32, nsup, t as u32,
-                    qt0 as u32, window, q6 as u32, if gqa != 0 { 128u32 } else { 2048u32 }))?;
-                self.tick(nc);
-                qt0 += qc as usize;
-            }
-            if false {
-                fe_inkk::pdl::launch(s, &self.k.gate_mul, ((t * 3072) as u32 + 255) / 256, 256u32, 0, (sc.gat.ptr(), sc.att.ptr(), at(&sc.qgr, 3072 * 2), 6528u32,
-                    (t * 3072) as u32))?;
             }
         }
         self.tick(if full { "attn_global" } else { "attn_slide" });
@@ -1286,7 +1713,9 @@ impl Ink {
                 *nb += 1;
             }
         } else {
-        self.sconv(s, sc.a2.ptr(), sc.o.ptr(), lw.attn_conv.ptr(), app.conv_a.ptr(), t, D)?;
+        for g in &segs {
+            self.sconv_s(s, at(&sc.a2, g.off * D * 2), at(&sc.o, g.off * D * 2), lw.attn_conv.ptr(), g.a.ca, g.t, D, g.spec)?;
+        }
         self.tick("conv_a");
         // 3. residual and block states
         unsafe {
@@ -1367,7 +1796,9 @@ impl Ink {
         }
         self.tick("comb");
         if !dec {
-            self.sconv(s, sc.mc.ptr(), sc.moe.ptr(), lw.mlp_conv.ptr(), app.conv_m.ptr(), t, D)?;
+            for g in &segs {
+                self.sconv_s(s, at(&sc.mc, g.off * D * 2), at(&sc.moe, g.off * D * 2), lw.mlp_conv.ptr(), g.a.cm, g.t, D, g.spec)?;
+            }
             unsafe {
                 fe_inkk::pdl::launch(s, &self.k.final_add, (n + 255) / 256, 256u32, 0, (hs_out, sc.resid.ptr(), sc.mc.ptr(), n))?;
             }
@@ -1506,7 +1937,7 @@ impl Ink {
         self.tick("start");
         let graphable = self.use_graph && t == 1 && nl == 1 && !self.prompt && taps.is_none() && forced.is_none() && !self.prof_on;
         if graphable {
-            let key = (self.draft_taps, self.spec);
+            let key = (self.cur, self.draft_taps, self.spec);
             if !self.graphs.contains_key(&key) {
                 self.s.sync()?;
                 self.s.begin_capture()?;

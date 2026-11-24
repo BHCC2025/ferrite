@@ -21,7 +21,13 @@
 #   FERRITE_LOCK_WAIT 1: wait for a busy card instead of failing [0]
 #   INK_KV            6bit | bf16: the K/V cache of the 8 global layers [6bit on both layouts; bf16 is the opt-out, docs/inkling-2-mini.md has what it costs]
 #   INK_DRAFT         on | off: the model's own draft head [on]
-#   INK_LAYOUT        24gb | 16gb: force a layout [from the card's memory]
+#   FERRITE_PARK_GB   park pool for conversations a lane gives up (lanes > 1): GB of pinned host memory (the engine reads INK_PARK_GB;
+#                     on a DGX Spark the parked K/V stays resident in unified memory) [8, 16 on a DGX Spark; 0 = off; host memory that stays available: INK_PARK_RESERVE_GB, 16]
+#   INK_LANES         requests decoded at once, each with its own caches and prompt cache [4 on the 24 GB layout (also on a DGX Spark,
+#                     where up to 8 raise the total further), 1 on the 16 GB layout, where every extra lane parks ~125 more experts in host memory;
+#                     1 = one request at a time]
+#   INK_LANE_PREFILL_ROWS  prompt rows a prefilling lane adds to each pass beside decoding lanes [128; 256 on a DGX Spark]
+#   INK_LAYOUT        24gb | 16gb: force a layout [from the card's memory; 24gb on a DGX Spark]
 #   INK_NUMA          numactl binding for the server, "" to run unbound [--cpunodebind=0 --membind=0 when numactl is installed and the machine
 #                     has more than one NUMA node; bind it to the node the card hangs off]
 #   FE_DEFAULT_TEMPERATURE / FE_DEFAULT_REASONING_EFFORT / FE_DEFAULT_MAX_TOKENS
@@ -59,7 +65,12 @@ fl_check_arch "$bin" "$cap"
 export CUDA_VISIBLE_DEVICES=$uuid
 
 layout=${INK_LAYOUT:-}
-if [ -z "$layout" ]; then
+# DGX Spark (GB10, compute capability 12.1): unified memory, nvidia-smi reports no card memory. The 24 GB layout fits many times over;
+# prompts go in chunks of 2048 rows (1.7x the prefill of 256-row chunks at 8K, same logits: the forward is chunk-invariant).
+unified=0
+[ "$cap" = 12.1 ] && unified=1
+if [ -z "$layout" ] && [ $unified = 1 ]; then layout=24gb
+elif [ -z "$layout" ]; then
   if [ "$mib_total" -ge 23000 ]; then layout=24gb
   elif [ "$mib_total" -ge 15000 ]; then layout=16gb
   else die "$name has $mib_total MiB: Inkling-2-Mini needs a 16 GB card or larger"; fi
@@ -82,13 +93,19 @@ if [ "$layout" = 16gb ]; then
   [ "$mem_gib" -ge 24 ] || fl_warn "${mem_gib} GiB of host memory: the experts parked in pinned host memory take up to 4 GiB beside the page cache"
 else
   kv=${INK_KV:-6bit}
-  export INK_CHUNK=${INK_CHUNK:-256}
+  if [ $unified = 1 ]; then export INK_CHUNK=${INK_CHUNK:-2048}; else export INK_CHUNK=${INK_CHUNK:-256}; fi
 fi
 case $kv in
   6bit) export INK_KVQ6=1; [ "$layout" = 24gb ] && export INK_KV_LAZY=1 ;;
   bf16) unset INK_KVQ6 ;;
   *) die "INK_KV is bf16 or 6bit, not '$kv'" ;;
 esac
+if [ "$layout" = 24gb ]; then lanes=${INK_LANES:-4}; else lanes=${INK_LANES:-1}; fi
+fl_int INK_LANES "$lanes" 1 8
+export INK_LANES=$lanes
+# each lane maps its K/V as its context grows (a lane does not reserve the whole context up front)
+[ "$lanes" -gt 1 ] && export INK_KV_LAZY=1
+[ -n "${FERRITE_PARK_GB:-}" ] && export INK_PARK_GB=$FERRITE_PARK_GB
 
 numa=()
 if [ -z "${INK_NUMA+x}" ]; then
@@ -99,7 +116,7 @@ elif [ -n "$INK_NUMA" ]; then
   read -ra opts <<<"$INK_NUMA"; numa=(numactl "${opts[@]}")
 fi
 
-fl_say "Inkling-2-Mini from $dir on $name (${mib_total} MiB): $layout layout, $kv K/V, draft head $draft, ctx $ctx${numa:+, ${numa[*]}}"
+fl_say "Inkling-2-Mini from $dir on $name (${mib_total} MiB): $layout layout, $kv K/V, draft head $draft, ctx $ctx, $lanes lane(s)${numa:+, ${numa[*]}}"
 fl_net
 fl_take_locks "$uuid"
 fl_banner "${FERRITE_MODEL_ID:-inkling-2-mini}" "loading takes one to two minutes"

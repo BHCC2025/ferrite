@@ -14,7 +14,7 @@ other setup has its own page:
 | Intel Arc Pro B70 (32 GB), no longer maintained | Qwen3.8-27B | [arc-b70.md](arc-b70.md) |
 | One or two RTX 5060 Ti (16 GB) | Qwen3.8-Flash-Next | [flash-next.md](flash-next.md) |
 | Three or four cards (24 GB each, an optional 16 GB) | DeepSeek-V4.1-Flash Coder | [deepseek-coder.md](deepseek-coder.md) |
-| One RTX PRO 4000 Blackwell or RTX 5060 Ti | Inkling-2-Mini | [inkling-2-mini.md](inkling-2-mini.md) |
+| One RTX PRO 4000 Blackwell, RTX 5060 Ti or DGX Spark | Inkling-2-Mini | [inkling-2-mini.md](inkling-2-mini.md) |
 
 Terms such as slot, prompt processing, drafting and K/V cache are explained in the README's
 [Words used in these docs](../README.md#words-used-in-these-docs).
@@ -56,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/insta
 1. checks the machine: aarch64, a GB10 GPU (compute capability 12.1) with the NVIDIA driver, at least 95 GB of
    available memory (`FERRITE_MIN_FREE_GB`), and that the port is free or already serves Ferrite;
 2. gets Ferrite into `~/ferrite` (`FERRITE_HOME`): the latest published release, which it asks the GitHub API for
-   (`FERRITE_VERSION=0.9.5` or `--version 0.9.5` pins one), built from source: a clone of the release's tag,
+   (`FERRITE_VERSION=0.9.6` or `--version 0.9.6` pins one), built from source: a clone of the release's tag,
    rustup, the pinned toolchains and `cargo build` (a few minutes the first time). Run inside a checkout, it uses
    that folder instead. Ferrite ships no prebuilt binaries;
 3. installs the Hugging Face CLI into `~/.venvs/hf`;
@@ -301,6 +301,7 @@ none. Set it to build for a card that is not in the build machine. The build com
 | RTX 5060 Ti (Qwen3.8-Flash-Next) | `sm_120a` | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ferrite,fnext` ([flash-next.md](flash-next.md)) |
 | Three or four cards (DeepSeek-V4.1-Flash Coder) | `sm_120a` on the tested cards | `cargo build --release -p fe-server --features dsc -p fe-dsc` ([deepseek-coder.md](deepseek-coder.md)) |
 | RTX PRO 4000 Blackwell or RTX 5060 Ti (Inkling-2-Mini) | `sm_120a` | `FE_KARCH=sm_120a cargo build --release -p fe-server --features ink -p fe-ink` ([inkling-2-mini.md](inkling-2-mini.md)) |
+| DGX Spark (Inkling-2-Mini) | `sm_121a` (the default on aarch64) | `cargo build --release -p fe-server --features ink -p fe-ink` ([inkling-2-mini.md](inkling-2-mini.md)) |
 | Intel Arc Pro B70 | none (SPIR-V) | `cargo build --release --features xe -p fe-server` ([arc-b70.md](arc-b70.md)) |
 
 `target/release/fe-server` is one file: building it with other features replaces the previous build. The Flash-Next

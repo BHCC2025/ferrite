@@ -210,7 +210,26 @@ impl PCache {
     }
 
     fn prefill_inner(&mut self, ink: &mut Ink, mut spec: Option<&mut Spec>, prompt: &[u32], from: usize, mut stop: impl FnMut() -> bool) -> Result<Option<Vec<u16>>> {
-        let n = prompt.len();
+        let mut run = self.prefill_start(ink, spec.as_deref(), prompt.len(), from)?;
+        let mut lg = vec![];
+        while run.pos < run.n {
+            if stop() {
+                return Ok(None);
+            }
+            let ch = self.next_chunk(&run, ink, ink.tmax);
+            let pos = run.pos;
+            ink.spec = ch.spec;
+            let r = ink.forward(&prompt[pos..pos + ch.t], 1, None, None);
+            ink.spec = false;
+            lg = r?;
+            self.chunk_done(&mut run, ink, spec.as_deref_mut(), ch, 0)?;
+        }
+        Ok(Some(lg))
+    }
+
+    /// Start a chunked prefill of a prompt of `n` tokens from `from` (the engine's current lane at `from`, as left by [`PCache::begin`]): the
+    /// marks where snapshots are taken. `spec`: the draft head when its context is fed (current lane at `from` too).
+    pub fn prefill_start(&mut self, ink: &mut Ink, spec: Option<&Spec>, n: usize, from: usize) -> Result<PrefillRun> {
         ensure!(from < n && ink.len == from, "prefill from {from}: engine at {}, prompt of {n}", ink.len);
         let mut marks: Vec<usize> = vec![];
         if self.on {
@@ -226,62 +245,158 @@ impl PCache {
             }
         }
         ink.prompt = true;
-        if let Some(sp) = spec.as_deref() {
+        if let Some(sp) = spec {
             ensure!(sp.draft.ctx_len == from, "draft context at {} for a prefill from {from}", sp.draft.ctx_len);
             ink.draft_taps = true;
         }
-        let (mut pos, mut lg, mut mi) = (from, vec![], 0usize);
-        let row_b = 4 * D * 2;
-        while pos < n {
-            if stop() {
-                return Ok(None);
-            }
-            let t = (n - pos).min(ink.tmax);
-            let ms: Vec<usize> = marks[mi..].iter().take_while(|&&m| m <= pos + t).copied().collect();
-            mi += ms.len();
-            ink.spec = !ms.is_empty();
-            let r = ink.forward(&prompt[pos..pos + t], 1, None, None);
-            ink.spec = false;
-            lg = r?;
-            let ts = Instant::now();
-            let mut bufs: Vec<Option<HostBuffer<u8>>> = vec![];
-            for k in 0..ms.len() {
-                bufs.push(self.take_buf(k));
-            }
-            if let Some(sp) = spec.as_deref_mut() {
-                let mut d0 = pos;
-                for (k, &m) in ms.iter().enumerate() {
-                    if m > d0 {
-                        sp.draft.extend(ink, ink.dtaps.ptr().byte_add((d0 - pos) * row_b), m - d0, d0)?;
-                        d0 = m;
-                    }
-                    if let Some(b) = bufs[k].as_mut() {
-                        let ib = self.ink_bytes;
-                        sp.draft.snapshot(&ink.s, &mut b.as_mut_slice()[ib..])?;
-                    }
-                }
-                if pos + t > d0 {
-                    sp.draft.extend(ink, ink.dtaps.ptr().byte_add((d0 - pos) * row_b), pos + t - d0, d0)?;
-                }
-                sp.set_last_taps(ink.dtaps.ptr().byte_add((t - 1) * row_b));
-            }
-            for (k, &m) in ms.iter().enumerate() {
-                if let Some(mut b) = bufs[k].take() {
-                    let ib = self.ink_bytes;
-                    ink.snapshot(&mut b.as_mut_slice()[..ib], m)?;
-                    self.snaps.push(Snap { mark: m, draft: spec.is_some(), buf: b });
-                    self.last.snaps_taken += 1;
-                }
-            }
-            if !ms.is_empty() {
-                self.last.snap_ms += ts.elapsed().as_secs_f64() * 1e3;
-            }
-            if ink.pending_rows() > 0 {
-                // keep every row of the chunk: the conv tails as of its last row
-                ink.rollback(t)?;
-            }
-            pos += t;
-        }
-        Ok(Some(lg))
+        Ok(PrefillRun { n, pos: from, marks, mi: 0 })
     }
+
+    /// The next chunk of a prefill, at most `max_rows` rows. A chunk that holds marks runs as a speculative chunk (conv inputs kept, so the
+    /// conv tails at any of its rows can be read) when the lane's conv buffers hold its rows (`Ink::spec_rows`); otherwise it ends at the first
+    /// mark (snapshot after the chunk). Either way the rows are the same bits (chunk invariance).
+    pub fn next_chunk(&self, run: &PrefillRun, ink: &Ink, max_rows: usize) -> Chunk {
+        let pos = run.pos;
+        let mut t = (run.n - pos).min(max_rows).max(1);
+        let mut ms: Vec<usize> = run.marks[run.mi..].iter().take_while(|&&m| m <= pos + t).copied().collect();
+        if !ms.is_empty() && t > ink.spec_rows() {
+            t = ms[0] - pos;
+            ms.truncate(1);
+            return Chunk { t, spec: false, ms };
+        }
+        Chunk { t, spec: !ms.is_empty(), ms }
+    }
+
+    /// After the forward of chunk `ch` (rows at `tap_row0..` of `Ink::dtaps`): feed the draft context, take the snapshots of its marks, commit it.
+    pub fn chunk_done(&mut self, run: &mut PrefillRun, ink: &mut Ink, mut spec: Option<&mut Spec>, ch: Chunk, tap_row0: usize) -> Result<()> {
+        let r = self.chunk_done_inner(run, ink, spec.as_deref_mut(), ch, tap_row0);
+        if r.is_err() {
+            self.clear();
+        }
+        r
+    }
+
+    fn chunk_done_inner(&mut self, run: &mut PrefillRun, ink: &mut Ink, mut spec: Option<&mut Spec>, ch: Chunk, tap_row0: usize) -> Result<()> {
+        let (pos, t, ms) = (run.pos, ch.t, ch.ms);
+        run.mi += ms.len();
+        let row_b = 4 * D * 2;
+        let taps = ink.dtaps.ptr().byte_add(tap_row0 * row_b);
+        let ts = Instant::now();
+        let mut bufs: Vec<Option<HostBuffer<u8>>> = vec![];
+        for k in 0..ms.len() {
+            bufs.push(self.take_buf(k));
+        }
+        if let Some(sp) = spec.as_deref_mut() {
+            let mut d0 = pos;
+            for (k, &m) in ms.iter().enumerate() {
+                if m > d0 {
+                    sp.draft.extend(ink, taps.byte_add((d0 - pos) * row_b), m - d0, d0)?;
+                    d0 = m;
+                }
+                if let Some(b) = bufs[k].as_mut() {
+                    let ib = self.ink_bytes;
+                    sp.draft.snapshot(&ink.s, &mut b.as_mut_slice()[ib..])?;
+                }
+            }
+            if pos + t > d0 {
+                sp.draft.extend(ink, taps.byte_add((d0 - pos) * row_b), pos + t - d0, d0)?;
+            }
+            sp.set_last_taps(taps.byte_add((t - 1) * row_b));
+        }
+        for (k, &m) in ms.iter().enumerate() {
+            if let Some(mut b) = bufs[k].take() {
+                let ib = self.ink_bytes;
+                ink.snapshot(&mut b.as_mut_slice()[..ib], m)?;
+                self.snaps.push(Snap { mark: m, draft: spec.is_some(), buf: b });
+                self.last.snaps_taken += 1;
+            }
+        }
+        if !ms.is_empty() {
+            self.last.snap_ms += ts.elapsed().as_secs_f64() * 1e3;
+        }
+        if ink.pending_rows() > 0 {
+            // keep every row of the chunk: the conv tails as of its last row
+            ink.rollback(t)?;
+        }
+        run.pos += t;
+        Ok(())
+    }
+
+    /// The resume point a prompt would get from this cache (0 = none), as [`PCache::begin`] would choose it: for routing a request to a lane.
+    pub fn resume_point(&self, prompt: &[u32], need_draft: bool) -> usize {
+        if !self.on || prompt.is_empty() {
+            return 0;
+        }
+        let common = self.toks.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        let limit = common.min(prompt.len() - 1);
+        self.snaps.iter().rev().find(|s| s.mark > 0 && s.mark <= limit && (s.draft || !need_draft)).map_or(0, |s| s.mark)
+    }
+
+    /// Divide the snapshot budget among `lanes` caches (at least 2 snapshots each).
+    pub fn set_lanes(&mut self, lanes: usize) {
+        let gb: f64 = std::env::var("INK_PCACHE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+        self.max_snaps = ((gb * 1073741824.0) as usize / (self.bytes * lanes.max(1))).max(2);
+    }
+}
+
+/// A lane's conversation handed to the park pool (`PCache::take_for_park`): its newest snapshot and the tokens before it.
+pub struct ParkedCache {
+    toks: Vec<u32>,
+    snap: Snap,
+}
+
+impl ParkedCache {
+    /// Position of the snapshot: the global K/V (and draft context) of positions [0, mark) go with it.
+    pub fn mark(&self) -> usize {
+        self.snap.mark
+    }
+    /// The draft context was fed up to the mark.
+    pub fn draft(&self) -> bool {
+        self.snap.draft
+    }
+    /// Pinned host bytes of the snapshot.
+    pub fn bytes(&self) -> usize {
+        self.snap.buf.len()
+    }
+    /// The resume point this conversation gives `prompt` (the rule of `PCache::begin`); 0 = none.
+    pub fn resume(&self, prompt: &[u32], need_draft: bool) -> usize {
+        if prompt.is_empty() || (need_draft && !self.snap.draft) {
+            return 0;
+        }
+        let common = self.toks.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        if self.snap.mark > 0 && self.snap.mark <= common.min(prompt.len() - 1) { self.snap.mark } else { 0 }
+    }
+}
+
+impl PCache {
+    /// Give up this lane's conversation for parking: its newest snapshot (the furthest resume point) and its tokens; the other snapshots are
+    /// dropped. None when it holds no snapshot (nothing worth parking).
+    pub fn take_for_park(&mut self) -> Option<ParkedCache> {
+        let snap = self.snaps.pop();
+        let toks = std::mem::take(&mut self.toks);
+        self.clear();
+        snap.map(|snap| ParkedCache { toks, snap })
+    }
+
+    /// Hold a conversation back from the park pool (the lane's global K/V of [0, mark) must be in place); replaces what the cache held.
+    pub fn give_parked(&mut self, p: ParkedCache) {
+        self.clear();
+        self.snaps.push(p.snap);
+        self.toks = p.toks;
+    }
+}
+
+/// A chunked prefill in progress (see [`PCache::prefill_start`]).
+pub struct PrefillRun {
+    pub n: usize,
+    pub pos: usize,
+    marks: Vec<usize>,
+    mi: usize,
+}
+
+/// One chunk of a prefill (see [`PCache::next_chunk`]).
+pub struct Chunk {
+    pub t: usize,
+    pub spec: bool,
+    ms: Vec<usize>,
 }

@@ -2,8 +2,9 @@
 //!
 //! Per pass: the head drafts 7 tokens after the anchor (the last emitted token); the engine verifies `1 + d` rows (anchor + the first d drafts) as one
 //! speculative chunk (`Ink::spec`), the longest accepted prefix is kept (`Ink::rollback`), one more token comes from the target (bonus / correction).
-//! Greedy output is identical to plain decode (verify rows have the same bits as decode rows). Sampled output is lossless: the draft is a point
-//! mass, so a draft token d is accepted with probability p(d) and on rejection the next token is drawn from p with d removed.
+//! Greedy output is identical to plain decode (verify rows have the same bits as decode rows). Sampled output too: every verified row draws its
+//! token with the next uniform exactly as plain decode draws one, a draft is accepted when the drawn token is the draft (probability p(d): lossless),
+//! and one uniform is used a token emitted, so a seed gives the same tokens with drafting on or off and whatever the draft length.
 //! `d` adapts to the running acceptance: cost model pass = c0 + c1 * d ms, value = 1 + sum_j prod_{i<=j} q_i.
 use crate::draft::{Draft, NDRAFT};
 use crate::sampler::PenHist;
@@ -76,6 +77,11 @@ pub struct Spec {
     reg: [f64; 5],
     drafted_d: usize,
     pub stats: SpecStats,
+    /// multi-lane passes in a row this lane ran without drafts (`multi_d`)
+    multi_plain: usize,
+    /// lanes: the fields above (but `draft`, `suspend`, `fixed` and the pass cost model `reg`, a property of the card) belong to lane `cur`; the other lanes' are parked here (None at `cur`)
+    cur: usize,
+    parked: Vec<Option<SpecSt>>,
 }
 
 pub fn rng_next(s: &mut u64) -> f64 {
@@ -161,8 +167,16 @@ impl Spec {
         }
         let draft = Draft::load(ink.ctx.clone(), &ink.s, model_dir, fold, ink.cap, fp8_level(ink))?;
         ink.draft_taps = true;
-        Ok(Spec { draft, q: [0.8, 0.75, 0.83, 0.8, 0.75, 0.83, 0.8], last_ptr: DevPtr(0), stage: DeviceBuffer::<u8>::alloc(STAGE_ROWS * 4 * D * 2)?, staged: 0, susp_left: 0,
-            susp_k: 32, probing: 0, passes_run: 0, acc_tok: 0.0, acc_ms: 0.0, acc_n: 0, calib: false, calib_pending: true, since_calib: 0, spec_rate: 0.0, plain_ms: 13.5, suspend: true, fixed: None, cfg: SampleCfg::greedy(), hist: PenHist::default(), reg: [4.0, 16.0, 89.6, 80.0, 2.0 * (2.0 * 20.0 + 6.0 * 24.8)], drafted_d: 0, stats: SpecStats::default() })
+        // INK_DRAFT_FIXED=n (tests): always verify n drafts and never suspend, so drafting does not depend on measured times (seeded sampled
+        // requests with the draft head then give the same tokens run to run)
+        let fixed: Option<usize> = std::env::var("INK_DRAFT_FIXED").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &usize| n >= 1);
+        let mut sp = Spec { draft, q: [0.8, 0.75, 0.83, 0.8, 0.75, 0.83, 0.8], last_ptr: DevPtr(0), stage: DeviceBuffer::<u8>::alloc(STAGE_ROWS * 4 * D * 2)?, staged: 0, susp_left: 0,
+            susp_k: 32, probing: 0, passes_run: 0, acc_tok: 0.0, acc_ms: 0.0, acc_n: 0, calib: false, calib_pending: true, since_calib: 0, spec_rate: 0.0, plain_ms: 13.5, suspend: true, fixed: None, cfg: SampleCfg::greedy(), hist: PenHist::default(), reg: [4.0, 16.0, 89.6, 80.0, 2.0 * (2.0 * 20.0 + 6.0 * 24.8)], drafted_d: 0, stats: SpecStats::default(), multi_plain: 0, cur: 0, parked: vec![None] };
+        if let Some(n) = fixed {
+            sp.fixed = Some(n.min(NDRAFT));
+            sp.suspend = false;
+        }
+        Ok(sp)
     }
 
     pub fn reset(&mut self, ink: &mut Ink) -> Result<()> {
@@ -175,6 +189,7 @@ impl Spec {
     /// The per-request part of [`Spec::reset`] (acceptance estimates, statistics, suspension) without touching the engine or the draft
     /// context: a request that resumes from a prompt-cache snapshot starts here.
     pub fn reset_policy(&mut self) {
+        self.multi_plain = 0;
         self.q = [0.8, 0.75, 0.83, 0.8, 0.75, 0.83, 0.8];
         self.stats = SpecStats::default();
         self.last_ptr = DevPtr(0);
@@ -246,6 +261,19 @@ impl Spec {
         Ok(t)
     }
 
+    /// `first_token` from logits already on the device (`lg` = that row; `greedy` = its argmax).
+    pub fn first_token_dev(&mut self, ink: &Ink, lg: DevPtr, greedy: u32, rng: &mut u64) -> Result<u32> {
+        let t = if self.cfg.plain_greedy() {
+            greedy
+        } else {
+            let words = self.cfg.words();
+            let tab = self.table();
+            self.draft.sample_rows_filtered(&ink.s, lg, &[], &words, &tab, || rng_next(rng))?.1
+        };
+        self.push(t);
+        Ok(t)
+    }
+
     /// (a, b) of the pass cost model a + b * d (ms)
     pub fn cost_model(&self) -> (f64, f64) {
         let [w, wd, wy, wdd, wdy] = self.reg;
@@ -298,6 +326,17 @@ impl Spec {
 
     /// One pass. `anchor` = the last emitted token (not yet processed by the target). Returns the newly emitted tokens (at least one); the caller stops at EOS / limits.
     pub fn step(&mut self, ink: &mut Ink, anchor: u32, rng: &mut u64) -> Result<Vec<u32>> {
+        let (plan, rows) = self.plan(ink, anchor, NDRAFT)?;
+        let am = match &plan {
+            Plan::Plain { .. } | Plan::Forced => vec![ink.decode_argmax(rows[0])?],
+            Plan::Spec { .. } => ink.spec_argmax(&rows)?,
+        };
+        self.finish(ink, plan, 0, 0, &am, rng)
+    }
+
+    /// The first half of a pass (the current lane in `ink` and in the head): the rows to run, `[anchor]` (plain, drafting suspended) or
+    /// `[anchor] + d drafts` (a speculative chunk). The caller runs them (alone: `step`; with other lanes: `Ink::forward_multi`) and calls `finish`.
+    pub fn plan(&mut self, ink: &mut Ink, anchor: u32, dmax: usize) -> Result<(Plan, Vec<u32>)> {
         if self.suspend && self.fixed.is_none() && self.susp_left == 0 && self.probing == 0 && ink.len >= CALIB_MIN_CTX && (self.calib_pending || self.since_calib >= CALIB_EVERY) {
             self.calib = true;
             self.susp_left = if self.calib_pending { 3 } else { 2 };
@@ -305,7 +344,11 @@ impl Spec {
             self.since_calib = 0;
         }
         if self.susp_left > 0 {
-            return self.plain_step(ink, anchor, rng);
+            let t0 = std::time::Instant::now();
+            if self.staged == STAGE_ROWS {
+                self.flush_stage(ink)?;
+            }
+            return Ok((Plan::Plain { t0 }, vec![anchor]));
         }
         if self.staged > 0 {
             self.flush_stage(ink)?;
@@ -313,9 +356,178 @@ impl Spec {
         let t0 = std::time::Instant::now();
         // passes that try other draft lengths on purpose (see pick_d) say nothing about the speed of the best choice: they do not enter the rate
         let explore = self.stats.passes < 8 || self.stats.passes % 24 == 23;
-        let out = self.spec_pass(ink, anchor, rng)?;
-        let ms = t0.elapsed().as_secs_f64() * 1e3;
-        let rate = out.len() as f64 / ms;
+        let before = ink.len;
+        let dr = self.draft.draft(ink, anchor, self.last_ptr)?;
+        let t1 = std::time::Instant::now();
+        let d = self.pick_d().min(dmax.max(1));
+        self.drafted_d = d;
+        let mut rows = vec![anchor];
+        rows.extend_from_slice(&dr[..d]);
+        Ok((Plan::Spec { t0, t1, before, dr, d, explore, multi: false }, rows))
+    }
+
+    /// Drafts for this lane in a multi-lane pass: the d that adds the most tokens beyond what the pass time it costs would give the plain
+    /// rows of the pass (`rate` tokens a ms), with `draft_ms` for the head and `row_ms` a verify row; 0 = no drafts this pass. A lane that
+    /// went 16 passes without drafts probes 2 (its acceptance estimates only learn from drafted passes).
+    pub fn multi_d(&mut self, rate: f64, draft_ms: f64, row_ms: f64) -> usize {
+        if let Some(f) = self.fixed {
+            return f.clamp(1, NDRAFT);
+        }
+        if self.stats.passes < 4 {
+            return 3;
+        }
+        if self.multi_plain >= 16 {
+            return 2;
+        }
+        let (mut best, mut cum, mut pj) = ((0usize, 0.0f64), 0.0, 1.0);
+        for d in 1..=NDRAFT {
+            pj *= self.q[d - 1];
+            cum += pj;
+            let gain = cum - rate * (draft_ms + row_ms * d as f64);
+            if gain > best.1 {
+                best = (d, gain);
+            }
+        }
+        best.0
+    }
+
+    /// `plan` for a multi-lane pass with `d` drafts chosen by `multi_d` (0 = the plain row only); the single-lane suspension rule is not used here.
+    pub fn plan_multi(&mut self, ink: &mut Ink, anchor: u32, d: usize) -> Result<(Plan, Vec<u32>)> {
+        if d == 0 {
+            if self.staged == STAGE_ROWS {
+                self.flush_stage(ink)?;
+            }
+            return Ok((Plan::Forced, vec![anchor]));
+        }
+        if self.staged > 0 {
+            self.flush_stage(ink)?;
+        }
+        let t0 = std::time::Instant::now();
+        let before = ink.len;
+        let dr = self.draft.draft(ink, anchor, self.last_ptr)?;
+        let t1 = std::time::Instant::now();
+        let d = d.min(NDRAFT);
+        self.drafted_d = d;
+        let mut rows = vec![anchor];
+        rows.extend_from_slice(&dr[..d]);
+        Ok((Plan::Spec { t0, t1, before, dr, d, explore: true, multi: true }, rows))
+    }
+
+    /// The second half of a pass: `lrow` = the lane's first row among the logits the forward left on the device, `trow` = its first row in
+    /// `Ink::dtaps` (the forward's row), `am` = the greedy tokens of its rows. Accepts / rejects, rolls the lane back to the kept rows, extends
+    /// the draft context; returns the emitted tokens.
+    pub fn finish(&mut self, ink: &mut Ink, plan: Plan, lrow: usize, trow: usize, am: &[u32], rng: &mut u64) -> Result<Vec<u32>> {
+        let lp = ink.logits_ptr().byte_add(lrow * VOCAB * 2);
+        let row0 = trow;
+        let tap_b = 4 * D * 2;
+        match plan {
+            Plan::Plain { t0 } => {
+                // one plain decode token (same bits) while drafting is suspended: the taps of the processed token are staged for the draft context
+                let tok = if self.cfg.plain_greedy() {
+                    am[0]
+                } else {
+                    let words = self.cfg.words();
+                    let tab = self.table();
+                    self.draft.sample_rows_filtered(&ink.s, lp, &[], &words, &tab, || rng_next(rng))?.1
+                };
+                ink.s.memcpy_dtod(self.stage.ptr().byte_add(self.staged * tap_b), ink.dtaps.ptr().byte_add(row0 * tap_b), tap_b)?;
+                self.staged += 1;
+                self.push(tok);
+                self.stats.plain_tokens += 1;
+                self.stats.tokens += 1;
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                self.plain_ms = if self.calib { ms } else { 0.8 * self.plain_ms + 0.2 * ms };
+                self.susp_left -= 1;
+                if self.susp_left == 0 {
+                    self.flush_stage(ink)?;
+                    if self.calib {
+                        self.calib = false;
+                    } else {
+                        self.probing = 3;
+                        self.passes_run = 1;
+                        self.acc_tok = 0.0;
+                        self.acc_ms = 0.0;
+                        self.acc_n = 0;
+                    }
+                }
+                Ok(vec![tok])
+            }
+            Plan::Forced => {
+                let tok = if self.cfg.plain_greedy() {
+                    am[0]
+                } else {
+                    let words = self.cfg.words();
+                    let tab = self.table();
+                    self.draft.sample_rows_filtered(&ink.s, lp, &[], &words, &tab, || rng_next(rng))?.1
+                };
+                ink.s.memcpy_dtod(self.stage.ptr().byte_add(self.staged * tap_b), ink.dtaps.ptr().byte_add(row0 * tap_b), tap_b)?;
+                self.staged += 1;
+                self.push(tok);
+                self.stats.plain_tokens += 1;
+                self.stats.tokens += 1;
+                self.multi_plain += 1;
+                Ok(vec![tok])
+            }
+            Plan::Spec { t0, t1, before, dr, d, explore, multi } => {
+                let mut out: Vec<u32> = vec![];
+                let k;
+                if self.cfg.plain_greedy() {
+                    let mut kk = 0;
+                    while kk < d && dr[kk] == am[kk] {
+                        kk += 1;
+                    }
+                    k = kk;
+                    out.extend_from_slice(&dr[..k]);
+                    out.push(am[k]);
+                } else {
+                    // verify rows leave their logits on the device; accept / reject and the draw run there
+                    // the filtered sampler for every sampled request (temperature-only too): its rows draw exactly as plain decode draws, so the
+                    // tokens of a seed do not depend on drafting; history of row j = base + drafted prefix (the kernel adds the prefix; the base
+                    // excludes the anchor's successors, includes the anchor, already pushed)
+                    let (kk, tok) = {
+                        let words = self.cfg.words();
+                        let tab = self.table();
+                        self.draft.sample_rows_filtered(&ink.s, lp, &dr[..d], &words, &tab, || rng_next(rng))?
+                    };
+                    k = kk;
+                    out.extend_from_slice(&dr[..k]);
+                    out.push(tok);
+                }
+                let t2 = std::time::Instant::now();
+                ink.rollback(k + 1)?;
+                self.draft.extend(ink, ink.dtaps.ptr().byte_add(row0 * tap_b), k + 1, before)?;
+                self.last_ptr = ink.dtaps.ptr().byte_add((row0 + k) * tap_b);
+                let t3 = std::time::Instant::now();
+                for &t in &out {
+                    self.push(t);
+                }
+                for i in 1..=d {
+                    if k + 1 >= i {
+                        self.q[i - 1] = 0.9 * self.q[i - 1] + 0.1 * if k >= i { 1.0 } else { 0.0 };
+                    }
+                }
+                let st = &mut self.stats;
+                st.passes += 1;
+                st.accepted += k;
+                st.rows += d + 1;
+                st.tokens += k + 1;
+                st.hist[k] += 1;
+                st.t_draft += (t1 - t0).as_secs_f64();
+                st.t_verify += (t2 - t1).as_secs_f64();
+                st.t_commit += (t3 - t2).as_secs_f64();
+                if multi {
+                    self.multi_plain = 0;
+                } else {
+                    self.after_pass(out.len(), t0.elapsed().as_secs_f64() * 1e3, explore);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Rate bookkeeping and the suspension rule after a speculative pass of `n` tokens in `ms`.
+    fn after_pass(&mut self, n: usize, ms: f64, explore: bool) {
+        let rate = n as f64 / ms;
         if self.passes_run >= 2 {
             self.observe_cost(self.drafted_d, ms);
         }
@@ -325,7 +537,7 @@ impl Spec {
         }
         // steady state: the speed of the best draft length over many passes (the passes that try other lengths on purpose and the probes are left out)
         if self.passes_run >= 2 && !explore && self.probing == 0 {
-            self.acc_tok += out.len() as f64;
+            self.acc_tok += n as f64;
             self.acc_ms += ms;
             self.acc_n += 1;
             if self.acc_n >= 64 {
@@ -356,7 +568,6 @@ impl Spec {
                 self.stats.suspensions += 1;
             }
         }
-        Ok(out)
     }
 
     fn flush_stage(&mut self, ink: &mut Ink) -> Result<()> {
@@ -369,101 +580,74 @@ impl Spec {
         Ok(())
     }
 
-    /// One plain decode token (CUDA graph, same bits) while drafting is suspended: the taps of the processed token are staged for the draft context.
-    fn plain_step(&mut self, ink: &mut Ink, anchor: u32, rng: &mut u64) -> Result<Vec<u32>> {
-        let t0 = std::time::Instant::now();
-        if self.staged == STAGE_ROWS {
-            self.flush_stage(ink)?;
-            // the flushed rows' last taps stay valid in the staging buffer only until overwritten: copy them to row 0 position is not needed (extend consumed them)
+    /// Give the head `n` lanes (each its own draft context, policy state, sampler history and staging rows).
+    pub fn add_lanes(&mut self, n: usize) -> Result<()> {
+        self.draft.add_lanes(n)?;
+        while self.parked.len() < n {
+            self.parked.push(Some(SpecSt::fresh()?));
         }
-        let g = ink.decode_argmax(anchor)?;
-        let tok = if self.cfg.plain_greedy() {
-            g
-        } else {
-            let words = self.cfg.words();
-            let tab = self.table();
-            self.draft.sample_rows_filtered(&ink.s, ink.logits_ptr(), &[], &words, &tab, || rng_next(rng))?.1
-        };
-        ink.s.memcpy_dtod(self.stage.ptr().byte_add(self.staged * 4 * D * 2), ink.dtaps.ptr(), 4 * D * 2)?;
-        self.staged += 1;
-        self.push(tok);
-        self.stats.plain_tokens += 1;
-        self.stats.tokens += 1;
-        let ms = t0.elapsed().as_secs_f64() * 1e3;
-        self.plain_ms = if self.calib { ms } else { 0.8 * self.plain_ms + 0.2 * ms };
-        self.susp_left -= 1;
-        if self.susp_left == 0 {
-            self.flush_stage(ink)?;
-            if self.calib {
-                self.calib = false;
-            } else {
-                self.probing = 3;
-                self.passes_run = 1;
-                self.acc_tok = 0.0;
-                self.acc_ms = 0.0;
-                self.acc_n = 0;
-            }
-        }
-        Ok(vec![tok])
+        Ok(())
     }
 
-    fn spec_pass(&mut self, ink: &mut Ink, anchor: u32, rng: &mut u64) -> Result<Vec<u32>> {
-        let t0 = std::time::Instant::now();
-        let before = ink.len;
-        let dr = self.draft.draft(ink, anchor, self.last_ptr)?;
-        let t1 = std::time::Instant::now();
-        let d = self.pick_d();
-        self.drafted_d = d;
-        let mut rows = vec![anchor];
-        rows.extend_from_slice(&dr[..d]);
-        let mut out: Vec<u32> = vec![];
-        let k;
-        if self.cfg.plain_greedy() {
-            let a = ink.spec_argmax(&rows)?;
-            let mut kk = 0;
-            while kk < d && dr[kk] == a[kk] {
-                kk += 1;
-            }
-            k = kk;
-            out.extend_from_slice(&dr[..k]);
-            out.push(a[k]);
-        } else {
-            // verify rows leave their logits on the device; accept / reject and the draw run there (spec_argmax is only the cheap forward entry)
-            let _ = ink.spec_argmax(&rows)?;
-            let (kk, tok) = if self.cfg.filtered() {
-                let words = self.cfg.words();
-                let tab = self.table();
-                // history of row j = base + drafted prefix: the kernel adds the prefix; the base excludes the anchor's successors, includes the anchor (already pushed)
-                self.draft.sample_rows_filtered(&ink.s, ink.logits_ptr(), &dr[..d], &words, &tab, || rng_next(rng))?
-            } else {
-                self.draft.sample_rows(&ink.s, ink.logits_ptr(), &dr[..d], 1.0 / self.cfg.temperature, || rng_next(rng))?
-            };
-            k = kk;
-            out.extend_from_slice(&dr[..k]);
-            out.push(tok);
+    pub fn n_lanes(&self) -> usize {
+        self.parked.len()
+    }
+
+    /// Make lane `i` current (its policy state and draft context); select the same lane in the engine (`Ink::select_lane`).
+    pub fn select_lane(&mut self, i: usize) -> Result<()> {
+        anyhow::ensure!(i < self.parked.len(), "spec lane {i} of {}", self.parked.len());
+        if i == self.cur {
+            return Ok(());
         }
-        let t2 = std::time::Instant::now();
-        ink.rollback(k + 1)?;
-        self.draft.extend(ink, ink.dtaps.ptr(), k + 1, before)?;
-        self.last_ptr = ink.dtaps.ptr().byte_add(k * 4 * D * 2);
-        let t3 = std::time::Instant::now();
-        for &t in &out {
-            self.push(t);
-        }
-        for i in 1..=d {
-            if k + 1 >= i {
-                self.q[i - 1] = 0.9 * self.q[i - 1] + 0.1 * if k >= i { 1.0 } else { 0.0 };
-            }
-        }
-        let st = &mut self.stats;
-        st.passes += 1;
-        st.accepted += k;
-        st.rows += d + 1;
-        st.tokens += k + 1;
-        st.hist[k] += 1;
-        st.t_draft += (t1 - t0).as_secs_f64();
-        st.t_verify += (t2 - t1).as_secs_f64();
-        st.t_commit += (t3 - t2).as_secs_f64();
-        Ok(out)
+        self.draft.select_lane(i)?;
+        let mut st = self.parked[i].take().unwrap();
+        macro_rules! sw { ($($f:ident),*) => { $( std::mem::swap(&mut self.$f, &mut st.$f); )* } }
+        sw!(q, last_ptr, stage, staged, susp_left, susp_k, probing, passes_run, acc_tok, acc_ms, acc_n, calib, calib_pending, since_calib, spec_rate,
+            plain_ms, cfg, hist, drafted_d, stats, multi_plain);
+        self.parked[self.cur] = Some(st);
+        self.cur = i;
+        Ok(())
+    }
+}
+
+/// The first half of a pass (see `Spec::plan`).
+pub enum Plan {
+    Plain { t0: std::time::Instant },
+    Spec { t0: std::time::Instant, t1: std::time::Instant, before: usize, dr: [u32; NDRAFT], d: usize, explore: bool, multi: bool },
+    /// a multi-lane pass without drafts by choice (`Spec::multi_d`): the taps are staged as while suspended
+    Forced,
+}
+
+/// A lane's per-request drafting state while another lane is current (see `Spec::select_lane`).
+struct SpecSt {
+    q: [f64; NDRAFT],
+    last_ptr: DevPtr,
+    stage: DeviceBuffer<u8>,
+    staged: usize,
+    susp_left: usize,
+    susp_k: usize,
+    probing: usize,
+    passes_run: usize,
+    acc_tok: f64,
+    acc_ms: f64,
+    acc_n: usize,
+    calib: bool,
+    calib_pending: bool,
+    since_calib: usize,
+    spec_rate: f64,
+    plain_ms: f64,
+    cfg: SampleCfg,
+    hist: PenHist,
+    drafted_d: usize,
+    stats: SpecStats,
+    multi_plain: usize,
+}
+
+impl SpecSt {
+    /// The state `Spec::load` starts with.
+    fn fresh() -> Result<SpecSt> {
+        Ok(SpecSt { q: [0.8, 0.75, 0.83, 0.8, 0.75, 0.83, 0.8], last_ptr: DevPtr(0), stage: DeviceBuffer::<u8>::alloc(STAGE_ROWS * 4 * D * 2)?, staged: 0, susp_left: 0,
+            susp_k: 32, probing: 0, passes_run: 0, acc_tok: 0.0, acc_ms: 0.0, acc_n: 0, calib: false, calib_pending: true, since_calib: 0, spec_rate: 0.0, plain_ms: 13.5,
+            cfg: SampleCfg::greedy(), hist: PenHist::default(), drafted_d: 0, stats: SpecStats::default(), multi_plain: 0 })
     }
 }

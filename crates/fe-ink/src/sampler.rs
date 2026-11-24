@@ -167,10 +167,12 @@ impl DevSampler {
         Ok((k, t[0]))
     }
 
-    /// Filtered speculative sampling over `drafts.len() + 1` verified rows with bf16 logits on the device at `logits` (or, when `host_row` is Some, a single
-    /// host row uploaded first): the final distribution of every row is the request's (penalties with the drafted prefix as history, temperature, top-k, min-p,
-    /// top-p; greedy when `cfg.greedy`), computed on the device. Draft j is accepted with probability p_j(draft_j), a rejection draws from p_j without it, after d
-    /// accepted drafts a token is drawn from row d. `tab`: base history [(token, output count, seen)]. Returns (accepted, token).
+    /// Filtered speculative sampling over `drafts.len() + 1` verified rows with bf16 logits on the device at `logits`: the final distribution of every row is
+    /// the request's (penalties with the drafted prefix as history, temperature, top-k, min-p, top-p; greedy when `cfg.greedy`), computed on the device.
+    /// Row j draws its token with the next uniform, the way plain decode draws a token; draft j is accepted when that token is the draft (probability
+    /// p_j(draft_j): lossless), the first other token ends the pass, after d accepted drafts row d's token is the bonus. One uniform a token emitted, so the
+    /// tokens of a seeded request do not depend on the drafts (on, off, how many): they are the tokens plain decode draws. `tab`: base history
+    /// [(token, output count, seen)]. Returns (accepted, token).
     pub fn sample_rows_filtered(&mut self, st: &Stream, logits: DevPtr, drafts: &[u32], cfg: &[u32; 8], tab: &[[u32; 3]], banned: &[u32], mut u: impl FnMut() -> f64) -> Result<(usize, u32)> {
         let d = drafts.len();
         ensure!(tab.len() <= FTAB_CAP, "penalty history too large");
@@ -212,21 +214,19 @@ impl DevSampler {
                 self.fext.ptr(), self.fnext.ptr(), self.sdraft.ptr(), self.foutf.ptr(), self.foutu.ptr(), self.fban.ptr(), banned.len() as u32))?;
         }
         st.sync()?;
-        let mut of = [0f32; 64];
-        fe_cuda::memcpy_dtoh(&mut of, self.foutf.ptr())?;
-        let mut k = 0;
-        while k < d && u() < of[k * 8 + 6] as f64 {
-            k += 1;
+        for j in 0..=d {
+            unsafe {
+                st.launch(&self.f_fsample, 1u32, 1024u32, 0, (self.ftok.ptr(), self.fs.ptr(), j as u32, VOCAB as u32, self.foutf.ptr(), self.foutu.ptr(),
+                    0xffff_ffffu32, u() as f32, cfg[1]))?;
+            }
+            st.sync()?;
+            let mut t = [0u32; 4];
+            fe_cuda::memcpy_dtoh(&mut t, self.ftok.ptr())?;
+            if j == d || t[0] != drafts[j] {
+                return Ok((j, t[0]));
+            }
         }
-        let skip = if k < d { drafts[k] } else { 0xffff_ffffu32 };
-        unsafe {
-            st.launch(&self.f_fsample, 1u32, 1024u32, 0, (self.ftok.ptr(), self.fs.ptr(), k as u32, VOCAB as u32, self.foutf.ptr(), self.foutu.ptr(), skip,
-                u() as f32, cfg[1]))?;
-        }
-        st.sync()?;
-        let mut t = [0u32; 4];
-        fe_cuda::memcpy_dtoh(&mut t, self.ftok.ptr())?;
-        Ok((k, t[0]))
+        unreachable!()
     }
 
     /// Upload one host row of bf16 logits to scratch (first token after the prompt) and return its device pointer.

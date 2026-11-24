@@ -16,14 +16,15 @@ use fe_ink::spec::{argmax, rng_next, SampleCfg, Spec};
 
 use crate::engine::{Engine, EngineInfo, Finish, FinishReason, GenRequest, Timings, TokenSink};
 
-struct Job {
-    req: GenRequest,
-    sink: TokenSink,
+pub(crate) struct Job {
+    pub(crate) req: GenRequest,
+    pub(crate) sink: TokenSink,
 }
 
 pub struct InkEngine {
     tx: Mutex<mpsc::Sender<Job>>,
     ctx: usize,
+    lanes: usize,
     dead: Arc<Mutex<Option<String>>>,
 }
 
@@ -31,7 +32,7 @@ impl InkEngine {
     /// Load the model on the visible card (CUDA_VISIBLE_DEVICES) and start the engine thread. `ctx` = context window.
     pub fn start(model_dir: PathBuf, ctx: usize) -> Result<InkEngine> {
         let (tx, rx) = mpsc::channel::<Job>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<usize, String>>();
         let dead = Arc::new(Mutex::new(None));
         let dead2 = dead.clone();
         let chunk: usize = std::env::var("INK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
@@ -61,7 +62,7 @@ impl InkEngine {
                         Err(e) => { tracing::warn!("ink engine: draft head not loaded ({e:#}), plain decode"); ink.draft_taps = false; None }
                     }
                 };
-                // the model's own draft head (lossless: greedy == plain decode bit for bit, sampled = accept/reject); INK_NODRAFT=1 turns it off
+                // the model's own draft head (lossless: greedy and seeded sampled requests give the tokens plain decode gives); INK_NODRAFT=1 turns it off
                 let mut spec = if head_allowed { load_head(&mut ink) } else { None };
                 let mut head_failed = head_allowed && spec.is_none();
                 // device sampler for plain (non-drafted) decode: the same distribution code as the draft loop, no host softmax
@@ -73,7 +74,12 @@ impl InkEngine {
                 } else {
                     tracing::info!("ink engine: prompt cache off (INK_PCACHE=0)");
                 }
-                let _ = ready_tx.send(Ok(()));
+                // INK_LANES > 1: several requests at once (crate::ink_lanes); the draft head stays as loaded
+                if ink.n_lanes() > 1 {
+                    let _ = ready_tx.send(Ok(ink.n_lanes()));
+                    return crate::ink_lanes::run_lanes(&mut ink, spec.as_mut(), &mut dsamp, &rx);
+                }
+                let _ = ready_tx.send(Ok(1));
                 while let Ok(job) = rx.recv() {
                     let need = job.req.prompt_ids.len() + job.req.params.max_tokens;
                     if spec.is_some() && need > max_head {
@@ -102,18 +108,18 @@ impl InkEngine {
             };
             *dead2.lock().unwrap() = Some(why);
         })?;
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
+        let lanes = match ready_rx.recv() {
+            Ok(Ok(n)) => n,
             Ok(Err(e)) => anyhow::bail!("ink engine: {e}"),
             Err(_) => anyhow::bail!("ink engine thread died while loading"),
-        }
-        Ok(InkEngine { tx: Mutex::new(tx), ctx, dead })
+        };
+        Ok(InkEngine { tx: Mutex::new(tx), ctx, lanes, dead })
     }
 }
 
 impl Engine for InkEngine {
     fn info(&self) -> EngineInfo {
-        EngineInfo { name: "ink (Inkling-2-Mini)".into(), max_batch: 1, max_context: self.ctx }
+        EngineInfo { name: "ink (Inkling-2-Mini)".into(), max_batch: self.lanes, max_context: self.ctx }
     }
 
     fn submit(&self, req: GenRequest, sink: TokenSink) {
@@ -137,7 +143,7 @@ fn run(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, pc: &
     }
     let t0 = Instant::now();
     // speculative decoding for every request except min_tokens (banned stop ids): greedy is bit-identical to plain decode, sampled requests (temperature,
-    // top-p / top-k / min-p, penalties) are distribution-exact through the device accept/reject (fe_ink::spec)
+    // top-p / top-k / min-p, penalties) give the tokens plain decode draws for the seed (each verified row draws as plain decode does, fe_ink::spec)
     let use_spec = spec.is_some() && p.min_tokens == 0 && n + p.max_tokens + 16 < ink.cap;
     let mut rng: u64 = p.seed.unwrap_or_else(crate::util::random_u64) | 1;
     let cfg = SampleCfg { temperature: p.temperature, top_k: p.top_k as u32, top_p: p.top_p, min_p: p.min_p, rep: p.repetition_penalty, pres: p.presence_penalty,
