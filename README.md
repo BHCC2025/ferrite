@@ -44,7 +44,7 @@ and each guide has the full tables, the long-context figures and how they were m
 | Qwen3.8-27B | One Intel Arc Pro B70 (32 GB), **no longer maintained** | 170 (measured with 0.6.0) | 1, up to 4 | [docs/arc-b70.md](docs/arc-b70.md) |
 | **Qwen3.8-Flash-Next** | One or two RTX 5060 Ti (16 GB), 32 GB of host memory | 93-99 (one card), 131-146 (two) | 1 to 4, by host memory | [docs/flash-next.md](docs/flash-next.md) |
 | **DeepSeek-V4.1-Flash Coder** | Three 24 GB cards, optionally a fourth of 16 GB | 103 (three cards), 114 (four) | 1, up to 4 | [docs/deepseek-coder.md](docs/deepseek-coder.md) |
-| **Inkling-2-Mini** | One RTX PRO 4000 Blackwell (24 GB), one RTX 5060 Ti (16 GB) or one DGX Spark | 138 (24 GB), 110 (16 GB), 74 (DGX Spark) | 4 (24 GB, DGX Spark), 1 (16 GB) | [docs/inkling-2-mini.md](docs/inkling-2-mini.md) |
+| **Inkling-2-Mini** | One RTX PRO 4000 Blackwell (24 GB), one RTX 5060 Ti (16 GB) or one DGX Spark | 138 (24 GB), 110 (16 GB), 72 (DGX Spark) | 4 (24 GB, DGX Spark), 1 (16 GB) | [docs/inkling-2-mini.md](docs/inkling-2-mini.md) |
 
 - **The Intel Arc Pro B70 row is no longer maintained.** The test card is gone, so that engine is not built or tested
   on later versions; the last one run on the card is 0.7.1. Its code, guide and model stay available
@@ -188,7 +188,7 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.6` pins one; a few minutes
+It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.7` pins one; a few minutes
 the first time: rustup, the pinned toolchains, `cargo build`) and puts the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the

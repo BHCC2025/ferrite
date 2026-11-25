@@ -69,10 +69,10 @@ fn attn_group() -> bool {
 /// batches, where it is the faster of the two on a discrete card); n rows or more take the grouped kernels (prompt chunks). Decided per segment
 /// from its own row count, so a lane's choice never depends on the other lanes; both paths give the same bits. INK_ATTN_GROUP=0 keeps the old
 /// path everywhere. Default 64 on a discrete card, measured on an RTX PRO 4000 with a 10K prompt by chunk rows (old path against grouped:
-/// 16 rows +8%, 32 +3%, 64 equal, 128 -3%, 256 -8%; drafted decode at 8K+ context +6% with the old path); 2 on an integrated GPU (DGX Spark),
-/// where the grouped kernels were tuned and gated for every row count.
-fn attn_group_min(integrated: bool) -> usize {
-    std::env::var("INK_ATTN_GROUP_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if integrated { 2 } else { 64 }).max(2)
+/// 16 rows +8%, 32 +3%, 64 equal, 128 -3%, 256 -8%; drafted decode at 8K+ context +6% with the old path) and 64 on an integrated GPU (DGX Spark,
+/// 8K prompt by chunk rows, old path against grouped: 16 rows +7%, 32 +2%, 64 -1%, 128 -2%, 256 -7%; drafted decode at 8K and 32K +4% with the old path).
+fn attn_group_min(_integrated: bool) -> usize {
+    std::env::var("INK_ATTN_GROUP_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64).max(2)
 }
 /// INK_ATTN_SPLIT=0 runs both prompt-attention phases through the one ink_attn_tcg kernel (A/B; same code, same bits).
 fn attn_split() -> bool {

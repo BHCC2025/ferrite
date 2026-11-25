@@ -5,7 +5,7 @@ mixture-of-experts reasoning model of about 20 GB. Ferrite serves it from the ch
 experts, FP8 attention) on **one NVIDIA GPU**: an **RTX PRO 4000 Blackwell (24 GB)**, an **RTX 5060 Ti (16 GB)** or a
 **DGX Spark (GB10, 128 GB of unified memory)**, with a **128K-token context on each**.
 
-- **Speed:** a short code request runs at 138 tokens/s on the 24 GB card, 110 on the 16 GB card and 74 on a DGX Spark
+- **Speed:** a short code request runs at 138 tokens/s on the 24 GB card, 110 on the 16 GB card and 72 on a DGX Spark
   ([Results](#results)).
 - **Text only.** The published model also reads images; this engine does not ([Limits](#limits)).
 - **Four requests at once on the 24 GB card and on a DGX Spark.** Each stream has its own caches; 4 short requests run at 160 to 190
@@ -269,7 +269,7 @@ the whole batch (median of 6 batches), against the same server with `INK_LANES=1
 
 ## Results
 
-**What to expect:** with the draft head on, a short code request runs at 138 tokens/s on the RTX PRO 4000, 110 on the RTX 5060 Ti and 74 on a
+**What to expect:** with the draft head on, a short code request runs at 138 tokens/s on the RTX PRO 4000, 110 on the RTX 5060 Ti and 72 on a
 DGX Spark; prose runs at the plain speed, about 83, 70 and 43. At a 126K-token context the RTX PRO 4000 still decodes code at 117 tokens/s and the
 RTX 5060 Ti at 64.
 
@@ -464,7 +464,7 @@ These are the engine's own settings, its whole interface. The launcher sets them
 | `INK_PARK_MIN=n` | conversations shorter than n tokens are not parked [512] |
 | `INK_SGEMM_WIDE=0` | the small decode GEMMs stream 64 instead of 256 k-columns a pipeline stage (same output; for comparisons) |
 | `INK_SCONV_PAR=0` | the short convolution of a prompt chunk walks its rows in one thread a channel (same output; for comparisons) |
-| `INK_ATTN_GROUP_MIN` | rows from which a batch takes the grouped prompt attention: 64 on a discrete card, where smaller batches (draft verification) are faster on the earlier path, 2 on a DGX Spark (same output either way) |
+| `INK_ATTN_GROUP_MIN` | rows from which a batch takes the grouped prompt attention: 64, because smaller batches (draft verification) are faster on the earlier path (same output either way) |
 | `INK_ATTN_GROUP=0`, `INK_ATTN_SPLIT=0`, `INK_ATTN_ORDER=0` | the prompt attention runs one block a key tile instead of one a group of tiles, both passes in one kernel, or in the earlier block order (same output; for comparisons) |
 | `INK_ATTN_UNPACK=0` | the prompt attention unpacks the 6-bit K/V per tile instead of once a layer (on integrated GPUs, where it is on: a scratch of 2 x context x 2 KiB) |
 | `INK_MEM_LOG`, `INK_SLOT_LOG` | print the card's memory by step while loading; print each expert-residency change |

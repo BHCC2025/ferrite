@@ -4,6 +4,31 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] - 2026-11-24
+
+### Fixed
+
+- **Inkling-2-Mini: decode with the draft head on a DGX Spark is as fast as in 0.9.5 again, or faster.** With the launcher's defaults
+  (four lanes, draft head on), 0.9.6 decoded a short code request at 60 to 62 tokens/s (0.9.5: 71) and code at an 8K context at 85
+  (0.9.5: 87). 0.9.7 decodes the short code request at 72 to 73 tokens/s, code at 8K at 88 to 89, prose at 8K at 80, and code and prose
+  at 32K at 74 to 75: at or above 0.9.5 in every one of these cold requests. There were two causes:
+  - The draft head suspends itself when drafting looks slower than plain decode. Its estimate of the plain decode speed started from a
+    fixed guess and was kept for each lane, so each lane suspended drafting again on its first requests. The estimate is now measured
+    and shared by the lanes, and a suspension is judged again over a longer window, so a request that drafts well is not held at the
+    plain speed.
+  - On an integrated GPU the grouped prompt-attention path was also used for the small batches that verify drafts. It is now used from
+    64 rows up, as on the discrete cards (`INK_ATTN_GROUP_MIN`).
+
+  Prompt processing keeps the 0.9.6 gain (30% faster than 0.9.5 at 8K, 40% at 32K), four requests at once run as before (about 92
+  tokens/s together), and the output is unchanged: greedy and seeded requests give the same tokens.
+- The guide said that a short code request runs at 74 tokens/s with the draft head on a DGX Spark. The measured figure is 72 (43 without
+  the draft head; four requests at once at 81 to 92 tokens/s together).
+
+### Changed
+
+- RTX PRO 4000 and RTX 5060 Ti: no change in speed or output.
+- Version 0.9.7.
+
 ## [0.9.6] - 2026-11-24
 
 ### Added

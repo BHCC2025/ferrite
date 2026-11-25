@@ -21,6 +21,12 @@ const SUSPEND_MARGIN: f64 = 0.99;
 /// the constant `plain_ms` starts from below that)
 const CALIB_EVERY: usize = 128;
 const CALIB_MIN_CTX: usize = 16384;
+/// After a suspension drafting is on trial: it is judged on its tokens per ms over all the passes since the resume, the first `TRIAL_MIN` of
+/// them with 2 drafts at most. From `TRIAL_MIN` passes on it is suspended again when that is below plain decode, for twice as many tokens as
+/// the last time (32, 64, .. `SUSP_MAX`); after `STEADY_MIN` passes that held it is in the steady state again and the next suspension is 32 tokens.
+const TRIAL_MIN: usize = 4;
+const STEADY_MIN: usize = 12;
+const SUSP_MAX: usize = 1024;
 const STAGE_ROWS: usize = 64;
 
 pub use crate::sampler::SampleCfg;
@@ -55,6 +61,7 @@ pub struct Spec {
     /// drafting suspended for `susp_left` more tokens (plain decode, same bits)
     susp_left: usize,
     susp_k: usize,
+    /// 1 while drafting is on trial after a suspension (see `TRIAL_MIN`)
     probing: usize,
     passes_run: usize,
     acc_tok: f64,
@@ -66,6 +73,8 @@ pub struct Spec {
     /// running throughput of spec passes (tokens per ms) and the measured time of a plain decode token (ms)
     spec_rate: f64,
     pub plain_ms: f64,
+    /// `plain_ms` was measured on this card (until then it is a guess: 13.5 ms is an RTX PRO 4000 at long context; 11.7 there at short context, 24 on a DGX Spark)
+    plain_known: bool,
     /// suspend drafting when it is slower than plain decode (default on)
     pub suspend: bool,
     /// fixed number of verified drafts (None = adaptive)
@@ -79,7 +88,7 @@ pub struct Spec {
     pub stats: SpecStats,
     /// multi-lane passes in a row this lane ran without drafts (`multi_d`)
     multi_plain: usize,
-    /// lanes: the fields above (but `draft`, `suspend`, `fixed` and the pass cost model `reg`, a property of the card) belong to lane `cur`; the other lanes' are parked here (None at `cur`)
+    /// lanes: the fields above (but `draft`, `suspend`, `fixed`, the plain decode time `plain_ms` and the pass cost model `reg`, properties of the card) belong to lane `cur`; the other lanes' are parked here (None at `cur`)
     cur: usize,
     parked: Vec<Option<SpecSt>>,
 }
@@ -171,7 +180,7 @@ impl Spec {
         // requests with the draft head then give the same tokens run to run)
         let fixed: Option<usize> = std::env::var("INK_DRAFT_FIXED").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &usize| n >= 1);
         let mut sp = Spec { draft, q: [0.8, 0.75, 0.83, 0.8, 0.75, 0.83, 0.8], last_ptr: DevPtr(0), stage: DeviceBuffer::<u8>::alloc(STAGE_ROWS * 4 * D * 2)?, staged: 0, susp_left: 0,
-            susp_k: 32, probing: 0, passes_run: 0, acc_tok: 0.0, acc_ms: 0.0, acc_n: 0, calib: false, calib_pending: true, since_calib: 0, spec_rate: 0.0, plain_ms: 13.5, suspend: true, fixed: None, cfg: SampleCfg::greedy(), hist: PenHist::default(), reg: [4.0, 16.0, 89.6, 80.0, 2.0 * (2.0 * 20.0 + 6.0 * 24.8)], drafted_d: 0, stats: SpecStats::default(), multi_plain: 0, cur: 0, parked: vec![None] };
+            susp_k: 32, probing: 0, passes_run: 0, acc_tok: 0.0, acc_ms: 0.0, acc_n: 0, calib: false, calib_pending: true, since_calib: 0, spec_rate: 0.0, plain_ms: 13.5, plain_known: false, suspend: true, fixed: None, cfg: SampleCfg::greedy(), hist: PenHist::default(), reg: [4.0, 16.0, 89.6, 80.0, 2.0 * (2.0 * 20.0 + 6.0 * 24.8)], drafted_d: 0, stats: SpecStats::default(), multi_plain: 0, cur: 0, parked: vec![None] };
         if let Some(n) = fixed {
             sp.fixed = Some(n.min(NDRAFT));
             sp.suspend = false;
@@ -300,19 +309,18 @@ impl Spec {
         if let Some(f) = self.fixed {
             return f.clamp(1, NDRAFT);
         }
-        // a probe after a suspension verifies 2 rows only (cheap)
-        if self.probing > 0 {
-            return 1;
-        }
+        // the first passes of a trial after a suspension: 2 drafts at most, so a trial that fails is cheap (a pass of 3 rows costs little more
+        // than a plain token and a half) and one that holds still shows it (up to 3 tokens a pass); then the draft length is free again
+        let cap = if self.probing > 0 && self.acc_n < TRIAL_MIN { 2 } else { NDRAFT };
         // first passes: spread the verify length so the cost slope is identified (it differs a lot between layouts)
         if self.stats.passes < 8 {
-            return [2, 6, 4, 1, 7, 3, 5, 2][self.stats.passes];
+            return [2, 6, 4, 1, 7, 3, 5, 2][self.stats.passes].min(cap);
         }
         if self.stats.passes % 24 == 23 {
-            return if (self.stats.passes / 24) % 2 == 0 { NDRAFT } else { 2 };
+            return if (self.stats.passes / 24) % 2 == 0 { cap } else { 2 };
         }
-        let (mut best, mut cum, mut pj) = ((NDRAFT, 0.0f64), 1.0, 1.0);
-        for d in 1..=NDRAFT {
+        let (mut best, mut cum, mut pj) = ((cap, 0.0f64), 1.0, 1.0);
+        for d in 1..=cap {
             pj *= self.q[d - 1];
             cum += pj;
             let (ca, cb) = self.cost_model();
@@ -337,11 +345,15 @@ impl Spec {
     /// The first half of a pass (the current lane in `ink` and in the head): the rows to run, `[anchor]` (plain, drafting suspended) or
     /// `[anchor] + d drafts` (a speculative chunk). The caller runs them (alone: `step`; with other lanes: `Ink::forward_multi`) and calls `finish`.
     pub fn plan(&mut self, ink: &mut Ink, anchor: u32, dmax: usize) -> Result<(Plan, Vec<u32>)> {
-        if self.suspend && self.fixed.is_none() && self.susp_left == 0 && self.probing == 0 && ink.len >= CALIB_MIN_CTX && (self.calib_pending || self.since_calib >= CALIB_EVERY) {
+        // the card's plain decode time is not known yet: 3 plain tokens after the first passes of the first request measure it (at any context)
+        let first = !self.plain_known && self.stats.passes >= 8;
+        if self.suspend && self.fixed.is_none() && self.susp_left == 0 && self.probing == 0 && (first || ink.len >= CALIB_MIN_CTX && (self.calib_pending || self.since_calib >= CALIB_EVERY)) {
             self.calib = true;
-            self.susp_left = if self.calib_pending { 3 } else { 2 };
-            self.calib_pending = false;
-            self.since_calib = 0;
+            self.susp_left = if first || self.calib_pending { 3 } else { 2 };
+            if !first {
+                self.calib_pending = false;
+                self.since_calib = 0;
+            }
         }
         if self.susp_left > 0 {
             let t0 = std::time::Instant::now();
@@ -437,14 +449,16 @@ impl Spec {
                 self.stats.tokens += 1;
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
                 self.plain_ms = if self.calib { ms } else { 0.8 * self.plain_ms + 0.2 * ms };
+                self.plain_known = true;
                 self.susp_left -= 1;
                 if self.susp_left == 0 {
                     self.flush_stage(ink)?;
                     if self.calib {
                         self.calib = false;
                     } else {
-                        self.probing = 3;
-                        self.passes_run = 1;
+                        self.probing = 1;
+                        // every pass of the trial counts: a resume has no warm-up pass (measured: its first pass costs what the next ones do)
+                        self.passes_run = 2;
                         self.acc_tok = 0.0;
                         self.acc_ms = 0.0;
                         self.acc_n = 0;
@@ -535,8 +549,8 @@ impl Spec {
         if self.passes_run >= 2 {
             self.spec_rate = if self.passes_run == 2 { rate } else { 0.85 * self.spec_rate + 0.15 * rate };
         }
-        // steady state: the speed of the best draft length over many passes (the passes that try other lengths on purpose and the probes are left out)
-        if self.passes_run >= 2 && !explore && self.probing == 0 {
+        // the speed of the best draft length over many passes (the passes that try other lengths on purpose are left out)
+        if self.passes_run >= 2 && !explore {
             self.acc_tok += n as f64;
             self.acc_ms += ms;
             self.acc_n += 1;
@@ -549,21 +563,20 @@ impl Spec {
         self.passes_run += 1;
         self.since_calib += 1;
         if self.suspend && self.fixed.is_none() {
-            let slow = if self.probing > 0 {
-                self.passes_run >= 2 && self.spec_rate < SUSPEND_MARGIN / self.plain_ms
-            } else {
-                self.acc_n >= 12 && self.acc_tok / self.acc_ms < SUSPEND_MARGIN / self.plain_ms
-            };
+            // one measure for both states: tokens per ms over the passes since the start / the resume against plain decode. (The old probe
+            // judged 3 passes with one draft each, which make 2 tokens a pass at most, on the rate of a single pass: one rejected draft
+            // suspended a request that drafts at twice the plain speed for 128 tokens.)
+            let slow = self.acc_ms > 0.0 && self.acc_tok / self.acc_ms < SUSPEND_MARGIN / self.plain_ms;
             if self.probing > 0 {
-                self.probing -= 1;
-                if self.probing == 0 && slow {
-                    self.susp_k = (self.susp_k * 4).min(1024);
+                if self.acc_n >= TRIAL_MIN && slow {
+                    self.susp_k = (self.susp_k * 2).min(SUSP_MAX);
                     self.susp_left = self.susp_k;
                     self.stats.suspensions += 1;
-                } else if self.probing == 0 {
+                } else if self.acc_n >= STEADY_MIN {
+                    self.probing = 0;
                     self.susp_k = 32;
                 }
-            } else if self.passes_run >= 10 && slow {
+            } else if self.passes_run >= 10 && self.acc_n >= STEADY_MIN && slow {
                 self.susp_left = self.susp_k;
                 self.stats.suspensions += 1;
             }
@@ -602,8 +615,9 @@ impl Spec {
         self.draft.select_lane(i)?;
         let mut st = self.parked[i].take().unwrap();
         macro_rules! sw { ($($f:ident),*) => { $( std::mem::swap(&mut self.$f, &mut st.$f); )* } }
+        // plain_ms stays with the card, like `reg`: a lane that has not decoded yet must not start from the optimistic constant again
         sw!(q, last_ptr, stage, staged, susp_left, susp_k, probing, passes_run, acc_tok, acc_ms, acc_n, calib, calib_pending, since_calib, spec_rate,
-            plain_ms, cfg, hist, drafted_d, stats, multi_plain);
+            cfg, hist, drafted_d, stats, multi_plain);
         self.parked[self.cur] = Some(st);
         self.cur = i;
         Ok(())
@@ -635,7 +649,6 @@ struct SpecSt {
     calib_pending: bool,
     since_calib: usize,
     spec_rate: f64,
-    plain_ms: f64,
     cfg: SampleCfg,
     hist: PenHist,
     drafted_d: usize,
@@ -647,7 +660,7 @@ impl SpecSt {
     /// The state `Spec::load` starts with.
     fn fresh() -> Result<SpecSt> {
         Ok(SpecSt { q: [0.8, 0.75, 0.83, 0.8, 0.75, 0.83, 0.8], last_ptr: DevPtr(0), stage: DeviceBuffer::<u8>::alloc(STAGE_ROWS * 4 * D * 2)?, staged: 0, susp_left: 0,
-            susp_k: 32, probing: 0, passes_run: 0, acc_tok: 0.0, acc_ms: 0.0, acc_n: 0, calib: false, calib_pending: true, since_calib: 0, spec_rate: 0.0, plain_ms: 13.5,
+            susp_k: 32, probing: 0, passes_run: 0, acc_tok: 0.0, acc_ms: 0.0, acc_n: 0, calib: false, calib_pending: true, since_calib: 0, spec_rate: 0.0,
             cfg: SampleCfg::greedy(), hist: PenHist::default(), drafted_d: 0, stats: SpecStats::default(), multi_plain: 0 })
     }
 }
