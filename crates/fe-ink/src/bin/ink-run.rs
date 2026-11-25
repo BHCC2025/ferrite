@@ -10,6 +10,12 @@
 //!   ink-run kl --ref DIR --set NAME --ids FILE.u32
 //!                                         free-running KL(reference || engine) and perplexity against reference logits (DIR/NAME/taps.json + taps.bin,
 //!                                         `logprobs_f16` rows of the publisher's reference implementation)
+//!                                         --image FILE[,FILE...]: the prompt holds pictures; every run of the placeholder id 200054 in the ids is
+//!                                         one picture's image tokens, in order (the engine decodes and encodes the files; the reference must have
+//!                                         been given the same pixels, see vision-pixels). --ctx N: load the engine with a context of N tokens.
+//!                                         --rows-from N: the figures again over the rows from position N on (the text behind a picture)
+//!   ink-run vision-pixels IMAGE OUT.f32   decode and preprocess a picture as the engine does and write the pixel values the encoder takes
+//!                                         ([tokens][40][40][3] f32, little endian), for a reference run on the same pixels; prints rows and columns
 //!   ink-run fold                          compute (or show) the draft head's fold tables
 //!   ink-run pcache [--ref] [--ngen G] [--modes LIST] [--lane N]
 //!                                         prompt-cache gate: a fixed series of chat-like requests (consecutive turns, an identical request, a
@@ -18,6 +24,17 @@
 //!                                         seeded-sampled with the draft head on or off (fixed 3 drafts a pass, no suspension); one line a request
 //!                                         with the hash of the first new position's logits, of the reply and the drafting counts. --ref runs the
 //!                                         same requests with the cache off (each prefilled from 0): the two outputs must be identical
+//!
+//!   ink-run vision-check REF_DIR [--engine] [--ctx N] [--ballast-mb N] [--reps R] [--strict-decode]
+//!                                         image input, stage 1: decode and preprocess every test image of REF_DIR/manifest.json (written by the
+//!                                         reference tool), encode it with the vision encoder and compare with the fp32 reference dumps: token
+//!                                         count, pixel values, per-token cosine and largest error of the embeddings. Exit status 1 when an image
+//!                                         fails (cosine below 0.999 or a different token count). A JPEG is decoded to slightly other pixels
+//!                                         than the reference's decoder gives; for such an image the bar applies to the encoder run on the
+//!                                         reference's pixels and the whole pipeline's cosine is printed (--strict-decode: it must pass too). --engine loads the text engine first (with the
+//!                                         INK_* switches of the layout, context N, default 131072) and the draft head, and makes room for the
+//!                                         encoder with the expert slots: the 16 GB layout check (--ballast-mb N holds N MiB of device memory
+//!                                         meanwhile, standing in for the K/V of a long context)
 //!
 //! Options: --model DIR (default INK_DIR, else $FERRITE_MODELS/Inkling-2-Mini), --tmax N prompt rows per forward (default 256; 0 = sized from free
 //! memory). The engine switches of docs/inkling-2-mini.md (INK_G16, INK_KVQ6, ...) apply.
@@ -436,15 +453,49 @@ fn main() -> Result<()> {
             let lpos: Vec<usize> = if rows == n { (0..n).collect() } else { i32s("logit_positions")?.into_iter().map(|x| x as usize).collect() };
             let rowof: HashMap<usize, usize> = lpos.iter().enumerate().map(|(i, &p)| (p, i)).collect();
             let top1 = i32s("top64_ids")?;
-            let mut ink = Ink::load(&model, 0, n + 16, tmax)?;
+            let cap: usize = opt("--ctx").map(|s| s.parse().unwrap()).unwrap_or(n + 16);
+            let mut ink = Ink::load(&model, 0, cap.max(n + 16), tmax)?;
+            // --image: every run of the placeholder id is one picture; its rows carry the picture's id in the forward
+            let mut fwd_ids = ids.clone();
+            if let Some(files) = opt("--image") {
+                let lim = images::Limits { max_images: usize::MAX, max_tokens: usize::MAX, max_tokens_each: usize::MAX, max_bytes: usize::MAX };
+                let mut pics = vec![];
+                for f in files.split(',') {
+                    pics.push(images::intake(&std::fs::read(f).with_context(|| f.to_string())?, &lim).map_err(|e| anyhow::anyhow!("{f}: {e}"))?);
+                }
+                let mut placed = vec![];
+                let (mut i, mut k) = (0, 0);
+                while i < n {
+                    if ids[i] != vision::IMAGE_TOKEN {
+                        i += 1;
+                        continue;
+                    }
+                    let run = ids[i..].iter().take_while(|&&t| t == vision::IMAGE_TOKEN).count();
+                    let p = pics.get(k).with_context(|| format!("placeholder run {k} at {i}: no picture for it"))?;
+                    anyhow::ensure!(run == p.tokens(), "placeholder run {k} at {i}: {run} ids, picture {} x {} has {} tokens", p.width, p.height, p.tokens());
+                    fwd_ids[i..i + run].fill(p.id());
+                    placed.push(images::Placed { pos: i, key: p.key, width: p.width, height: p.height, rgb: &p.rgb });
+                    i += run;
+                    k += 1;
+                }
+                anyhow::ensure!(k == pics.len(), "{k} placeholder runs for {} pictures", pics.len());
+                let mut im = images::Images::new(&model);
+                let (spans, rep) = im.prepare(&mut ink, &placed, 0)?;
+                println!("{set}: {} picture(s), {} image tokens encoded in {:.0} ms (experts moved {}, {:.0} ms)", rep.encoded + rep.from_row_cache, rep.encoded_tokens, rep.encode_ms,
+                    rep.experts_moved, rep.fit_ms);
+                ink.set_images(0, spans);
+            }
             ink.prompt = true;
             let tmax = ink.tmax;
             let (mut klsum, mut klcnt, mut agree, mut nllsum, mut nllcnt) = (0f64, 0usize, 0usize, 0f64, 0usize);
+            // --rows-from N: the same figures again over the rows from position N on (the text rows behind a picture)
+            let rows_from: Option<usize> = opt("--rows-from").map(|s| s.parse().unwrap());
+            let (mut klsum2, mut klcnt2, mut agree2, mut klmax2) = (0f64, 0usize, 0usize, 0f64);
             let t0 = std::time::Instant::now();
             let mut pos = 0;
             while pos < n {
                 let t = (n - pos).min(tmax);
-                let logits = ink.forward(&ids[pos..pos + t], t, None, None)?;
+                let logits = ink.forward(&fwd_ids[pos..pos + t], t, None, None)?;
                 lhash_add(&logits);
                 let res: Vec<(f64, f64, bool)> = std::thread::scope(|sc| {
                     let hs: Vec<_> = (0..t).step_by(8).map(|r0| {
@@ -479,6 +530,12 @@ fn main() -> Result<()> {
                         klsum += k;
                         klcnt += 1;
                         agree += *ag as usize;
+                        if rows_from.is_some_and(|r| pos + i >= r) {
+                            klsum2 += k;
+                            klcnt2 += 1;
+                            agree2 += *ag as usize;
+                            klmax2 = klmax2.max(*k);
+                        }
                     }
                     if pos + i + 1 < n {
                         nllsum += nll;
@@ -490,6 +547,9 @@ fn main() -> Result<()> {
             println!("{set}: prompt logits hash {:016x}", lhash_take());
             println!("{set}: n={n} | KL(reference || engine) on {klcnt} logit rows {:.5}, top-1 agrees on {agree}/{klcnt} | perplexity {:.3} (nll {:.4}) | {:.1} s ({:.0} tok/s)",
                 klsum / klcnt.max(1) as f64, (nllsum / nllcnt.max(1) as f64).exp(), nllsum / nllcnt.max(1) as f64, t0.elapsed().as_secs_f64(), n as f64 / t0.elapsed().as_secs_f64());
+            if let Some(r) = rows_from {
+                println!("{set}: rows from {r}: KL(reference || engine) on {klcnt2} logit rows {:.5} (largest {:.4}), top-1 agrees on {agree2}/{klcnt2}", klsum2 / klcnt2.max(1) as f64, klmax2);
+            }
         }
         "pcache" => {
             let ngen: usize = opt("--ngen").map(|s| s.parse().unwrap()).unwrap_or(48);
@@ -651,11 +711,178 @@ fn main() -> Result<()> {
             }
             println!("lanescheck: all checks passed");
         }
+        "vision-pixels" => {
+            let file = args.get(2).context("vision-pixels IMAGE OUT.f32")?;
+            let out = args.get(3).context("vision-pixels IMAGE OUT.f32")?;
+            let rgb = vision::decode(&std::fs::read(file).with_context(|| file.to_string())?)?;
+            let pt = vision::preprocess(&rgb);
+            let bytes: Vec<u8> = pt.pixels.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(out, bytes)?;
+            println!("{file}: {} x {} pixels, rows {} cols {} tokens {}", rgb.width, rgb.height, pt.rows, pt.cols, pt.tokens());
+        }
         "fold" => {
             let p = fold::ensure(&model)?;
             println!("fold tables: {}", p.display());
         }
-        _ => bail!("usage: ink-run selftest [--n N] [--deep N] | bench [--ctx N] [--gen G] [--kind code|prose] [--draft on|off] | kl --ref DIR --set NAME --ids FILE.u32 | pcache [--ref] [--ngen G] [--modes LIST] | fold   (--model DIR, --tmax N)"),
+        "vision-check" => {
+            let refdir = PathBuf::from(args.get(2).context("vision-check REF_DIR")?);
+            let with_engine = args.iter().any(|a| a == "--engine");
+            let reps: usize = opt("--reps").map(|s| s.parse().unwrap()).unwrap_or(2);
+            let man: Value = serde_json::from_slice(&std::fs::read(refdir.join("manifest.json")).context("manifest.json")?)?;
+            let mib = |b: usize| b as f64 / 1048576.0;
+            // the text engine first when asked for (the 16 GB layout: experts in slots, lazily mapped K/V, the draft head)
+            let mut eng: Option<(Ink, Option<Spec>)> = None;
+            let mut ballast: Option<fe_cuda::DeviceBuffer<u8>> = None;
+            let _ctx;
+            if with_engine {
+                let cap: usize = opt("--ctx").map(|s| s.parse().unwrap()).unwrap_or(131072);
+                let chunk: usize = std::env::var("INK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(tmax);
+                let mut ink = Ink::load(&model, 0, cap, chunk)?;
+                let spec = if env_flag("INK_NODRAFT") { None } else { Some(Spec::load(&mut ink, &model, &fold::ensure(&model)?)?) };
+                let (free, total) = ink.ctx.mem_info()?;
+                println!("engine loaded: context {cap}, chunk {}, draft head {}, host experts {}, device memory free {:.0} MiB of {:.0}", ink.tmax,
+                    if spec.is_some() { "on" } else { "off" }, ink.host_experts(), mib(free), mib(total));
+                // --ballast-mb N (test): N MiB of device memory held during the images, standing in for the K/V of a long context
+                if let Some(mb) = opt("--ballast-mb").map(|s| s.parse::<usize>().unwrap()) {
+                    ballast = Some(fe_cuda::DeviceBuffer::<u8>::alloc(mb << 20)?);
+                    println!("ballast: {mb} MiB held, device memory free {:.0} MiB", mib(ink.ctx.mem_info()?.0));
+                }
+                eng = Some((ink, spec));
+                _ctx = None;
+            } else {
+                let c = fe_cuda::Context::new(0)?;
+                c.bind()?;
+                _ctx = Some(c);
+            }
+            let t0 = std::time::Instant::now();
+            let ck = ckpt::Ckpt::open(&model.join("model-00001-of-00001.safetensors"))?;
+            let vis = vision::Vision::load(&ck)?;
+            drop(ck);
+            println!("vision weights: {:.0} MiB in pinned host memory, read in {:.2} s", mib(vis.host_bytes()), t0.elapsed().as_secs_f64());
+            let st = fe_cuda::Stream::new()?;
+            let rd = |p: PathBuf| -> Result<Vec<f32>> {
+                let b = std::fs::read(&p).with_context(|| format!("{p:?}"))?;
+                Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+            };
+            // (min cosine, mean cosine, max abs error) over the rows of `d` columns
+            let cmp = |x: &[f32], y: &[f32], d: usize| -> (f64, f64, f64) {
+                let (mut mn, mut sum, mut mx) = (f64::MAX, 0.0, 0.0f64);
+                for (a, b) in x.chunks_exact(d).zip(y.chunks_exact(d)) {
+                    let (mut ab, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+                    for (&u, &v) in a.iter().zip(b) {
+                        ab += u as f64 * v as f64;
+                        aa += u as f64 * u as f64;
+                        bb += v as f64 * v as f64;
+                        mx = mx.max((u as f64 - v as f64).abs());
+                    }
+                    let c = ab / (aa.sqrt() * bb.sqrt()).max(1e-30);
+                    mn = mn.min(c);
+                    sum += c;
+                }
+                (mn, sum / (x.len() / d).max(1) as f64, mx)
+            };
+            let floor: usize = std::env::var("INK_FIT_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(150) << 20;
+            let mut failed = 0;
+            let (mut worst_cos, mut worst_err, mut worst_pipe, mut decoder_diff) = (f64::MAX, 0.0f64, f64::MAX, 0);
+            let strict_decode = args.iter().any(|a| a == "--strict-decode");
+            for im in man["images"].as_array().context("manifest images")? {
+                let name = im["name"].as_str().unwrap();
+                let ref_tokens = im["tokens"].as_u64().unwrap() as usize;
+                let bytes = std::fs::read(refdir.join(im["file"].as_str().unwrap()))?;
+                let t0 = std::time::Instant::now();
+                let rgb = vision::decode(&bytes)?;
+                let pt = vision::preprocess(&rgb);
+                let prep_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let tokens = pt.tokens();
+                let grid_ok = tokens == ref_tokens && pt.rows as u64 == im["rows"].as_u64().unwrap() && pt.cols as u64 == im["cols"].as_u64().unwrap();
+                let need = vis.work_bytes(tokens);
+                let mut line = format!("{name}: {}x{} -> {} x {} = {tokens} tokens (reference {ref_tokens}){}", rgb.width, rgb.height, pt.rows, pt.cols,
+                    if grid_ok { "" } else { "  TOKEN COUNT DIFFERS" });
+                if !grid_ok {
+                    println!("{line}\n  FAIL");
+                    failed += 1;
+                    continue;
+                }
+                let ref_px = rd(refdir.join(format!("{name}.pixels.f32")))?;
+                let px_err = pt.pixels.iter().zip(&ref_px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                let px_diff = pt.pixels.iter().zip(&ref_px).filter(|(a, b)| (**a - **b).abs() > 1e-6).count();
+                line += &format!("; pixels: max abs diff {px_err:.2e} ({px_diff} of {} values differ)", ref_px.len());
+                println!("{line}");
+                // room on the card: the experts make it when the free memory is short (the mechanism K/V growth uses)
+                if let Some((ink, _)) = eng.as_mut() {
+                    let (free0, _) = ink.ctx.mem_info()?;
+                    let h0 = ink.host_experts();
+                    let t = std::time::Instant::now();
+                    if ink.slot_dev_bytes() > 0 {
+                        ink.fit_host_experts(need + floor, usize::MAX / 4)?;
+                    }
+                    let (free1, _) = ink.ctx.mem_info()?;
+                    println!("  memory: encoder needs {:.0} MiB; free {:.0} MiB -> {:.0} MiB, host experts {h0} -> {} ({:.0} ms)", mib(need), mib(free0), mib(free1),
+                        ink.host_experts(), t.elapsed().as_secs_f64() * 1e3);
+                } else {
+                    println!("  memory: encoder needs {:.0} MiB on the device while it runs", mib(need));
+                }
+                let mut enc = None;
+                let mut ms = vec![];
+                for _ in 0..reps.max(1) {
+                    let t = std::time::Instant::now();
+                    enc = Some(vis.encode(&st, &pt, true)?);
+                    ms.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                let enc = enc.unwrap();
+                let ref_emb = rd(refdir.join(format!("{name}.embeds.f32")))?;
+                let ref_h = rd(refdir.join(format!("{name}.h_last.f32")))?;
+                let (mn, mean, mx) = cmp(&enc.embeds, &ref_emb, D);
+                let (hmn, _, hmx) = cmp(enc.hidden.as_ref().unwrap(), &ref_h, vision::VD);
+                // the rows the text model takes are bf16
+                let bfv: Vec<f32> = enc.bf16().iter().map(|&b| bf16_f32(b)).collect();
+                let (bmn, _, bmx) = cmp(&bfv, &ref_emb, D);
+                // identical pixels: the bar applies to the whole pipeline. Other pixels (a JPEG: decoders differ by a few levels): the bar applies
+                // to the encoder on the reference's pixels, and the pipeline's cosine is reported (--strict-decode makes it count)
+                let mut ok = mn >= 0.999 || (px_diff > 0 && !strict_decode);
+                println!("  embeddings vs fp32 reference: min cosine {mn:.6}, mean {mean:.6}, max abs error {mx:.3e} (rounded to bf16: min cosine {bmn:.6}, max abs error {bmx:.3e})");
+                println!("  last hidden state: min cosine {hmn:.6}, max abs error {hmx:.3e}; decode + preprocess {prep_ms:.1} ms, encode {} ms", ms.iter().map(|m| format!("{m:.0}")).collect::<Vec<_>>().join(" / "));
+                if px_diff > 0 {
+                    // the decoder gave other pixels than the reference's (JPEG decoders differ): the encoder alone, on the reference's pixels
+                    let rp = vision::Patches { rows: pt.rows, cols: pt.cols, pixels: ref_px };
+                    let e2 = vis.encode(&st, &rp, false)?;
+                    let (mn2, mean2, mx2) = cmp(&e2.embeds, &ref_emb, D);
+                    println!("  encoder on the reference's pixels: min cosine {mn2:.6}, mean {mean2:.6}, max abs error {mx2:.3e}");
+                    ok = ok && mn2 >= 0.999;
+                    worst_cos = worst_cos.min(mn2);
+                    worst_err = worst_err.max(mx2);
+                    decoder_diff += 1;
+                    worst_pipe = worst_pipe.min(mn);
+                    println!("  the decoder's pixels differ from the reference's (PIL, libjpeg-turbo): {px_diff} values, up to {:.0} levels; whole pipeline min cosine {mn:.6}{}", px_err * 127.5,
+                        if mn < 0.999 { " (below 0.999 because of the decoder)" } else { "" });
+                } else {
+                    worst_cos = worst_cos.min(mn);
+                    worst_err = worst_err.max(mx);
+                    worst_pipe = worst_pipe.min(mn);
+                }
+                println!("  {}", if ok { "ok" } else { "FAIL" });
+                if !ok {
+                    failed += 1;
+                }
+            }
+            drop(ballast.take());
+            if let Some((ink, _)) = eng.as_mut() {
+                // the encoder's buffers are free again: the experts come back up to the floor
+                let h0 = ink.host_experts();
+                let t = std::time::Instant::now();
+                if ink.slot_dev_bytes() > 0 {
+                    ink.fit_host_experts(floor, floor)?;
+                }
+                let (free, _) = ink.ctx.mem_info()?;
+                println!("after the images: host experts {h0} -> {} ({:.0} ms), free {:.0} MiB", ink.host_experts(), t.elapsed().as_secs_f64() * 1e3, mib(free));
+            }
+            println!("vision-check: {} images, {failed} failed; encoder on the reference's pixels: worst min cosine {worst_cos:.6}, worst max abs error {worst_err:.3e}; whole pipeline (own decoder): worst min cosine {worst_pipe:.6}, {decoder_diff} image(s) with decoder differences",
+                man["images"].as_array().unwrap().len());
+            if failed > 0 {
+                std::process::exit(1);
+            }
+        }
+        _ => bail!("usage: ink-run selftest [--n N] [--deep N] | bench [--ctx N] [--gen G] [--kind code|prose] [--draft on|off] | kl --ref DIR --set NAME --ids FILE.u32 | pcache [--ref] [--ngen G] [--modes LIST] | fold | vision-check REF_DIR [--engine] [--ctx N] | vision-pixels IMAGE OUT.f32   (--model DIR, --tmax N; kl also takes --image FILES --rows-from N --ctx N)"),
     }
     Ok(())
 }

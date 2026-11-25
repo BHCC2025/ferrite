@@ -53,8 +53,8 @@ and each guide has the full tables, the long-context figures and how they were m
 - **Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash Coder are run from quants made for code.** They are for coding work and
   are weak at general chat; their guides say what was seen.
 - "1, up to 4" means one request at a time by default and up to four when you ask for more slots; further requests
-  wait in a queue. Inkling-2-Mini serves four requests at once on the 24 GB card and on a DGX Spark, one on the 16 GB card, and is
-  text only.
+  wait in a queue. Inkling-2-Mini serves four requests at once on the 24 GB card and on a DGX Spark, one on the 16 GB card, and reads
+  pictures (PNG, JPEG) as well as text.
 - Each model is a separate engine inside the same server, `fe-server`. You build the engine for your row
   ([Build, download, start](#build-download-start)).
 - Operating systems, drivers and memory for each row are under [Requirements](#requirements).
@@ -188,7 +188,7 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.7` pins one; a few minutes
+It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.8` pins one; a few minutes
 the first time: rustup, the pinned toolchains, `cargo build`) and puts the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the

@@ -7,7 +7,8 @@ experts, FP8 attention) on **one NVIDIA GPU**: an **RTX PRO 4000 Blackwell (24 G
 
 - **Speed:** a short code request runs at 138 tokens/s on the 24 GB card, 110 on the 16 GB card and 72 on a DGX Spark
   ([Results](#results)).
-- **Text only.** The published model also reads images; this engine does not ([Limits](#limits)).
+- **It reads pictures.** A chat request may hold PNG and JPEG pictures; each is encoded once and then lives in the prompt cache
+  ([Images](#images)).
 - **Four requests at once on the 24 GB card and on a DGX Spark.** Each stream has its own caches; 4 short requests run at 160 to 190
   tokens/s together on the 24 GB card and 81 to 92 on a DGX Spark, and every stream gets the same text as alone
   ([Several requests at once](#several-requests-at-once-lanes)).
@@ -20,8 +21,8 @@ Terms such as K/V cache, experts, drafting, prefill and KL are explained in
 [Words used in these docs](../README.md#words-used-in-these-docs).
 
 > **Status: experimental.** One model, built from source only, on Linux. Measured on two machines: an x86 workstation with the RTX cards
-> and a DGX Spark (see Results). Text only, up to four requests at once on the 24 GB card and on a DGX Spark (one on the 16 GB card by
-> default), with a prompt cache for each conversation in progress.
+> and a DGX Spark (see Results). Text and pictures in, text out; up to four requests at once on the 24 GB card and on a DGX Spark (one on
+> the 16 GB card by default), with a prompt cache for each conversation in progress. Image input was measured on the RTX cards only.
 > Reports and measurements from other cards are welcome.
 
 ## Requirements
@@ -168,8 +169,82 @@ every turn repeats the previous prompt, so only the reply and the new message ar
 - `INK_PCACHE=0` turns it off. The cache is in host memory only and is empty after a restart. With several lanes the snapshot memory
   (`INK_PCACHE_GB`) is shared among them: 2 snapshots a lane at 4 lanes.
 
-### Several requests at once (lanes)
+### Images
 
+A chat request may hold pictures: `image_url` content parts with a `data:` URL, in user and tool messages.
+
+```json
+{"role": "user", "content": [
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}},
+  {"type": "text", "text": "Read the text in this chart."}]}
+```
+
+- **Formats.** PNG and JPEG, base64 in a `data:image/png;base64,` or `data:image/jpeg;base64,` URL. `input_image` and `image` parts that
+  carry such a URL are read the same way.
+- **The engine only takes pictures in with a request.** It does not fetch `http(s)` URLs or files (HTTP 400), take screenshots or look
+  again by itself. A loop of look, fix and look again is the client's job: each look is a new request with a new picture.
+- **Size.** One image token covers 40 x 40 pixels, rounded up: 800 x 600 is 300 tokens, 1280 x 720 is 576, 1920 x 1080 is 1,296,
+  2560 x 1440 is 2,304. Image tokens count in the context and in `usage.prompt_tokens`. Send a smaller picture when the detail is
+  not needed: it is faster and leaves more context.
+- **A large picture is shrunk, not refused.** A picture of up to 2,304 image tokens (`INK_IMAGE_TOKENS_EACH`; 2560 x 1440) goes to
+  the model pixel for pixel. A larger one is shrunk by the server first, with its aspect ratio kept, until it fits: 3840 x 2160
+  becomes 2560 x 1440 (2,304 tokens), 8000 x 600 becomes 6933 x 520 (2,262 tokens). A picture is never enlarged. The model itself
+  has no resize rule, so this is the same as a client that shrinks a screenshot before it sends it. The filter is Lanczos3, which
+  keeps small text sharp (0.3 s for a 3840 x 2160 picture); the log says `ink vision: picture of 3840 x 2160 pixels (5184 image
+  tokens) shrunk to 2560 x 1440`. On the test pictures (a chart and a settings screen of 3840 x 2160 with text 24 to 96 pixels
+  high) every line of text is read correctly after the shrink. For the full detail of a larger picture set
+  `INK_IMAGE_TOKENS_EACH` higher (5184 takes 3840 x 2160 whole); the encoder then needs much longer (table below).
+- **Limits of a request** (HTTP 400 with the reason beyond them; a picture above `INK_IMAGE_TOKENS_EACH` is shrunk instead):
+
+  | Setting | Default | What it limits |
+  |---|---|---|
+  | `INK_IMAGE_MAX` | 16 | pictures in one request |
+  | `INK_IMAGE_TOKENS` | 16384 | image tokens in one request, all pictures together |
+  | `INK_IMAGE_TOKENS_EACH` | 2304 | image tokens of one picture (2560 x 1440); a larger picture is shrunk to fit |
+  | `INK_IMAGE_MB` | 20 | size of one picture file, MiB |
+
+  A picture file with a side above 16,384 pixels or with more than 100 million pixels is refused (HTTP 400) before it is decoded.
+  The request body may be up to 256 MiB.
+- **Each picture is encoded once.** The vision encoder runs when the picture first arrives:
+
+  | picture | image tokens | RTX 5060 Ti | RTX PRO 4000 |
+  |---|---|---|---|
+  | 512 x 512 | 169 | 0.19 s | 0.14 s |
+  | 800 x 600 | 300 | 0.29 s | 0.23 s |
+  | 1280 x 720 | 576 | 0.56 s | 0.43 s |
+  | 1920 x 1080 | 1,296 | 1.8 s | 1.4 s |
+  | 2560 x 1440 (the default limit; also 3840 x 2160 after the shrink) | 2,304 | 5.7 s | not measured |
+  | 3840 x 2160 with `INK_IMAGE_TOKENS_EACH=5184` | 5,184 | 40 s | 39 s |
+
+  The time grows with the square of the size. After that the picture's rows are part of the prompt and the
+  [prompt cache](#prompt-cache) keeps them like text: a later turn of the conversation does not encode or prefill the picture again
+  (the log line `ink vision` says `inside the resumed prompt cache (no encode)`). The same holds for a conversation that comes back
+  from the [park pool](#park-pool).
+- **Two pictures are never mixed up.** The cache knows a picture by the SHA-256 of its pixels and size. Another picture of the same
+  size gets no cache hit; the same picture sent again as another file does.
+- **Measured on the RTX 5060 Ti** (16 GB layout, 128K context, replies identical to the same server with `INK_PCACHE=0`):
+  a question about a 1920 x 1080 picture starts its answer after 3.6 s (1.8 s of it the encoder), the next turn after 0.27 s. For a
+  1280 x 720 screenshot: 1.5 s, then 0.29 s. A screenshot that arrives 32,000 tokens into a conversation: 2.9 s, and the turn after
+  it 0.41 s (28 s without the cache). Eight pictures (9,421 tokens): 9.7 s for the first question, 1.7 s for a second, different
+  question (7.4 s without the cache).
+- **Rows of recent pictures are also kept in host memory** (`INK_IMAGE_CACHE_MB`, 256 MiB by default, 6 MiB for a 1920 x 1080 picture),
+  so a picture that must be prefilled again (another lane, an edit in front of it, `INK_PCACHE=0`) is not encoded again.
+- **Memory.** The encoder's weights (605 MiB) are read into pinned host memory with the first picture (0.6 s) and stay there. Card
+  memory is used only while a picture is encoded: 77 MiB for 800 x 600, 215 MiB for 1920 x 1080, 540 MiB for 3840 x 2160; it is
+  freed before the prompt is prefilled. **On the 16 GB card** the free memory may be short of that; then some experts move to host
+  memory for the encode and move back after it (0 on an idle engine up to 1920 x 1080; 23 experts for a 1280 x 720 picture at 32,000
+  tokens of context, 36 for 1920 x 1080 after other requests, 110 for 3840 x 2160; 0.2 to 0.7 s for both moves). The context limit
+  does not change.
+- **With lanes** the encoder runs between two passes, so the other streams pause for the encode time.
+- **Drafting works as with text.** Replies with the draft head on equal replies with it off.
+- **EXIF orientation is not applied** (the model's reference processor does not apply it either). Rotate a photo before sending it
+  if its orientation is stored in EXIF.
+- **JPEG.** The Rust decoder gives slightly other pixels than libjpeg-turbo, which the reference uses: on the test photo 23% of the
+  values differ, by up to 4 of 255 levels. See [Accuracy](#accuracy) for what that does to the answers.
+- **Transparency** is drawn on a grey checkerboard, as the reference does. 16-bit PNG and CMYK JPEG are converted to 8-bit RGB;
+  that conversion was not compared with the reference.
+
+### Several requests at once (lanes)
 With `INK_LANES=4` (the default on the 24 GB layout and on a DGX Spark) four requests decode at once. Each lane has its own K/V cache, short-convolution
 states, draft-head caches and prompt cache; one forward carries the rows of every lane, so the weights are read once for all of them. Every
 stream's tokens are the same as the same request alone, whatever the other lanes do (`ink-run lanescheck` and the lanes gate check it row
@@ -395,12 +470,31 @@ reference is the published model run with Hugging Face transformers (weights as 
 engine's expert GEMMs use the activation quantization the SM120 expert kernels of the model's reference code use, which is why a run with the
 shipped formats is not bit-equal to the reference and costs a few thousandths of KL.
 
+**Pictures.** Measured on 8 prompts with pictures (a chart, a screenshot, shapes, two photos, a tall list, a picture with
+transparency, two charts in one request), each with a question and its reply.
+
+| KL over the text rows behind the picture | lowest | highest | mean |
+|---|---|---|---|
+| 24 GB layout | 0.010 | 0.037 | 0.017 |
+| 16 GB layout | 0.016 | 0.045 | 0.025 |
+| the reference against itself with the activation quantization of its own SM120 expert kernels | 0.011 | 0.031 | 0.021 |
+| the reference against itself with 1% of the picture's row values moved by one bf16 step | 0.002 | 0.008 | 0.004 |
+
+- Prompts with pictures are more sensitive than text: the reference itself moves by 0.021 on them when it runs the experts the way
+  the engine does (0.004 to 0.007 on text). The engine is in that range, and below the 0.05 limit on every prompt.
+- The most likely next token agrees with the reference on 95 to 99% of those rows.
+- The vision encoder is exact: its rows equal the reference's fp32 encoder to 3e-5 (`ink-run vision-check`). The reference for the
+  table is that fp32 encoder, run on the pixels the engine decoded, in front of the reference text model.
+- A JPEG decoded by the engine instead of libjpeg-turbo moves the reference by 0.009 on the test photo: less than the engine's own
+  distance.
+
 **Repeating it.** `ink-run kl` repeats the measurement, but it needs reference logits in the format described at the top of
 `crates/fe-ink/src/bin/ink-run.rs`. They are not shipped, so the measurement cannot be repeated from the repository alone.
 
 ## Limits
 
-- **Text only.** The published model reads images; the engine has no vision tower yet. A request with an image is answered without it (the prompt tells the model that an image was omitted).
+- **Pictures:** PNG and JPEG in `data:` URLs only, at most 16 pictures and 16,384 image tokens a request. A picture above 2,304
+  image tokens (2560 x 1440) is shrunk to that size; the encoder takes 5.7 s for it on the RTX 5060 Ti ([Images](#images)). No audio, no video. Image input was not run on a DGX Spark yet.
 - **Four requests at once** on the 24 GB card and on a DGX Spark (up to eight there with `INK_LANES`), one on the 16 GB card by default;
   more wait in the queue. Each lane's prompt cache follows
   one conversation; more conversations than lanes take turns through the park pool, and one that has left the pool is prefilled again
@@ -450,6 +544,9 @@ These are the engine's own settings, its whole interface. The launcher sets them
 | `INK_DRAFT_MAX_CTX=n` | the draft head is loaded only for requests of at most n tokens (prompt plus answer) [no limit] |
 | `INK_FOLD=file` | where the draft head's fold tables are kept [`$INK_DIR/fold.safetensors`] |
 | `INK_PCACHE=0` | prompt cache off: every request prefills its whole prompt [on] |
+| `INK_IMAGE_MAX`, `INK_IMAGE_TOKENS`, `INK_IMAGE_TOKENS_EACH`, `INK_IMAGE_MB` | the limits of image input [16 pictures, 16384 image tokens a request, 2304 a picture (a larger picture is shrunk to fit), 20 MiB a file] ([Images](#images)) |
+| `INK_IMAGE_CACHE_MB=n` | host memory for the rows of recent pictures [256; `0` keeps none] |
+| `INK_VISION_SCORE_MB=n` | card memory for the vision encoder's attention scores while a picture is encoded [64] |
 | `INK_PCACHE_EVERY=n` | prompt-cache marks every n positions besides the prompt end [8192; `0` = the prompt end only] |
 | `INK_PCACHE_GB=x` | pinned host memory for prompt-cache snapshots, 172 MiB each [2: 11 snapshots] |
 | `INK_LANES=n` | requests decoded at once, 1 to 8 (needs `INK_KV_LAZY`) [the launcher: 4 on the 24 GB layout, 1 on the 16 GB layout] |
@@ -475,7 +572,7 @@ These are the engine's own settings, its whole interface. The launcher sets them
 relative-position bias, attention sinks, short causal convolutions on the keys, values and layer inputs) and a mixture of 128 experts, 8 picked a
 token (sigmoid router, soft-capped SwiGLU). Layers 6 to 17 run three times (the loop), the layers hand their results to block attention residuals,
 and a small gate passes a message from one pass to the next. 200,058 tokens of vocabulary, logits soft-capped at 30. The published model also
-reads images; **this engine is text only**.
+reads images, and so does this engine ([Images](#images)).
 
 It runs in a separate engine in the same server (`fe-server --engine ink`, crates `fe-ink` and `fe-inkk`), with its own Rust kernels compiled
 to PTX like the rest (`k-ink`, `k-inkm`, `k-draft`), and it uses the model's own draft head for speculative decoding.

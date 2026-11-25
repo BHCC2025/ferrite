@@ -1549,7 +1549,7 @@ mod tests {
     const V: usize = 64;
 
     fn ctl(p: SamplingParams) -> Ctl {
-        let req = GenRequest { id: "t".into(), prompt_ids: vec![1, 2, 3], snapshots: vec![], params: p, cancel: CancelToken::new() };
+        let req = GenRequest { id: "t".into(), prompt_ids: vec![1, 2, 3], snapshots: vec![], params: p, cancel: CancelToken::new(), images: vec![] };
         Ctl::new(&req, V)
     }
 

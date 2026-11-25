@@ -251,6 +251,13 @@ pub struct Taps {
     pub fin: Vec<u16>,
 }
 
+/// The embedding rows of one picture in a lane's prompt: bf16 [n][D] for positions [pos, pos + n) (see crate::images).
+#[derive(Clone)]
+pub struct ImageSpan {
+    pub pos: usize,
+    pub rows: Arc<Vec<u16>>,
+}
+
 pub struct Ink {
     pub s: Stream,
     k: Kern,
@@ -318,6 +325,10 @@ pub struct Ink {
     kvu: Option<Buf>,
     /// rows from which a segment takes the grouped prompt attention (INK_ATTN_GROUP_MIN)
     agmin: usize,
+    /// image input: the pictures of each lane's current prompt (`set_images`)
+    img: Vec<Vec<ImageSpan>>,
+    /// image rows of the forward in progress: (row of the forward, rows, first row there, count); they replace the embedding rows after embed_norm
+    img_over: Vec<(usize, Arc<Vec<u16>>, usize, usize)>,
     /// last: the context outlives every buffer, stream and graph above
     pub ctx: Arc<Context>,
 }
@@ -601,7 +612,7 @@ impl Ink {
             dq: alloc(6528 * 2304 * 2)?, ast: alloc(16 << 20)?, apt: if kv_lazy { KvBuf::Lazy(fe_cuda::VmBuffer::reserve(att_bytes, dev)?) } else { KvBuf::Plain(alloc(att_bytes)?) }, fit_floor: std::env::var("INK_FIT_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20), dg: true, dg_slide: false, dg2: true, att_mb, apt_reserved: att_bytes, capturing: false, posbuf: alloc(16)?, graphs: std::collections::HashMap::new(), kvq6, kstg: alloc(if kvq6 { tmax * 2048 } else { 16 })?, vstg: alloc(if kvq6 { tmax * 2048 } else { 16 })?, posbuf0: Buf::from_slice(&[0u8; 16])?, use_graph: true, pf_scr, cur: 0, parked, crow: tmax, multi: vec![], posarr: alloc(64 * 16)?,
             aux: [Stream::new()?, Stream::new()?], ev_fork: fe_cuda::Event::new_no_timing()?,
             ev_join: [fe_cuda::Event::new_no_timing()?, fe_cuda::Event::new_no_timing()?],
-            prof: Default::default(), evs: Default::default(), last: Default::default(), slots: None, kvu: None, agmin: 2 };
+            prof: Default::default(), evs: Default::default(), last: Default::default(), slots: None, kvu: None, agmin: 2, img: vec![], img_over: vec![] };
         let mut me = me;
         me.agmin = attn_group_min(me.ctx.attribute(18).unwrap_or(0) != 0);
         // INK_ATTN_UNPACK (default on unified-memory GPUs such as GB10, where 2 x cap x 2 KiB is cheap): the bf16 scratch of one global
@@ -830,6 +841,39 @@ impl Ink {
         self.prof.borrow_mut().clear();
     }
 
+    /// INK_FIT_MB: the device memory kept free (bytes), if set.
+    pub fn fit_floor(&self) -> Option<usize> {
+        self.fit_floor
+    }
+
+    /// The pictures of lane `lane`'s prompt (image input): a prompt id >= `images::IMG_ID_BASE` at one of their positions takes its row from
+    /// them instead of the embedding table. Set for every request with pictures before its prefill; an empty list for a text request.
+    pub fn set_images(&mut self, lane: usize, spans: Vec<ImageSpan>) {
+        if self.img.len() <= lane {
+            if spans.is_empty() {
+                return;
+            }
+            self.img.resize(lane + 1, vec![]);
+        }
+        self.img[lane] = spans;
+    }
+
+    /// Row `row` of the forward in progress is an image row at position `pos` of lane `lane`: note where its embedding row comes from.
+    fn image_row(&mut self, lane: usize, pos: usize, row: usize) -> Result<()> {
+        let sp = self.img.get(lane).and_then(|v| v.iter().find(|s| s.pos <= pos && pos < s.pos + s.rows.len() / D));
+        let Some(sp) = sp else { anyhow::bail!("image row at position {pos} of lane {lane} without its picture") };
+        let src = pos - sp.pos;
+        if let Some(last) = self.img_over.last_mut() {
+            if Arc::ptr_eq(&last.1, &sp.rows) && last.0 + last.3 == row && last.2 + last.3 == src {
+                last.3 += 1;
+                return Ok(());
+            }
+        }
+        let rows = sp.rows.clone();
+        self.img_over.push((row, rows, src, 1));
+        Ok(())
+    }
+
     /// Number of lanes (INK_LANES).
     pub fn n_lanes(&self) -> usize {
         self.parked.len()
@@ -906,12 +950,19 @@ impl Ink {
         let mut pos = vec![0u32; segs.len() * 4];
         let mut ms = Vec::with_capacity(segs.len());
         let mut off = 0;
+        self.img_over.clear();
         for (i, s) in segs.iter().enumerate() {
+            let pos0 = self.lane_len(s.0);
             for (j, &id) in s.1.iter().enumerate() {
+                let id = if crate::images::is_image_id(id) {
+                    self.image_row(s.0, pos0 + j, off + j)?;
+                    crate::vision::IMAGE_TOKEN
+                } else {
+                    id
+                };
                 let r = self.ck.read_range("model.llm.embed.weight", id as usize * D * 2, D * 2)?;
                 raw[(off + j) * D * 2..(off + j + 1) * D * 2].copy_from_slice(&r);
             }
-            let pos0 = self.lane_len(s.0);
             pos[i * 4] = pos0 as u32;
             ms.push(MultiSeg { apps: self.lane_app_ptrs(s.0), pos0, posbuf: at(&self.posarr, i * 16), t: s.1.len(), off, spec: s.2 });
             off += s.1.len();
@@ -1824,6 +1875,13 @@ impl Ink {
         let mut cur = 0usize;
         self.last.set(Some(std::time::Instant::now()));
         self.rms(self.sc.hs[0].ptr(), self.sc.x[0].ptr(), false, D, self.w.embed_norm.ptr(), t)?;
+        if !self.img_over.is_empty() {
+            // image rows: the picture's embedding rows as they are (no embed_norm), over the placeholder rows
+            ensure!(!self.capturing, "image rows in a captured forward");
+            for (row, rows, src, n) in &self.img_over {
+                unsafe { self.s.memcpy_htod(at(&self.sc.hs[0], row * D * 2), &rows[src * D..(src + n) * D])? };
+            }
+        }
         if let Some(tp) = taps.as_deref_mut() {
             self.s.sync()?;
             tp.embed = vec![0u16; t * D];
@@ -1925,7 +1983,14 @@ impl Ink {
         self.ensure_kv(self.len + t)?;
         // embedding rows (host gather) and norm
         let mut raw = vec![0u8; t * D * 2];
+        self.img_over.clear();
         for (i, &id) in ids.iter().enumerate() {
+            let id = if crate::images::is_image_id(id) {
+                self.image_row(self.cur, pos0 + i, i)?;
+                crate::vision::IMAGE_TOKEN
+            } else {
+                id
+            };
             let r = self.ck.read_range("model.llm.embed.weight", id as usize * D * 2, D * 2)?;
             raw[i * D * 2..(i + 1) * D * 2].copy_from_slice(&r);
         }
@@ -1935,7 +2000,7 @@ impl Ink {
             self.s.memcpy_htod(self.posbuf.ptr(), &[pos0 as u32])?;
         }
         self.tick("start");
-        let graphable = self.use_graph && t == 1 && nl == 1 && !self.prompt && taps.is_none() && forced.is_none() && !self.prof_on;
+        let graphable = self.use_graph && t == 1 && nl == 1 && !self.prompt && taps.is_none() && forced.is_none() && !self.prof_on && self.img_over.is_empty();
         if graphable {
             let key = (self.cur, self.draft_taps, self.spec);
             if !self.graphs.contains_key(&key) {

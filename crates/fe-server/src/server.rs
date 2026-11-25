@@ -18,10 +18,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::{ApiError, ChatRequest, CompletionRequest, SamplingRequest, parse_body, wants_logprobs};
-use crate::engine::{CancelToken, Engine, FinishReason, GenEvent, GenRequest, SamplingParams, Timings, TokenSink};
+use crate::engine::{CancelToken, Engine, FinishReason, GenEvent, GenRequest, ImageInput, SamplingParams, Timings, TokenSink};
 use crate::parser::{Delta, ForcedCall, OutputParser, ParserConfig, Parsed};
 use crate::stop::StopMatcher;
-use crate::template::{ChatTemplate, normalize_messages};
+use crate::template::{ChatTemplate, normalize_messages_with};
 use crate::tokenizer::{IncrementalDecoder, Tok};
 use crate::toolcall::ToolSet;
 use crate::util::{random_id, unix_now};
@@ -261,6 +261,9 @@ pub struct AppState {
     /// Request capture (env FE_DUMP_REQUESTS=<dir>, off when unset): every chat-completions body as received in `<id>.json`, and
     /// `<id>.meta.json` when the request completes. Set once at start (tests set it directly).
     pub dump_dir: OnceLock<PathBuf>,
+    /// Image input (the ink engine with the Inkling template): the limits of a request. None: image parts become a text placeholder.
+    #[cfg(feature = "ink")]
+    image_limits: Option<fe_ink::images::Limits>,
 }
 
 /// Write `<dir>/<name>` (a capture file); failures are logged, never returned (capture must not break a request).
@@ -302,7 +305,16 @@ impl AppState {
             tracing::info!("request capture on: chat-completions bodies and .meta.json sidecars go to {}", Path::new(&d).display());
             let _ = dump_dir.set(PathBuf::from(d));
         }
+        #[cfg(feature = "ink")]
+        let image_limits = (engine.accepts_images() && template.inkling).then(fe_ink::images::Limits::from_env);
+        #[cfg(feature = "ink")]
+        if let Some(l) = &image_limits {
+            tracing::info!("image input on: PNG and JPEG in data: URLs, up to {} pictures and {} image tokens a request, {} image tokens a picture (a larger picture is shrunk to fit) and {} MiB a file (INK_IMAGE_MAX, INK_IMAGE_TOKENS, INK_IMAGE_TOKENS_EACH, INK_IMAGE_MB)",
+                l.max_images, l.max_tokens, l.max_tokens_each, l.max_bytes >> 20);
+        }
         Arc::new(Self {
+            #[cfg(feature = "ink")]
+            image_limits,
             dump_dir,
             slots: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
             marks: crate::snapshots::Marks::new(&tok)
@@ -324,9 +336,19 @@ impl AppState {
     pub fn queued(&self) -> usize {
         self.queued.load(Ordering::Relaxed)
     }
+
+    /// The engine reads pictures: image parts of a chat request are decoded and placed in the prompt.
+    pub fn accepts_images(&self) -> bool {
+        #[cfg(feature = "ink")]
+        return self.image_limits.is_some();
+        #[cfg(not(feature = "ink"))]
+        false
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    // pictures arrive inside the request body (base64)
+    let body_limit = if state.accepts_images() { IMAGE_BODY_LIMIT } else { BODY_LIMIT };
     Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
@@ -335,7 +357,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         // a 128K-token prompt is about 0.5 MB of text; larger bodies are rejected before any tokenizing
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
 }
 
@@ -367,6 +389,8 @@ async fn health(State(s): State<Arc<AppState>>) -> Response {
 
 /// Request bodies above this many bytes get a 413 (axum's DefaultBodyLimit).
 pub const BODY_LIMIT: usize = 32 << 20;
+/// The same for a server whose engine reads pictures (they come base64-encoded in the body).
+pub const IMAGE_BODY_LIMIT: usize = 256 << 20;
 
 fn model_card(s: &AppState) -> Json {
     json!({
@@ -404,6 +428,8 @@ struct Prepared {
     id: String,
     created: u64,
     prompt_ids: Vec<u32>,
+    /// the pictures of the prompt (engines with image input)
+    images: Vec<ImageInput>,
     /// snapshot points in prompt_ids (crate::snapshots)
     snapshots: Vec<usize>,
     params: SamplingParams,
@@ -605,7 +631,73 @@ fn resolve_sampling(
     Ok((params, stops, r.include_stop_str_in_output.unwrap_or(false), r.skip_special_tokens.unwrap_or(true), effective))
 }
 
+/// Image input: decode the pictures of the image parts (`image_url` with a `data:` URL; also `input_image` and `image` parts that carry
+/// one), in the order the template will place them, and leave `{"type": "image_url"}` in each part's place. The limits of `lim` apply.
+#[cfg(feature = "ink")]
+fn take_pictures(messages: &mut [Json], lim: &fe_ink::images::Limits) -> Result<Vec<fe_ink::images::Picture>, String> {
+    let mut pics = Vec::new();
+    let mut tokens = 0usize;
+    for (i, m) in messages.iter_mut().enumerate() {
+        let Some(Json::Array(parts)) = m.get_mut("content") else { continue };
+        for (j, p) in parts.iter_mut().enumerate() {
+            let ty = p.get("type").and_then(Json::as_str).unwrap_or("");
+            if !matches!(ty, "image_url" | "input_image" | "image") {
+                continue;
+            }
+            let at = format!("messages[{i}].content[{j}]");
+            let url = match p.get("image_url") {
+                Some(Json::String(u)) => Some(u.as_str()),
+                Some(Json::Object(o)) => o.get("url").and_then(Json::as_str),
+                _ => None,
+            }
+            .or_else(|| p.get("url").and_then(Json::as_str));
+            let Some(url) = url else {
+                return Err(format!("{at}: an image part needs image_url.url with a data: URL (data:image/png;base64,... or data:image/jpeg;base64,...)"));
+            };
+            if pics.len() >= lim.max_images {
+                return Err(format!("{at}: more than {} pictures in one request (INK_IMAGE_MAX)", lim.max_images));
+            }
+            let bytes = fe_ink::images::data_url_bytes(url, lim.max_bytes).map_err(|e| format!("{at}: {e}"))?;
+            let pic = fe_ink::images::intake(&bytes, lim).map_err(|e| format!("{at}: {e}"))?;
+            tokens += pic.tokens();
+            if tokens > lim.max_tokens {
+                return Err(format!("{at}: the pictures of this request are more than {} image tokens (one per 40 x 40 pixels; INK_IMAGE_TOKENS). Send fewer or smaller pictures.", lim.max_tokens));
+            }
+            pics.push(pic);
+            *p = json!({"type": "image_url"});
+        }
+    }
+    Ok(pics)
+}
+
+/// Image input: every placeholder token the template wrote (one a picture, in order) becomes the picture's image tokens, which carry
+/// the picture's id (fe_ink::images) so that the prompt cache tells pictures apart.
+#[cfg(feature = "ink")]
+fn place_pictures(ids: Vec<u32>, pics: Vec<fe_ink::images::Picture>) -> Result<(Vec<u32>, Vec<ImageInput>), ApiError> {
+    let ph = fe_ink::vision::IMAGE_TOKEN;
+    let n = ids.iter().filter(|&&t| t == ph).count();
+    if n != pics.len() {
+        return Err(ApiError::bad_request(format!("the chat template placed {n} of the {} pictures of this request (pictures belong in user and tool messages)", pics.len())));
+    }
+    let mut out = Vec::with_capacity(ids.len() + pics.iter().map(|p| p.tokens()).sum::<usize>());
+    let mut images = Vec::with_capacity(pics.len());
+    let mut pics = pics.into_iter();
+    for t in ids {
+        if t != ph {
+            out.push(t);
+            continue;
+        }
+        let p = pics.next().expect("counted above");
+        let (pos, id, tokens) = (out.len(), p.id(), p.tokens());
+        out.resize(pos + tokens, id);
+        images.push(ImageInput { pos, key: p.key, width: p.width, height: p.height, rgb: Arc::new(p.rgb) });
+    }
+    Ok((out, images))
+}
+
 fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
+    #[cfg(feature = "ink")]
+    let mut req = req;
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must be a non-empty list"));
     }
@@ -615,7 +707,12 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
     if wants_logprobs(&req.logprobs) || wants_logprobs(&req.top_logprobs) {
         return Err(ApiError::bad_request("logprobs are not supported"));
     }
-    let mut messages = normalize_messages(&req.messages).map_err(ApiError::bad_request)?;
+    #[cfg(feature = "ink")]
+    let pictures = match &s.image_limits {
+        Some(lim) => take_pictures(&mut req.messages, lim).map_err(ApiError::bad_request)?,
+        None => Vec::new(),
+    };
+    let mut messages = normalize_messages_with(&req.messages, s.accepts_images()).map_err(ApiError::bad_request)?;
     let tools: Vec<Json> = req.tools.clone().unwrap_or_default();
     let choice = parse_tool_choice(req.tool_choice.as_ref())?;
     let template_tools: Option<Vec<Json>> = match &choice {
@@ -752,6 +849,15 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
     } else {
         s.tok.encode(&prompt).map_err(|e| ApiError::internal(e.to_string()))?
     };
+    #[cfg(feature = "ink")]
+    let (prompt_ids, images) = if pictures.is_empty() { (prompt_ids, Vec::new()) } else { place_pictures(prompt_ids, pictures)? };
+    #[cfg(not(feature = "ink"))]
+    let images: Vec<ImageInput> = Vec::new();
+    if !images.is_empty() {
+        let sizes: Vec<String> = images.iter().map(|i| format!("{} x {}", i.width, i.height)).collect();
+        let tokens: usize = images.iter().map(|i| i.width.div_ceil(40) * i.height.div_ceil(40)).sum();
+        tracing::info!("chat request with {} picture(s) ({}): {tokens} image tokens of {} prompt tokens", images.len(), sizes.join(", "), prompt_ids.len());
+    }
     let (mut params, stops, include_stop, skip_special, mut effective) = resolve_sampling(s, &req.sampling, prompt_ids.len(), None, Some(thinking))?;
     let ph = &s.cfg.defaults.phase;
     // the loop breaker watches every chat reply (answer and tool-call rules); the reasoning rule and cap need the block's end token
@@ -803,6 +909,7 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
         created: unix_now(),
         snapshots: s.marks.points(&prompt_ids),
         prompt_ids,
+        images,
         params,
         stops,
         include_stop,
@@ -866,6 +973,7 @@ fn prepare_completion(s: &AppState, req: CompletionRequest) -> Result<Prepared, 
         created: unix_now(),
         snapshots: s.marks.points(&prompt_ids),
         prompt_ids,
+        images: Vec::new(),
         params,
         stops,
         include_stop,
@@ -924,7 +1032,7 @@ async fn start(s: &Arc<AppState>, p: &Prepared) -> Running {
     let (tx, rx) = mpsc::unbounded_channel();
     let cancel = CancelToken::new();
     let req = GenRequest { id: p.id.clone(), prompt_ids: p.prompt_ids.clone(), snapshots: p.snapshots.clone(),
-        params: p.params.clone(), cancel: cancel.clone() };
+        params: p.params.clone(), cancel: cancel.clone(), images: p.images.clone() };
     // given back before the submit: the worker this request wakes must not wait for the request itself
     drop(p.incoming.lock().unwrap_or_else(|e| e.into_inner()).take());
     s.engine.submit(req, TokenSink::with_slot(tx, Box::new(slot)));
@@ -1579,12 +1687,37 @@ async fn run(state: Arc<AppState>, prepared: Result<Prepared, ApiError>, t_start
 mod tests {
     use super::*;
 
+    #[cfg(feature = "ink")]
+    #[test]
+    fn pictures_take_the_place_of_the_placeholders() {
+        use fe_ink::images::{IMG_ID_BASE, Picture};
+        let pic = |key: u32, w: usize, h: usize| Picture { key, width: w, height: h, rgb: vec![0; w * h * 3] };
+        let ph = fe_ink::vision::IMAGE_TOKEN;
+        // 80 x 40 pixels = 2 image tokens, 41 x 81 = 2 x 3 = 6
+        let (ids, images) = place_pictures(vec![5, ph, 6, 7, ph, 8], vec![pic(3, 80, 40), pic(9, 41, 81)]).unwrap();
+        let (a, b) = (IMG_ID_BASE | 3, IMG_ID_BASE | 9);
+        assert_eq!(ids, vec![5, a, a, 6, 7, b, b, b, b, b, b, 8]);
+        assert_eq!(images.iter().map(|i| (i.pos, i.key, i.width, i.height)).collect::<Vec<_>>(), vec![(1, 3, 80, 40), (5, 9, 41, 81)]);
+        // a placeholder count that differs from the pictures is refused
+        assert!(place_pictures(vec![5, ph], vec![pic(3, 80, 40), pic(9, 41, 81)]).is_err());
+        // image parts are taken out in message order; other URLs are refused
+        let lim = fe_ink::images::Limits { max_images: 2, max_tokens: 100, max_tokens_each: 100, max_bytes: 1 << 20 };
+        let mut m = vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]})];
+        let e = take_pictures(&mut m, &lim).unwrap_err();
+        assert!(e.starts_with("messages[0].content[1]:") && e.contains("does not fetch"), "{e}");
+        let mut m = vec![json!({"role": "user", "content": [{"type": "image_url"}]})];
+        assert!(take_pictures(&mut m, &lim).unwrap_err().contains("data: URL"));
+        let mut m = vec![json!({"role": "user", "content": "no parts"}), json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})];
+        assert!(take_pictures(&mut m, &lim).unwrap().is_empty());
+    }
+
     fn prepared(include_usage: bool) -> Prepared {
         Prepared {
             kind: Kind::Chat,
             id: "chatcmpl-x".into(),
             created: 1,
             prompt_ids: vec![1, 2, 3],
+            images: Vec::new(),
             snapshots: Vec::new(),
             params: SamplingParams::default(),
             stops: Vec::new(),

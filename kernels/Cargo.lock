@@ -4,116 +4,123 @@ version = 4
 
 [[package]]
 name = "k-core"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-core-tp2"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-dflash"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-draft"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-ds"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-dspark"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-engram"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-exl3"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-fabric"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-fnext"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-fp4"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-gdn"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-gdn-tp2"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-gguf"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-ink"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "k-inkm"
-version = "0.9.7"
+version = "0.9.8"
+dependencies = [
+ "kcommon",
+]
+
+[[package]]
+name = "k-inkv"
+version = "0.9.8"
 dependencies = [
  "kcommon",
 ]
 
 [[package]]
 name = "kcommon"
-version = "0.9.7"
+version = "0.9.8"

@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use fe_ink::engine::Ink;
+use fe_ink::images::{Images, Placed};
 use fe_ink::pcache::PCache;
 use fe_ink::sampler::{DevSampler, PenHist};
 use fe_ink::spec::{argmax, rng_next, SampleCfg, Spec};
@@ -67,6 +68,8 @@ impl InkEngine {
                 let mut head_failed = head_allowed && spec.is_none();
                 // device sampler for plain (non-drafted) decode: the same distribution code as the draft loop, no host softmax
                 let mut dsamp = DevSampler::new(ink.ctx.clone())?;
+                // image input: the vision encoder is loaded with the first picture (its weights stay in host memory)
+                let mut images = Images::new(&model_dir);
                 let mut pc = PCache::new(&ink);
                 if pc.on {
                     tracing::info!("ink engine: prompt cache on: snapshots of {:.0} MiB in pinned host memory, up to {} ({:.2} GiB, INK_PCACHE_GB), marks at the prompt end and every {} tokens (INK_PCACHE_EVERY); INK_PCACHE=0 turns it off",
@@ -77,7 +80,7 @@ impl InkEngine {
                 // INK_LANES > 1: several requests at once (crate::ink_lanes); the draft head stays as loaded
                 if ink.n_lanes() > 1 {
                     let _ = ready_tx.send(Ok(ink.n_lanes()));
-                    return crate::ink_lanes::run_lanes(&mut ink, spec.as_mut(), &mut dsamp, &rx);
+                    return crate::ink_lanes::run_lanes(&mut ink, spec.as_mut(), &mut dsamp, &mut images, &rx);
                 }
                 let _ = ready_tx.send(Ok(1));
                 while let Ok(job) = rx.recv() {
@@ -97,7 +100,7 @@ impl InkEngine {
                         pc.clear();
                     }
                     let _ = chunk;
-                    run(&mut ink, spec.as_mut(), &mut dsamp, &mut pc, job);
+                    run(&mut ink, spec.as_mut(), &mut dsamp, &mut pc, &mut images, job);
                 }
                 Ok(())
             }));
@@ -131,9 +134,30 @@ impl Engine for InkEngine {
     fn dead(&self) -> Option<String> {
         self.dead.lock().unwrap().clone()
     }
+
+    fn accepts_images(&self) -> bool {
+        true
+    }
 }
 
-fn run(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, pc: &mut PCache, job: Job) {
+/// The pictures of a request, for the current lane, once the prompt cache has given the resume point `from`: the rows of every picture
+/// the prefill still reaches (from the row cache, or one run of the vision encoder each). A picture that lies wholly inside the resumed
+/// prefix needs nothing. A text request clears the lane's pictures.
+pub(crate) fn place_images(ink: &mut Ink, images: &mut Images, req: &GenRequest, from: usize) -> Result<()> {
+    if req.images.is_empty() {
+        ink.set_images(ink.lane(), Vec::new());
+        return Ok(());
+    }
+    let placed: Vec<Placed> = req.images.iter().map(|i| Placed { pos: i.pos, key: i.key, width: i.width, height: i.height, rgb: i.rgb.as_slice() }).collect();
+    let (spans, rep) = images.prepare(ink, &placed, from)?;
+    ink.set_images(ink.lane(), spans);
+    let moved = if rep.experts_moved > 0 { format!("; {} experts made room in host memory and came back ({:.0} ms)", rep.experts_moved, rep.fit_ms) } else { String::new() };
+    tracing::info!("ink vision ({}, lane {}): {} picture(s): {} inside the resumed prompt cache (no encode), {} from the row cache (no encode), {} encoded ({} image tokens, {:.0} ms){moved}",
+        req.id, ink.lane(), req.images.len(), rep.in_prompt_cache, rep.from_row_cache, rep.encoded, rep.encoded_tokens, rep.encode_ms);
+    Ok(())
+}
+
+fn run(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, pc: &mut PCache, images: &mut Images, job: Job) {
     let Job { req, sink } = job;
     let p = &req.params;
     let fin0 = |reason: FinishReason, t: Option<Timings>| Finish { reason, cached_prompt_tokens: 0, timings: t, events: Default::default() };
@@ -156,6 +180,9 @@ fn run(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, pc: &
         Err(e) => return sink.finish(fin0(FinishReason::Error(format!("{e:#}")), None)),
     };
     let fin = |reason: FinishReason, t: Option<Timings>| Finish { reason, cached_prompt_tokens: from, timings: t, events: Default::default() };
+    if let Err(e) = place_images(ink, images, &req, from) {
+        return sink.finish(fin(FinishReason::Error(format!("{e:#}")), None));
+    }
     if !feed {
         ink.draft_taps = false;
     }

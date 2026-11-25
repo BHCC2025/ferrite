@@ -4,6 +4,36 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] - 2026-11-25
+
+### Added
+
+- **Inkling-2-Mini reads pictures.** A chat request can carry PNG and JPEG pictures as `image_url` parts with `data:` URLs, and the
+  model sees them through its own vision encoder, which is now part of the engine. This works on every Inkling target: one RTX PRO
+  4000 (24 GB), one RTX 5060 Ti (16 GB) and one DGX Spark.
+  - **Accuracy:** the encoder gives the reference implementation's output to within 3.3e-5 (fp32 reference, 7 test pictures). On the
+    text after a picture, the KL against the reference is 0.017 on average on the 24 GB card and 0.025 on the 16 GB card. The reference
+    run with the model's native activation formats differs from the reference itself by 0.021 on the same prompts.
+  - **Speed:** a 1920 x 1080 picture is encoded in about 1.8 s on the cards. The first token of a request with one comes after 3.2 to
+    3.6 s.
+  - **Prompt cache:** the prompt cache keeps pictures. A later turn about the same picture does not encode it again: the first token
+    comes after 0.2 to 0.3 s. A different picture never matches a cached one.
+  - **Memory:** the encoder's 605 MiB stay in host memory and are streamed while a picture is encoded. Nothing stays on the card, and the
+    128K context is unchanged. On the 16 GB card a few experts may move to host memory during an encode and come back after it.
+  - **Large pictures** are shrunk, keeping their shape, to 2,304 image tokens (2560 x 1440 for 16:9; `INK_IMAGE_TOKENS_EACH`).
+  - **Limits** (`INK_IMAGE_MAX`, `INK_IMAGE_TOKENS`, `INK_IMAGE_MB`): 16 pictures and 16,384 image tokens a request, 20 MiB a file.
+    `http(s)` and `file` URLs get a 400; the server fetches nothing.
+  - **Drafting and lanes:** the draft head and several requests at once work with pictures, with the same output as one request alone
+    without drafting.
+  - EXIF orientation is not applied, the same as in the reference.
+
+### Changed
+
+- **Text-only requests:** no change in output or speed on any target. On a DGX Spark, every cell of the release checks is within 1.5% of
+  0.9.7.
+- **Other engines:** an image part still becomes a text placeholder, as before.
+- Version 0.9.8.
+
 ## [0.9.7] - 2026-11-24
 
 ### Fixed

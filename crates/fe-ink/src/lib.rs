@@ -10,6 +10,8 @@ pub mod pcache;
 pub mod park;
 pub mod fold;
 pub mod weights;
+pub mod vision;
+pub mod images;
 
 /// Per-layer pick shares of the experts (code and prose averaged), the order in which experts leave the card on the 16 GB layout.
 pub static HEAT_SHARE: &str = include_str!("../heat/heat_share.json");
@@ -34,6 +36,8 @@ pub fn heat_share() -> anyhow::Result<Vec<Vec<f64>>> {
 
 pub static K_DRAFT_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/k_draft.cubin"));
 pub static K_INKM_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/k_inkm.cubin"));
+/// The vision encoder kernels (image input); loaded only when an image is encoded.
+pub static K_INKV_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/k_inkv.cubin"));
 
 pub const D: usize = 2304;
 pub const NL: usize = 24;

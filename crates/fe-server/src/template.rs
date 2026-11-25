@@ -193,6 +193,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// - non-text content parts (images, audio, ...) become a text placeholder: the model is text-only
 ///   and an agent loop should keep going (e.g. a tool that returned a screenshot) instead of failing.
 pub fn normalize_messages(messages: &[Json]) -> Result<Vec<Json>, String> {
+    normalize_messages_with(messages, false)
+}
+
+/// [`normalize_messages`]; `keep_images`: the engine reads pictures and the server has already taken them out of the image parts
+/// (each is left as `{"type": "image_url"}`), which stay for the template to place.
+pub fn normalize_messages_with(messages: &[Json], keep_images: bool) -> Result<Vec<Json>, String> {
     let mut out = Vec::with_capacity(messages.len());
     for (i, m) in messages.iter().enumerate() {
         let Json::Object(obj) = m else {
@@ -211,6 +217,9 @@ pub fn normalize_messages(messages: &[Json]) -> Result<Vec<Json>, String> {
             for p in parts.iter_mut() {
                 let ty = p.get("type").and_then(Json::as_str).unwrap_or("");
                 let is_text = p.get("text").is_some_and(Json::is_string) && (ty == "text" || ty.is_empty());
+                if keep_images && ty == "image_url" && p.as_object().is_some_and(|o| o.len() == 1) {
+                    continue;
+                }
                 if !is_text {
                     let kind = if ty.is_empty() { "content" } else { ty.trim_end_matches("_url") };
                     tracing::warn!("messages[{i}]: replacing a '{ty}' content part with a placeholder (text-only model)");
@@ -283,5 +292,11 @@ mod tests {
         assert_eq!(out[2]["role"], "system");
         let out = normalize_messages(&[json!({"role": "user", "content": [{"type": "text", "text": "see"}, {"type": "image_url", "image_url": {}}]})]).unwrap();
         assert_eq!(out[0]["content"][1], json!({"type": "text", "text": "[image omitted: this model only reads text]"}));
+        // an engine that reads pictures: the part the server left for the template stays; anything else is still replaced
+        let msgs = [json!({"role": "user", "content": [{"type": "image_url"}, {"type": "image_url", "image_url": {"url": "x"}}, {"type": "input_audio"}]})];
+        let out = normalize_messages_with(&msgs, true).unwrap();
+        assert_eq!(out[0]["content"][0], json!({"type": "image_url"}));
+        assert_eq!(out[0]["content"][1]["type"], "text");
+        assert_eq!(out[0]["content"][2]["type"], "text");
     }
 }

@@ -136,6 +136,7 @@ licenses):
 | [minijinja](https://github.com/mitsuhiko/minijinja), minijinja-contrib (pycompat) | Apache-2.0 | `chat_template.jinja` |
 | [axum](https://github.com/tokio-rs/axum), [tokio](https://github.com/tokio-rs/tokio), tokio-stream, [tracing](https://github.com/tokio-rs/tracing), tracing-subscriber, [tower](https://github.com/tower-rs/tower) (tests), [http-body-util](https://github.com/hyperium/http-body) (tests) | MIT | the HTTP server, async runtime, logging |
 | [serde](https://github.com/serde-rs/serde), [serde_json](https://github.com/serde-rs/json), [anyhow](https://github.com/dtolnay/anyhow), [clap](https://github.com/clap-rs/clap), [futures](https://github.com/rust-lang/futures-rs), [memmap2](https://github.com/RazrFalcon/memmap2-rs), [libc](https://github.com/rust-lang/libc) | MIT OR Apache-2.0 | JSON, errors, CLI, streams, safetensors mapping, system calls |
+| [image](https://github.com/image-rs/image) (PNG and JPEG features only: [png](https://github.com/image-rs/image-png), [zune-jpeg](https://github.com/etemesi254/zune-image)) | MIT OR Apache-2.0 | decoding the pictures of a request (Inkling-2-Mini image input) |
 
 Toolchain and system libraries (NON-RUST.md has the reasons):
 

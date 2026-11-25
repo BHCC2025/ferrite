@@ -140,7 +140,7 @@ impl Act {
     }
 }
 
-pub(crate) fn run_lanes(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, rx: &mpsc::Receiver<Job>) -> Result<()> {
+pub(crate) fn run_lanes(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut DevSampler, images: &mut fe_ink::images::Images, rx: &mpsc::Receiver<Job>) -> Result<()> {
     let nl = ink.n_lanes();
     if let Some(sp) = spec.as_deref_mut() {
         sp.add_lanes(nl)?;
@@ -270,7 +270,7 @@ pub(crate) fn run_lanes(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut 
                 }
             }
             lanes[best].used = tick;
-            match start(ink, &mut spec, &mut lanes[best].pc, best, job, need) {
+            match start(ink, &mut spec, &mut lanes[best].pc, images, best, job, need) {
                 Ok(Some(a)) => lanes[best].act = Some(a),
                 Ok(None) => {}
                 Err(e) => tracing::warn!("ink lanes: lane {best}: {e:#}"),
@@ -316,7 +316,7 @@ pub(crate) fn run_lanes(ink: &mut Ink, mut spec: Option<&mut Spec>, dsamp: &mut 
 }
 
 /// Give lane `l` the request: prompt cache restore (or reset), sampling state, the prefill run.
-fn start(ink: &mut Ink, spec: &mut Option<&mut Spec>, pc: &mut PCache, l: usize, job: Job, need: usize) -> Result<Option<Act>> {
+fn start(ink: &mut Ink, spec: &mut Option<&mut Spec>, pc: &mut PCache, images: &mut fe_ink::images::Images, l: usize, job: Job, need: usize) -> Result<Option<Act>> {
     select(ink, spec, l)?;
     let p = &job.req.params;
     let n = job.req.prompt_ids.len();
@@ -335,6 +335,11 @@ fn start(ink: &mut Ink, spec: &mut Option<&mut Spec>, pc: &mut PCache, l: usize,
             return Ok(None);
         }
     };
+    // the pictures of the prompt (the encoder runs here, between forwards, for those the prefill reaches)
+    if let Err(e) = crate::ink::place_images(ink, images, &job.req, from) {
+        job.sink.finish(Finish { reason: FinishReason::Error(format!("{e:#}")), cached_prompt_tokens: from, timings: None, events: Default::default() });
+        return Ok(None);
+    }
     if use_spec {
         spec.as_deref_mut().unwrap().begin(cfg, &job.req.prompt_ids);
     }

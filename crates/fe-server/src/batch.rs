@@ -505,7 +505,7 @@ pub mod tests {
 
     pub fn generate(e: &BatchEngine, prompt: Vec<u32>, p: SamplingParams, cancel: CancelToken) -> (Vec<u32>, Finish) {
         let (tx, mut rx) = tmpsc::unbounded_channel();
-        e.submit(GenRequest { id: "t".into(), prompt_ids: prompt, snapshots: Vec::new(), params: p, cancel }, TokenSink::new(tx));
+        e.submit(GenRequest { id: "t".into(), prompt_ids: prompt, snapshots: Vec::new(), params: p, cancel, images: Vec::new() }, TokenSink::new(tx));
         let mut out = Vec::new();
         loop {
             match rx.blocking_recv() {

@@ -68,7 +68,10 @@ impl PenHist {
         self.on = cfg.has_penalties();
         if self.on {
             for &t in prompt {
-                self.map.entry(t).or_insert((0, false)).1 = true;
+                // ids of image rows (crate::images) are not vocabulary tokens: no penalty entry
+                if !crate::images::is_image_id(t) {
+                    self.map.entry(t).or_insert((0, false)).1 = true;
+                }
             }
         }
     }

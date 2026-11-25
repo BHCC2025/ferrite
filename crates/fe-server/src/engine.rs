@@ -116,6 +116,25 @@ impl CancelToken {
     }
 }
 
+/// A picture of a request at its place in the prompt, decoded (engines with image input: [`Engine::accepts_images`]). Its image tokens
+/// are positions `pos..` of `prompt_ids` and carry the picture's id there instead of a vocabulary token (fe_ink::images).
+#[derive(Clone)]
+pub struct ImageInput {
+    pub pos: usize,
+    /// the picture's number: the same pixels have the same number
+    pub key: u32,
+    pub width: usize,
+    pub height: usize,
+    /// 8-bit RGB, row-major
+    pub rgb: Arc<Vec<u8>>,
+}
+
+impl std::fmt::Debug for ImageInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ImageInput {{ pos: {}, key: {}, {} x {} }}", self.pos, self.key, self.width, self.height)
+    }
+}
+
 /// One generation request as the engine sees it.
 #[derive(Clone, Debug)]
 pub struct GenRequest {
@@ -129,6 +148,8 @@ pub struct GenRequest {
     pub snapshots: Vec<usize>,
     pub params: SamplingParams,
     pub cancel: CancelToken,
+    /// The pictures of the prompt, in order (empty for a text request and for engines without image input).
+    pub images: Vec<ImageInput>,
 }
 
 /// Why generation ended.
@@ -285,6 +306,11 @@ pub trait Engine: Send + Sync + 'static {
     /// fails with the reason and the server exits non-zero, so a supervisor restarts it.
     fn dead(&self) -> Option<String> {
         None
+    }
+
+    /// The engine reads pictures (`GenRequest::images`). Others get a text placeholder for an image part.
+    fn accepts_images(&self) -> bool {
+        false
     }
 
     /// Positions of the context a prompt may not use (the engine keeps them for its own rows): a prompt of

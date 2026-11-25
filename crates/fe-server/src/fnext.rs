@@ -838,7 +838,7 @@ mod tests {
     /// A request as `start` sets it up, without an engine.
     fn active(p: SamplingParams) -> (Active, tokio::sync::mpsc::UnboundedReceiver<GenEvent>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let req = GenRequest { id: "t".into(), prompt_ids: vec![1, 2, 3], snapshots: vec![], params: p, cancel: CancelToken::new() };
+        let req = GenRequest { id: "t".into(), prompt_ids: vec![1, 2, 3], snapshots: vec![], params: p, cancel: CancelToken::new(), images: vec![] };
         let (guard, mode) = match PhaseGuard::new(&req.params, |q| Mode(q.clone())) {
             Some((g, s)) => (Some(g), s),
             None => (None, Mode(req.params.clone())),

@@ -70,7 +70,8 @@ completion_tokens / total_tokens / prompt_tokens_details.cached_tokens`. Streams
   `strftime_now`, the tokenizer's special tokens as variables. Variables: `messages`, `tools`,
   `add_generation_prompt` (request field, default true), every key of `chat_template_kwargs`. Messages are
   normalized like vLLM: tool-call `arguments` JSON strings → objects, `developer` → `system`, an assistant
-  `reasoning` field → `reasoning_content`, non-text content parts → a text placeholder.
+  `reasoning` field → `reasoning_content`, non-text content parts → a text placeholder (`--engine ink` reads
+  pictures instead, see "Image parts" below).
   `continue_final_message` is supported. Byte-for-byte equal to HF `apply_chat_template` on 16 cases (below).
 - **Thinking**: on by default (prompt ends `<think>\n`); `chat_template_kwargs.enable_thinking=false` (or
   top-level `enable_thinking: false`, or `reasoning_effort: "none"`) pre-fills `<think>\n\n</think>\n\n`.
@@ -112,6 +113,24 @@ completion_tokens / total_tokens / prompt_tokens_details.cached_tokens`. Streams
   let go of the request.
 - **Cancellation**: a client disconnect (stream or not, also while queued) drops the request's driver,
   which sets the `CancelToken` and closes the sink (`send_tokens` then returns false).
+
+### Image parts (`--engine ink`)
+
+- A chat message of role `user` or `tool` may hold `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`
+  parts (PNG or JPEG; `image_url` may also be the URL string itself; `input_image` and `image` parts with such a URL are
+  read the same way). Any other URL (`http`, `https`, `file`) is refused with HTTP 400: the server never fetches a picture.
+- The server decodes each picture, checks the limits (`INK_IMAGE_MAX` 16 pictures, `INK_IMAGE_TOKENS` 16384 image tokens a
+  request, `INK_IMAGE_MB` 20 MiB a file, at most 16,384 pixels a side and 100 million pixels; HTTP 400 beyond them) and lets
+  the chat template place it.
+- A picture above `INK_IMAGE_TOKENS_EACH` (2304 image tokens = 2560 x 1440) is not refused: the server shrinks it (Lanczos3,
+  aspect ratio kept, `fe_ink::images::fit_size`) until it fits, so 3840 x 2160 becomes 2560 x 1440. A picture within the
+  limit keeps its pixels; none is enlarged. The log line `ink vision: picture of W x H pixels ... shrunk to W' x H'` tells.
+  One image token is 40 x 40 pixels; image tokens count in `usage.prompt_tokens`.
+- The engine gets the decoded pictures with the request (`GenRequest::images`); in `prompt_ids` a picture's tokens carry an
+  id that stands for its pixels (SHA-256), so the prompt cache reuses the same picture and never another one.
+- A picture in a message of another role is refused by the chat template (HTTP 400). Other part types (audio, video) still
+  become a text placeholder. The request body may be up to 256 MiB on such a server (32 MiB otherwise).
+- `tools/e2e_images.py` runs the image checks against a running server.
 
 ## Engine trait (`src/engine.rs`)
 
@@ -271,4 +290,4 @@ feature). Verified: with that manifest on top of core d7cbe99, `cargo build --re
   supported (`n`/`suffix`/batched return 400, the rest are ignored).
 - `tool_choice: required` / named function is a prompt hint, not constrained decoding.
 - Tool-call arguments stream in one piece at `</function>` (not character by character).
-- Images / audio in messages become a text placeholder (text-only model).
+- Images / audio in messages become a text placeholder (text-only models); `--engine ink` reads pictures (see "Image parts" above).
