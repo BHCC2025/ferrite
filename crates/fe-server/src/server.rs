@@ -309,7 +309,12 @@ impl AppState {
         let image_limits = (engine.accepts_images() && template.inkling).then(fe_ink::images::Limits::from_env);
         #[cfg(feature = "ink")]
         if let Some(l) = &image_limits {
-            tracing::info!("image input on: PNG and JPEG in data: URLs, up to {} pictures and {} image tokens a request, {} image tokens a picture (a larger picture is shrunk to fit) and {} MiB a file (INK_IMAGE_MAX, INK_IMAGE_TOKENS, INK_IMAGE_TOKENS_EACH, INK_IMAGE_MB)",
+            let over = if l.drop_oldest {
+                format!("a request with more pictures or image tokens leaves out its oldest pictures, {} at a time (INK_IMAGE_OVERFLOW=drop)", l.overflow_batch())
+            } else {
+                "a request with more pictures or image tokens is refused (INK_IMAGE_OVERFLOW=reject)".to_string()
+            };
+            tracing::info!("image input on: PNG and JPEG in data: URLs, up to {} pictures and {} image tokens a request, {} image tokens a picture (a larger picture is shrunk to fit) and {} MiB a file (INK_IMAGE_MAX, INK_IMAGE_TOKENS, INK_IMAGE_TOKENS_EACH, INK_IMAGE_MB); {over}",
                 l.max_images, l.max_tokens, l.max_tokens_each, l.max_bytes >> 20);
         }
         Arc::new(Self {
@@ -430,6 +435,8 @@ struct Prepared {
     prompt_ids: Vec<u32>,
     /// the pictures of the prompt (engines with image input)
     images: Vec<ImageInput>,
+    /// pictures of the request left out of the prompt (image overflow; `usage.prompt_tokens_details.images_omitted` when not 0)
+    images_omitted: usize,
     /// snapshot points in prompt_ids (crate::snapshots)
     snapshots: Vec<usize>,
     params: SamplingParams,
@@ -631,43 +638,104 @@ fn resolve_sampling(
     Ok((params, stops, r.include_stop_str_in_output.unwrap_or(false), r.skip_special_tokens.unwrap_or(true), effective))
 }
 
-/// Image input: decode the pictures of the image parts (`image_url` with a `data:` URL; also `input_image` and `image` parts that carry
-/// one), in the order the template will place them, and leave `{"type": "image_url"}` in each part's place. The limits of `lim` apply.
+/// The text an image part becomes when its picture is left out of the prompt (see [`take_pictures`]).
 #[cfg(feature = "ink")]
-fn take_pictures(messages: &mut [Json], lim: &fe_ink::images::Limits) -> Result<Vec<fe_ink::images::Picture>, String> {
+const PICTURE_OMITTED: &str = "[earlier picture omitted]";
+
+/// The `data:` URL of an image part (`image_url` with a `data:` URL; also `input_image` and `image` parts that carry one); None for
+/// a part that is not an image part.
+#[cfg(feature = "ink")]
+fn image_part_url<'a>(p: &'a Json, at: &str) -> Result<Option<&'a str>, String> {
+    let ty = p.get("type").and_then(Json::as_str).unwrap_or("");
+    if !matches!(ty, "image_url" | "input_image" | "image") {
+        return Ok(None);
+    }
+    let url = match p.get("image_url") {
+        Some(Json::String(u)) => Some(u.as_str()),
+        Some(Json::Object(o)) => o.get("url").and_then(Json::as_str),
+        _ => None,
+    }
+    .or_else(|| p.get("url").and_then(Json::as_str));
+    match url {
+        Some(u) => Ok(Some(u)),
+        None => Err(format!("{at}: an image part needs image_url.url with a data: URL (data:image/png;base64,... or data:image/jpeg;base64,...)")),
+    }
+}
+
+/// Image input: decode the pictures of the image parts, in the order the template will place them, and leave
+/// `{"type": "image_url"}` in each part's place. The limits of `lim` apply. A request with more pictures than `lim.max_images` or
+/// more image tokens than `lim.max_tokens` is not refused (unless `lim.drop_oldest` is off): its oldest pictures (message order,
+/// then part order) are left out, each image part becoming the text part "[earlier picture omitted]". How many:
+/// `fe_ink::images::omit_count`, in whole batches, so that the prompt in front of the kept pictures stays the same from turn to
+/// turn and the prompt cache resumes it. Returns the pictures kept and the number left out.
+#[cfg(feature = "ink")]
+fn take_pictures(messages: &mut [Json], lim: &fe_ink::images::Limits) -> Result<(Vec<fe_ink::images::Picture>, usize), String> {
     let mut pics = Vec::new();
-    let mut tokens = 0usize;
+    if !lim.drop_oldest {
+        // INK_IMAGE_OVERFLOW=reject: a request beyond the limits gets HTTP 400
+        let mut tokens = 0usize;
+        for (i, m) in messages.iter_mut().enumerate() {
+            let Some(Json::Array(parts)) = m.get_mut("content") else { continue };
+            for (j, p) in parts.iter_mut().enumerate() {
+                let at = format!("messages[{i}].content[{j}]");
+                let Some(url) = image_part_url(p, &at)? else { continue };
+                if pics.len() >= lim.max_images {
+                    return Err(format!("{at}: more than {} pictures in one request (INK_IMAGE_MAX)", lim.max_images));
+                }
+                let bytes = fe_ink::images::data_url_bytes(url, lim.max_bytes).map_err(|e| format!("{at}: {e}"))?;
+                let pic = fe_ink::images::intake(&bytes, lim).map_err(|e| format!("{at}: {e}"))?;
+                tokens += pic.tokens();
+                if tokens > lim.max_tokens {
+                    return Err(format!("{at}: the pictures of this request are more than {} image tokens (one per 40 x 40 pixels; INK_IMAGE_TOKENS). Send fewer or smaller pictures.", lim.max_tokens));
+                }
+                pics.push(pic);
+                *p = json!({"type": "image_url"});
+            }
+        }
+        return Ok((pics, 0));
+    }
+    // every picture file and its image tokens (from the file header; nothing is decoded yet), oldest first
+    let mut files: Vec<Vec<u8>> = Vec::new();
+    let mut tokens: Vec<usize> = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        let Some(Json::Array(parts)) = m.get("content") else { continue };
+        for (j, p) in parts.iter().enumerate() {
+            let at = format!("messages[{i}].content[{j}]");
+            let Some(url) = image_part_url(p, &at)? else { continue };
+            let bytes = fe_ink::images::data_url_bytes(url, lim.max_bytes).map_err(|e| format!("{at}: {e}"))?;
+            tokens.push(fe_ink::images::header_tokens(&bytes, lim).map_err(|e| format!("{at}: {e}"))?);
+            files.push(bytes);
+        }
+    }
+    let omit = fe_ink::images::omit_count(&tokens, lim);
+    let mut n = 0usize;
     for (i, m) in messages.iter_mut().enumerate() {
         let Some(Json::Array(parts)) = m.get_mut("content") else { continue };
         for (j, p) in parts.iter_mut().enumerate() {
-            let ty = p.get("type").and_then(Json::as_str).unwrap_or("");
-            if !matches!(ty, "image_url" | "input_image" | "image") {
+            let at = format!("messages[{i}].content[{j}]");
+            if image_part_url(p, &at)?.is_none() {
                 continue;
             }
-            let at = format!("messages[{i}].content[{j}]");
-            let url = match p.get("image_url") {
-                Some(Json::String(u)) => Some(u.as_str()),
-                Some(Json::Object(o)) => o.get("url").and_then(Json::as_str),
-                _ => None,
+            if n < omit {
+                *p = json!({"type": "text", "text": PICTURE_OMITTED});
+            } else {
+                pics.push(fe_ink::images::intake(&files[n], lim).map_err(|e| format!("{at}: {e}"))?);
+                *p = json!({"type": "image_url"});
             }
-            .or_else(|| p.get("url").and_then(Json::as_str));
-            let Some(url) = url else {
-                return Err(format!("{at}: an image part needs image_url.url with a data: URL (data:image/png;base64,... or data:image/jpeg;base64,...)"));
-            };
-            if pics.len() >= lim.max_images {
-                return Err(format!("{at}: more than {} pictures in one request (INK_IMAGE_MAX)", lim.max_images));
-            }
-            let bytes = fe_ink::images::data_url_bytes(url, lim.max_bytes).map_err(|e| format!("{at}: {e}"))?;
-            let pic = fe_ink::images::intake(&bytes, lim).map_err(|e| format!("{at}: {e}"))?;
-            tokens += pic.tokens();
-            if tokens > lim.max_tokens {
-                return Err(format!("{at}: the pictures of this request are more than {} image tokens (one per 40 x 40 pixels; INK_IMAGE_TOKENS). Send fewer or smaller pictures.", lim.max_tokens));
-            }
-            pics.push(pic);
-            *p = json!({"type": "image_url"});
+            files[n] = Vec::new();
+            n += 1;
         }
     }
-    Ok(pics)
+    if omit > 0 {
+        let b = lim.overflow_batch();
+        let kept: usize = tokens[omit..].iter().sum();
+        if omit % b != 0 {
+            tracing::warn!("image overflow: the limits (INK_IMAGE_MAX {}, INK_IMAGE_TOKENS {}) are smaller than one batch of this request's pictures; the count left out is not a multiple of the batch", lim.max_images, lim.max_tokens);
+        }
+        tracing::info!("image overflow: {omit} of {n} pictures left out, oldest first (k = {omit}, batch B = {b}); kept {} pictures, {kept} image tokens (INK_IMAGE_MAX {}, INK_IMAGE_TOKENS {})",
+            n - omit, lim.max_images, lim.max_tokens);
+    }
+    Ok((pics, omit))
 }
 
 /// Image input: every placeholder token the template wrote (one a picture, in order) becomes the picture's image tokens, which carry
@@ -708,10 +776,12 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
         return Err(ApiError::bad_request("logprobs are not supported"));
     }
     #[cfg(feature = "ink")]
-    let pictures = match &s.image_limits {
+    let (pictures, images_omitted) = match &s.image_limits {
         Some(lim) => take_pictures(&mut req.messages, lim).map_err(ApiError::bad_request)?,
-        None => Vec::new(),
+        None => (Vec::new(), 0),
     };
+    #[cfg(not(feature = "ink"))]
+    let images_omitted = 0usize;
     let mut messages = normalize_messages_with(&req.messages, s.accepts_images()).map_err(ApiError::bad_request)?;
     let tools: Vec<Json> = req.tools.clone().unwrap_or_default();
     let choice = parse_tool_choice(req.tool_choice.as_ref())?;
@@ -910,6 +980,7 @@ fn prepare_chat(s: &AppState, req: ChatRequest) -> Result<Prepared, ApiError> {
         snapshots: s.marks.points(&prompt_ids),
         prompt_ids,
         images,
+        images_omitted,
         params,
         stops,
         include_stop,
@@ -974,6 +1045,7 @@ fn prepare_completion(s: &AppState, req: CompletionRequest) -> Result<Prepared, 
         snapshots: s.marks.points(&prompt_ids),
         prompt_ids,
         images: Vec::new(),
+        images_omitted: 0,
         params,
         stops,
         include_stop,
@@ -1419,14 +1491,20 @@ impl Outcome {
 // ---------------------------------------------------------------------------------------------
 // output formatting
 
-fn usage(prompt: usize, out: &Outcome) -> Json {
-    json!({
+/// `images_omitted`: pictures of the request left out of the prompt (image overflow); reported as
+/// `prompt_tokens_details.images_omitted` when not 0 (no such key otherwise: the JSON of every other request is unchanged).
+fn usage(prompt: usize, out: &Outcome, images_omitted: usize) -> Json {
+    let mut u = json!({
         "prompt_tokens": prompt,
         "completion_tokens": out.completion_tokens,
         "total_tokens": prompt + out.completion_tokens,
         "prompt_tokens_details": {"cached_tokens": out.cached_prompt_tokens},
         "completion_tokens_details": {"reasoning_tokens": out.reasoning_tokens},
-    })
+    });
+    if images_omitted > 0 {
+        u["prompt_tokens_details"]["images_omitted"] = json!(images_omitted);
+    }
+    u
 }
 
 fn delta_json(d: &Delta) -> Json {
@@ -1552,7 +1630,7 @@ fn stream_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> Respo
                 } else {
                     let _ = tx.send(sse(p.final_chunk(&model, o.finish_reason, o.timings.as_ref()))).await;
                     if p.include_usage {
-                        let _ = tx.send(sse(p.chunk_t(&model, None, Some(usage(p.prompt_ids.len(), &o)), o.timings.as_ref()))).await;
+                        let _ = tx.send(sse(p.chunk_t(&model, None, Some(usage(p.prompt_ids.len(), &o, p.images_omitted)), o.timings.as_ref()))).await;
                     }
                 }
                 let _ = tx.send(sse("[DONE]".to_string())).await;
@@ -1589,7 +1667,7 @@ async fn full_response(state: Arc<AppState>, p: Prepared, t_start: Instant) -> R
         return ApiError::internal(e).into_response();
     }
     let model = &state.cfg.model_id;
-    let usage = usage(p.prompt_ids.len(), &outcome);
+    let usage = usage(p.prompt_ids.len(), &outcome, p.images_omitted);
     let body = match p.kind {
         Kind::Chat => {
             let mut message = json!({"role": "assistant", "content": null});
@@ -1701,14 +1779,144 @@ mod tests {
         // a placeholder count that differs from the pictures is refused
         assert!(place_pictures(vec![5, ph], vec![pic(3, 80, 40), pic(9, 41, 81)]).is_err());
         // image parts are taken out in message order; other URLs are refused
-        let lim = fe_ink::images::Limits { max_images: 2, max_tokens: 100, max_tokens_each: 100, max_bytes: 1 << 20 };
+        let lim = fe_ink::images::Limits { max_images: 2, max_tokens: 100, max_tokens_each: 100, max_bytes: 1 << 20, drop_oldest: true };
         let mut m = vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]})];
         let e = take_pictures(&mut m, &lim).unwrap_err();
         assert!(e.starts_with("messages[0].content[1]:") && e.contains("does not fetch"), "{e}");
         let mut m = vec![json!({"role": "user", "content": [{"type": "image_url"}]})];
         assert!(take_pictures(&mut m, &lim).unwrap_err().contains("data: URL"));
         let mut m = vec![json!({"role": "user", "content": "no parts"}), json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})];
-        assert!(take_pictures(&mut m, &lim).unwrap().is_empty());
+        assert!(take_pictures(&mut m, &lim).unwrap().0.is_empty());
+    }
+
+    /// An image part with a grey PNG of w x h pixels (stored, not compressed); `shade` tells the pictures apart.
+    #[cfg(feature = "ink")]
+    fn png_part(w: u32, h: u32, shade: u8) -> Json {
+        fn crc(d: &[u8]) -> u32 {
+            let mut c = !0u32;
+            for &b in d {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        fn chunk(out: &mut Vec<u8>, ty: &[u8; 4], d: &[u8]) {
+            out.extend((d.len() as u32).to_be_bytes());
+            let mut td = ty.to_vec();
+            td.extend(d);
+            out.extend(&td);
+            out.extend(crc(&td).to_be_bytes());
+        }
+        let mut raw = Vec::new();
+        for _ in 0..h {
+            raw.push(0);
+            raw.extend(std::iter::repeat(shade).take(3 * w as usize));
+        }
+        assert!(raw.len() < 65536, "one stored block");
+        let (mut a, mut b) = (1u32, 0u32);
+        for &x in &raw {
+            a = (a + x as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        let mut z = vec![0x78, 0x01, 0x01];
+        z.extend((raw.len() as u16).to_le_bytes());
+        z.extend((!(raw.len() as u16)).to_le_bytes());
+        z.extend(&raw);
+        z.extend(((b << 16) | a).to_be_bytes());
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend(w.to_be_bytes());
+        ihdr.extend(h.to_be_bytes());
+        ihdr.extend([8, 2, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &z);
+        chunk(&mut png, b"IEND", &[]);
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::from("data:image/png;base64,");
+        for c in png.chunks(3) {
+            let v = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            s.push(T[(v >> 18) as usize & 63] as char);
+            s.push(T[(v >> 12) as usize & 63] as char);
+            s.push(if c.len() > 1 { T[(v >> 6) as usize & 63] as char } else { '=' });
+            s.push(if c.len() > 2 { T[v as usize & 63] as char } else { '=' });
+        }
+        json!({"type": "image_url", "image_url": {"url": s}})
+    }
+
+    #[cfg(feature = "ink")]
+    #[test]
+    fn the_oldest_pictures_of_a_request_beyond_the_limits_are_left_out() {
+        // a conversation of n turns, one 80 x 40 picture (2 image tokens) a turn, the first one in a tool message
+        let convo = |n: usize| -> Vec<Json> {
+            (0..n)
+                .flat_map(|i| {
+                    let role = if i == 0 { "tool" } else { "user" };
+                    [json!({"role": role, "content": [{"type": "text", "text": format!("turn {i}")}, png_part(80, 40, i as u8)]}), json!({"role": "assistant", "content": "ok"})]
+                })
+                .collect()
+        };
+        let shape = |m: &[Json]| -> Vec<&'static str> {
+            m.iter()
+                .filter_map(|m| m["content"].as_array())
+                .map(|p| {
+                    if p[1]["type"] == "image_url" {
+                        assert_eq!(p[1], json!({"type": "image_url"}));
+                        "pic"
+                    } else {
+                        assert_eq!(p[1], json!({"type": "text", "text": "[earlier picture omitted]"}));
+                        "gone"
+                    }
+                })
+                .collect()
+        };
+        let lim = fe_ink::images::Limits { max_images: 8, max_tokens: 1000, max_tokens_each: 100, max_bytes: 1 << 20, drop_oldest: true };
+        assert_eq!(lim.overflow_batch(), 2);
+        // within the limits: nothing is left out
+        let mut m = convo(8);
+        let (pics, omitted) = take_pictures(&mut m, &lim).unwrap();
+        assert_eq!((pics.len(), omitted), (8, 0));
+        assert_eq!(pics[0].tokens(), 2);
+        // 9 and 10 pictures: the same 2 left out, in place; the kept ones are the newest, in order
+        let mut keys = Vec::new();
+        for n in [9, 10] {
+            let mut m = convo(n);
+            let (pics, omitted) = take_pictures(&mut m, &lim).unwrap();
+            assert_eq!((pics.len(), omitted), (n - 2, 2), "n {n}");
+            let s = shape(&m);
+            assert!(s[..2].iter().all(|x| *x == "gone") && s[2..].iter().all(|x| *x == "pic"), "{s:?}");
+            keys.push(pics.iter().map(|p| p.key).collect::<Vec<_>>());
+        }
+        // the prompt cache's view: the pictures of the 9-picture request lead the 10-picture request
+        assert_eq!(keys[0][..], keys[1][..7]);
+        assert_eq!(take_pictures(&mut convo(11), &lim).unwrap().1, 4);
+        // the token limit: 2 tokens a picture, 5 fit in 11 tokens; 6 pictures lose 2
+        let tight = fe_ink::images::Limits { max_tokens: 11, ..lim };
+        assert_eq!(take_pictures(&mut convo(5), &tight).unwrap().1, 0);
+        let (pics, omitted) = take_pictures(&mut convo(6), &tight).unwrap();
+        assert_eq!((pics.len(), omitted), (4, 2));
+        // a bad picture is still refused, also among the oldest
+        let mut m = convo(9);
+        m[0]["content"][1] = json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}});
+        assert!(take_pictures(&mut m, &lim).unwrap_err().contains("does not fetch"));
+        // INK_IMAGE_OVERFLOW=reject: HTTP 400 as before
+        let reject = fe_ink::images::Limits { drop_oldest: false, ..lim };
+        assert_eq!(take_pictures(&mut convo(8), &reject).unwrap().0.len(), 8);
+        let e = take_pictures(&mut convo(9), &reject).unwrap_err();
+        assert!(e.starts_with("messages[16].content[1]:") && e.contains("more than 8 pictures in one request (INK_IMAGE_MAX)"), "{e}");
+        let e = take_pictures(&mut convo(6), &fe_ink::images::Limits { drop_oldest: false, ..tight }).unwrap_err();
+        assert!(e.contains("more than 11 image tokens") && e.contains("INK_IMAGE_TOKENS"), "{e}");
+    }
+
+    #[test]
+    fn usage_names_omitted_pictures_only_when_there_are_some() {
+        let o = Outcome { finish_reason: "stop", reasoning_tokens: 0, error: None, completion_tokens: 2, cached_prompt_tokens: 3, timings: None };
+        let plain = usage(10, &o, 0);
+        assert_eq!(plain["prompt_tokens_details"], json!({"cached_tokens": 3}));
+        let u = usage(10, &o, 16);
+        assert_eq!(u["prompt_tokens_details"], json!({"cached_tokens": 3, "images_omitted": 16}));
+        assert_eq!(u["prompt_tokens"], plain["prompt_tokens"]);
     }
 
     fn prepared(include_usage: bool) -> Prepared {
@@ -1718,6 +1926,7 @@ mod tests {
             created: 1,
             prompt_ids: vec![1, 2, 3],
             images: Vec::new(),
+            images_omitted: 0,
             snapshots: Vec::new(),
             params: SamplingParams::default(),
             stops: Vec::new(),

@@ -458,7 +458,7 @@ fn main() -> Result<()> {
             // --image: every run of the placeholder id is one picture; its rows carry the picture's id in the forward
             let mut fwd_ids = ids.clone();
             if let Some(files) = opt("--image") {
-                let lim = images::Limits { max_images: usize::MAX, max_tokens: usize::MAX, max_tokens_each: usize::MAX, max_bytes: usize::MAX };
+                let lim = images::Limits { max_images: usize::MAX, max_tokens: usize::MAX, max_tokens_each: usize::MAX, max_bytes: usize::MAX, drop_oldest: false };
                 let mut pics = vec![];
                 for f in files.split(',') {
                     pics.push(images::intake(&std::fs::read(f).with_context(|| f.to_string())?, &lim).map_err(|e| anyhow::anyhow!("{f}: {e}"))?);

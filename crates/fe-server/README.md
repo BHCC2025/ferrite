@@ -119,9 +119,20 @@ completion_tokens / total_tokens / prompt_tokens_details.cached_tokens`. Streams
 - A chat message of role `user` or `tool` may hold `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`
   parts (PNG or JPEG; `image_url` may also be the URL string itself; `input_image` and `image` parts with such a URL are
   read the same way). Any other URL (`http`, `https`, `file`) is refused with HTTP 400: the server never fetches a picture.
-- The server decodes each picture, checks the limits (`INK_IMAGE_MAX` 16 pictures, `INK_IMAGE_TOKENS` 16384 image tokens a
-  request, `INK_IMAGE_MB` 20 MiB a file, at most 16,384 pixels a side and 100 million pixels; HTTP 400 beyond them) and lets
-  the chat template place it.
+- The server decodes each picture, checks the limits (`INK_IMAGE_MB` 20 MiB a file, at most 16,384 pixels a side and
+  100 million pixels; HTTP 400 beyond them) and lets the chat template place it.
+- Limits of a request: `INK_IMAGE_MAX` 64 pictures and `INK_IMAGE_TOKENS` 49152 image tokens, all pictures together. A request
+  beyond one of them is not refused. The server leaves out the oldest pictures (message order, then part order): each such
+  image part becomes the text part `[earlier picture omitted]`, in place. An agent that sends every screenshot of a long
+  session again with each turn keeps working.
+- The number left out is `fe_ink::images::omit_count`: the smallest multiple of B = max(1, `INK_IMAGE_MAX` / 4) that makes the
+  newest pictures fit both limits (defaults, equal pictures within the token limit: 0 up to 64 pictures, 16 for 65 to 80,
+  32 for 81 to 96). It is batched for the prompt cache: between two batches every turn starts with the same prompt and resumes
+  the cache; only the turn that drops a batch processes its prompt again. If no multiple fits (limits smaller than one batch
+  of the pictures), the smallest count that fits, with a warning in the log.
+- Such a request logs `image overflow: K of N pictures left out, oldest first (k = K, batch B = B); kept ...` and reports
+  `usage.prompt_tokens_details.images_omitted` (absent when 0). A picture that is left out is checked from its header only.
+- `INK_IMAGE_OVERFLOW=reject` refuses such a request with HTTP 400 instead (`drop` is the default).
 - A picture above `INK_IMAGE_TOKENS_EACH` (2304 image tokens = 2560 x 1440) is not refused: the server shrinks it (Lanczos3,
   aspect ratio kept, `fe_ink::images::fit_size`) until it fits, so 3840 x 2160 becomes 2560 x 1440. A picture within the
   limit keeps its pixels; none is enlarged. The log line `ink vision: picture of W x H pixels ... shrunk to W' x H'` tells.
@@ -130,7 +141,7 @@ completion_tokens / total_tokens / prompt_tokens_details.cached_tokens`. Streams
   id that stands for its pixels (SHA-256), so the prompt cache reuses the same picture and never another one.
 - A picture in a message of another role is refused by the chat template (HTTP 400). Other part types (audio, video) still
   become a text placeholder. The request body may be up to 256 MiB on such a server (32 MiB otherwise).
-- `tools/e2e_images.py` runs the image checks against a running server.
+- `tools/e2e_images.py` runs the image checks against a running server (`overflow`: a conversation that grows to 90 pictures).
 
 ## Engine trait (`src/engine.rs`)
 

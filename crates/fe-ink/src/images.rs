@@ -29,26 +29,87 @@ pub fn is_image_id(id: u32) -> bool {
     id >= IMG_ID_BASE
 }
 
-/// Limits of a request (settings). A request beyond them is refused with a clear message, except for `max_tokens_each`: a picture
-/// above it is shrunk to fit.
+/// Limits of a request (settings). A picture above `max_tokens_each` is shrunk to fit. A request with more pictures than
+/// `max_images` or more image tokens than `max_tokens` loses its oldest pictures ([`omit_count`]), or is refused when `drop_oldest`
+/// is off. A request beyond the other limits is refused with a clear message.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// pictures a request (INK_IMAGE_MAX, default 16)
+    /// pictures a request (INK_IMAGE_MAX, default 64)
     pub max_images: usize,
-    /// image tokens a request, all pictures together (INK_IMAGE_TOKENS, default 16384)
+    /// image tokens a request, all pictures together (INK_IMAGE_TOKENS, default 49152)
     pub max_tokens: usize,
     /// image tokens of one picture (INK_IMAGE_TOKENS_EACH, default 2304 = 2560 x 1440); a larger picture is shrunk to fit
     pub max_tokens_each: usize,
     /// bytes of one picture file (INK_IMAGE_MB, default 20)
     pub max_bytes: usize,
+    /// past `max_images` or `max_tokens`: true = the oldest pictures of the request are left out (INK_IMAGE_OVERFLOW=drop, the
+    /// default), false = the request is refused (INK_IMAGE_OVERFLOW=reject)
+    pub drop_oldest: bool,
 }
 
 impl Limits {
     pub fn from_env() -> Limits {
         let e = |n: &str, d: usize| std::env::var(n).ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(d);
-        Limits { max_images: e("INK_IMAGE_MAX", 16), max_tokens: e("INK_IMAGE_TOKENS", 16384), max_tokens_each: e("INK_IMAGE_TOKENS_EACH", 2304),
-            max_bytes: e("INK_IMAGE_MB", 20) << 20 }
+        let drop_oldest = match std::env::var("INK_IMAGE_OVERFLOW").ok().map(|v| v.trim().to_lowercase()).as_deref() {
+            None | Some("") | Some("drop") => true,
+            Some("reject") => false,
+            Some(v) => {
+                eprintln!("ink vision: INK_IMAGE_OVERFLOW={v} is not drop or reject; using drop");
+                true
+            }
+        };
+        Limits { max_images: e("INK_IMAGE_MAX", 64), max_tokens: e("INK_IMAGE_TOKENS", 49152), max_tokens_each: e("INK_IMAGE_TOKENS_EACH", 2304),
+            max_bytes: e("INK_IMAGE_MB", 20) << 20, drop_oldest }
     }
+
+    /// The step of [`omit_count`]: a quarter of `max_images`, at least 1 (16 by default).
+    pub fn overflow_batch(&self) -> usize {
+        (self.max_images / 4).max(1)
+    }
+}
+
+/// How many of the oldest pictures of a request are left out so that the rest fit `lim.max_images` and `lim.max_tokens`.
+/// `tokens`: the image tokens of every picture of the request, oldest first. The answer is the smallest multiple of
+/// [`Limits::overflow_batch`] that makes the newest pictures fit. It moves in whole batches so that it changes rarely while a
+/// conversation grows: between two changes every request starts with the same prompt, and the prompt cache resumes it.
+/// If no multiple below the picture count fits (the limits are smaller than one batch of pictures), the smallest count that fits.
+pub fn omit_count(tokens: &[usize], lim: &Limits) -> usize {
+    let n = tokens.len();
+    // tail[k] = image tokens of the pictures k.. (the newest n - k)
+    let mut tail = vec![0usize; n + 1];
+    for k in (0..n).rev() {
+        tail[k] = tail[k + 1].saturating_add(tokens[k]);
+    }
+    let fits = |k: usize| n - k <= lim.max_images && tail[k] <= lim.max_tokens;
+    let b = lim.overflow_batch();
+    let mut k = 0;
+    while k < n {
+        if fits(k) {
+            return k;
+        }
+        k += b;
+    }
+    if n == 0 {
+        return 0;
+    }
+    // past the last multiple: one by one (k = n always fits)
+    let mut k = (n - 1) / b * b + 1;
+    while !fits(k) {
+        k += 1;
+    }
+    k
+}
+
+/// The image tokens a picture file will take in the prompt, from its header alone (nothing is decoded): the size check of
+/// [`intake`] and the shrink of [`fit_size`] applied to the size the header gives.
+pub fn header_tokens(bytes: &[u8], lim: &Limits) -> Result<usize, String> {
+    if bytes.len() > lim.max_bytes {
+        return Err(format!("image: the picture file is {:.1} MiB; the limit is {} MiB (INK_IMAGE_MB)", bytes.len() as f64 / 1048576.0, lim.max_bytes >> 20));
+    }
+    let (w, h) = vision::dimensions(bytes).map_err(|e| format!("{e:#}"))?;
+    check_size(w, h)?;
+    let (nw, nh) = fit_size(w, h, lim.max_tokens_each);
+    Ok(nw.div_ceil(CELL) * nh.div_ceil(CELL))
 }
 
 /// A decoded picture of a request.
@@ -507,7 +568,7 @@ mod tests {
 
     #[test]
     fn intake_counts_tokens_and_tells_pictures_apart() {
-        let lim = Limits { max_images: 16, max_tokens: 16384, max_tokens_each: 300, max_bytes: 1 << 20 };
+        let lim = Limits { max_images: 16, max_tokens: 16384, max_tokens_each: 300, max_bytes: 1 << 20, drop_oldest: true };
         let a = intake(&png(800, 600, 1), &lim).unwrap();
         assert_eq!((a.width, a.height, a.rows(), a.cols(), a.tokens()), (800, 600, 15, 20, 300));
         assert_eq!(a.rgb.len(), 800 * 600 * 3);
@@ -564,7 +625,7 @@ mod tests {
 
     #[test]
     fn a_large_picture_is_shrunk_and_a_small_one_is_untouched() {
-        let lim = Limits { max_images: 16, max_tokens: 16384, max_tokens_each: 300, max_bytes: 64 << 20 };
+        let lim = Limits { max_images: 16, max_tokens: 16384, max_tokens_each: 300, max_bytes: 64 << 20, drop_oldest: true };
         // within the budget: the pixels are the decoder's, bit for bit
         let file = png(800, 600, 3);
         let a = intake(&file, &lim).unwrap();
@@ -591,13 +652,83 @@ mod tests {
 
     #[test]
     fn an_absurd_size_is_refused_from_the_header() {
-        let lim = Limits { max_images: 16, max_tokens: 16384, max_tokens_each: 2304, max_bytes: 1 << 20 };
+        let lim = Limits { max_images: 16, max_tokens: 16384, max_tokens_each: 2304, max_bytes: 1 << 20, drop_oldest: true };
         let e = intake(&png(16385, 1, 0), &lim).unwrap_err();
         assert!(e.contains("16385 x 1") && e.contains("too large"), "{e}");
         assert!(intake(&png(1, 16385, 0), &lim).is_err());
         assert!(intake(&png(16384, 1, 0), &lim).is_ok());
         assert!(check_size(16384, 6103).is_ok());
         assert!(check_size(10001, 10000).is_err());
+    }
+
+    #[test]
+    fn the_oldest_pictures_are_omitted_in_batches() {
+        let lim = Limits { max_images: 64, max_tokens: 49152, max_tokens_each: 2304, max_bytes: 1 << 20, drop_oldest: true };
+        assert_eq!(lim.overflow_batch(), 16);
+        let k = |n: usize, each: usize, lim: &Limits| omit_count(&vec![each; n], lim);
+        // screenshots of 640 image tokens: the count limit binds (64 x 640 = 40960 tokens)
+        for n in 0..=64 {
+            assert_eq!(k(n, 640, &lim), 0, "n {n}");
+        }
+        // stability: one value of k for a whole batch of new pictures
+        for n in 65..=80 {
+            assert_eq!(k(n, 640, &lim), 16, "n {n}");
+        }
+        for n in 81..=96 {
+            assert_eq!(k(n, 640, &lim), 32, "n {n}");
+        }
+        assert_eq!(k(97, 640, &lim), 48);
+        // k never falls while a conversation grows, and it is always a multiple of the batch here
+        let mut last = 0;
+        for n in 0..400 {
+            let v = k(n, 640, &lim);
+            assert!(v >= last && v % 16 == 0 && n - v <= 64, "n {n} k {v}");
+            last = v;
+        }
+        // token-limited: 2304 tokens a picture, 21 fit in 49152; the same multiples of 16
+        for n in 0..=21 {
+            assert_eq!(k(n, 2304, &lim), 0, "n {n}");
+        }
+        for n in 22..=37 {
+            assert_eq!(k(n, 2304, &lim), 16, "n {n}");
+        }
+        for n in 38..=53 {
+            assert_eq!(k(n, 2304, &lim), 32, "n {n}");
+        }
+        // mixed sizes, oldest first: 20 large pictures then 50 small ones. 70 pictures: the count asks for 16 out; the newest
+        // 54 are 4 x 2304 + 50 x 300 = 24216 tokens, which fit
+        let mut t = vec![2304; 20];
+        t.extend(vec![300; 50]);
+        assert_eq!(omit_count(&t, &lim), 16);
+        // the newest pictures are the large ones: 50 small then 30 large = 84120 tokens. k = 48: 2 x 300 + 30 x 2304 = 69720, too
+        // many; k = 64: 16 x 2304 = 36864 fits
+        let mut t = vec![300; 50];
+        t.extend(vec![2304; 30]);
+        assert_eq!(omit_count(&t, &lim), 64);
+        // small limits: the batch is at least 1
+        let small = Limits { max_images: 2, max_tokens: 100, ..lim };
+        assert_eq!(small.overflow_batch(), 1);
+        assert_eq!(k(2, 10, &small), 0);
+        assert_eq!(k(3, 10, &small), 1);
+        assert_eq!(k(5, 60, &small), 4);
+        // no multiple of the batch below n fits: the smallest count that does; a picture above the request limit goes too
+        let odd = Limits { max_images: 64, max_tokens: 1000, ..lim };
+        assert_eq!(k(20, 640, &odd), 19);
+        assert_eq!(k(20, 2000, &odd), 20);
+        assert_eq!(k(1, 2000, &odd), 1);
+        assert_eq!(k(0, 2000, &odd), 0);
+    }
+
+    #[test]
+    fn header_tokens_equal_the_tokens_of_the_picture_taken_in() {
+        let lim = Limits { max_images: 64, max_tokens: 49152, max_tokens_each: 300, max_bytes: 64 << 20, drop_oldest: true };
+        for (w, h) in [(800u32, 600u32), (1280, 800), (1920, 1080), (300, 1000), (41, 81)] {
+            let f = png(w, h, 5);
+            assert_eq!(header_tokens(&f, &lim).unwrap(), intake(&f, &lim).unwrap().tokens(), "{w} x {h}");
+        }
+        assert!(header_tokens(&png(16385, 1, 0), &lim).unwrap_err().contains("too large"));
+        assert!(header_tokens(b"GIF89a not a picture", &lim).is_err());
+        assert!(header_tokens(&png(64, 64, 1), &Limits { max_bytes: 10, ..lim }).unwrap_err().contains("INK_IMAGE_MB"));
     }
 
     #[test]

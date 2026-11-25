@@ -194,17 +194,37 @@ A chat request may hold pictures: `image_url` content parts with a `data:` URL, 
   tokens) shrunk to 2560 x 1440`. On the test pictures (a chart and a settings screen of 3840 x 2160 with text 24 to 96 pixels
   high) every line of text is read correctly after the shrink. For the full detail of a larger picture set
   `INK_IMAGE_TOKENS_EACH` higher (5184 takes 3840 x 2160 whole); the encoder then needs much longer (table below).
-- **Limits of a request** (HTTP 400 with the reason beyond them; a picture above `INK_IMAGE_TOKENS_EACH` is shrunk instead):
+- **Limits of a request:**
 
-  | Setting | Default | What it limits |
-  |---|---|---|
-  | `INK_IMAGE_MAX` | 16 | pictures in one request |
-  | `INK_IMAGE_TOKENS` | 16384 | image tokens in one request, all pictures together |
-  | `INK_IMAGE_TOKENS_EACH` | 2304 | image tokens of one picture (2560 x 1440); a larger picture is shrunk to fit |
-  | `INK_IMAGE_MB` | 20 | size of one picture file, MiB |
+  | Setting | Default | What it limits | Beyond it |
+  |---|---|---|---|
+  | `INK_IMAGE_MAX` | 64 | pictures in one request | the oldest pictures are left out |
+  | `INK_IMAGE_TOKENS` | 49152 | image tokens in one request, all pictures together | the oldest pictures are left out |
+  | `INK_IMAGE_TOKENS_EACH` | 2304 | image tokens of one picture (2560 x 1440) | the picture is shrunk to fit |
+  | `INK_IMAGE_MB` | 20 | size of one picture file, MiB | HTTP 400 |
+  | `INK_IMAGE_OVERFLOW` | `drop` | what happens beyond the first two limits | `reject`: HTTP 400 instead |
 
   A picture file with a side above 16,384 pixels or with more than 100 million pixels is refused (HTTP 400) before it is decoded.
   The request body may be up to 256 MiB.
+- **A long session is never refused for its pictures.** An agent sends the whole conversation again with every turn, with every
+  screenshot it ever looked at. When a request holds more than `INK_IMAGE_MAX` pictures or more than `INK_IMAGE_TOKENS` image
+  tokens, the server leaves out the oldest pictures of the conversation (message order, then part order). Each one becomes the
+  text `[earlier picture omitted]` in its place; the text around it stays. The newest pictures are always kept.
+  - **They go in batches, for the prompt cache.** The number left out is the smallest multiple of B that makes the rest fit, with
+    B = `INK_IMAGE_MAX` / 4 (16 by default; at least 1). With the defaults and screenshots of 1280 x 800: up to 64 pictures none is
+    left out, with 65 to 80 pictures the oldest 16, with 81 to 96 the oldest 32. Dropping one picture a turn would change the
+    start of the prompt on every turn, and every turn would process the whole conversation again. In batches the start stays
+    the same for 16 turns, and the prompt cache resumes each of them.
+  - **Measured** (a conversation that gains one 1280 x 800 screenshot a turn, up to 90 pictures; no turn refused): on the
+    RTX 5060 Ti the turns between two batches start their answer after 1.6 s (median; 2.0 s at 40,000 tokens; prompts of up to
+    43,800 tokens, all but the new picture from the cache). The turn that drops a batch (65 and 81) processes its 33,700 to
+    34,400 tokens again once: 32 s. The kept pictures are not encoded again there (their rows are in host memory). On the
+    RTX PRO 4000 (70 pictures): 1.1 s, and 20 s for the turn that drops a batch.
+  - The log says `image overflow: 16 of 65 pictures left out, oldest first (k = 16, batch B = 16); kept 49 pictures, 31360 image
+    tokens`. The response says it in `usage.prompt_tokens_details.images_omitted` (the key is absent when nothing was left out).
+  - If the limits are smaller than one batch of the request's pictures, the server leaves out as many as needed, one by one, and
+    logs a warning. A picture that is left out is still checked from its file header (format, size), but it is not decoded.
+  - `INK_IMAGE_OVERFLOW=reject` brings back the refusal: HTTP 400 with the limit's name.
 - **Each picture is encoded once.** The vision encoder runs when the picture first arrives:
 
   | picture | image tokens | RTX 5060 Ti | RTX PRO 4000 |
@@ -493,7 +513,8 @@ transparency, two charts in one request), each with a question and its reply.
 
 ## Limits
 
-- **Pictures:** PNG and JPEG in `data:` URLs only, at most 16 pictures and 16,384 image tokens a request. A picture above 2,304
+- **Pictures:** PNG and JPEG in `data:` URLs only. The model sees at most 64 pictures and 49,152 image tokens a request; a request
+  with more is taken, and its oldest pictures are left out (16 at a time). A picture above 2,304
   image tokens (2560 x 1440) is shrunk to that size; the encoder takes 5.7 s for it on the RTX 5060 Ti ([Images](#images)). No audio, no video. Image input was not run on a DGX Spark yet.
 - **Four requests at once** on the 24 GB card and on a DGX Spark (up to eight there with `INK_LANES`), one on the 16 GB card by default;
   more wait in the queue. Each lane's prompt cache follows
@@ -544,7 +565,8 @@ These are the engine's own settings, its whole interface. The launcher sets them
 | `INK_DRAFT_MAX_CTX=n` | the draft head is loaded only for requests of at most n tokens (prompt plus answer) [no limit] |
 | `INK_FOLD=file` | where the draft head's fold tables are kept [`$INK_DIR/fold.safetensors`] |
 | `INK_PCACHE=0` | prompt cache off: every request prefills its whole prompt [on] |
-| `INK_IMAGE_MAX`, `INK_IMAGE_TOKENS`, `INK_IMAGE_TOKENS_EACH`, `INK_IMAGE_MB` | the limits of image input [16 pictures, 16384 image tokens a request, 2304 a picture (a larger picture is shrunk to fit), 20 MiB a file] ([Images](#images)) |
+| `INK_IMAGE_MAX`, `INK_IMAGE_TOKENS`, `INK_IMAGE_TOKENS_EACH`, `INK_IMAGE_MB` | the limits of image input [64 pictures, 49152 image tokens a request, 2304 a picture (a larger picture is shrunk to fit), 20 MiB a file] ([Images](#images)) |
+| `INK_IMAGE_OVERFLOW=drop\|reject` | a request with more pictures or image tokens than the limits: leave out its oldest pictures, a quarter of `INK_IMAGE_MAX` at a time, or refuse it with HTTP 400 [`drop`] |
 | `INK_IMAGE_CACHE_MB=n` | host memory for the rows of recent pictures [256; `0` keeps none] |
 | `INK_VISION_SCORE_MB=n` | card memory for the vision encoder's attention scores while a picture is encoded [64] |
 | `INK_PCACHE_EVERY=n` | prompt-cache marks every n positions besides the prompt end [8192; `0` = the prompt end only] |

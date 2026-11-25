@@ -188,7 +188,7 @@ again (finished steps are skipped):
 curl -fsSL https://raw.githubusercontent.com/BHCC2025/ferrite/main/scripts/install.sh | bash
 ```
 
-It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.8` pins one; a few minutes
+It builds the latest release from source into `~/ferrite` (`FERRITE_HOME`; `--version 0.9.9` pins one; a few minutes
 the first time: rustup, the pinned toolchains, `cargo build`) and puts the models into
 `/var/tmp/models` (`FERRITE_MODELS`). It starts the server in the background (log `~/ferrite/logs/server-8000.log`;
 stop it with `~/ferrite/scripts/ferritectl.sh stop`) and sends it a test request. `--no-serve` stops after the

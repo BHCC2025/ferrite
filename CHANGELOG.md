@@ -4,6 +4,24 @@ Notable changes to Ferrite, newest release first. Every section below is a tagge
 available. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9] - 2026-11-25
+
+### Changed
+
+- **Inkling-2-Mini: a long conversation with many pictures is no longer refused.** An agent harness resends the whole
+  conversation every turn, with every screenshot it has looked at, so 0.9.8's limit of 16 pictures a request stopped long agent
+  sessions with an HTTP 400. Now:
+  - **Higher defaults:** 64 pictures and 49,152 image tokens a request (`INK_IMAGE_MAX`, `INK_IMAGE_TOKENS`).
+  - **Oldest pictures left out:** past either limit, the oldest pictures are left out and each becomes the text "[earlier
+    picture omitted]" in place. The response reports the count in `usage.prompt_tokens_details.images_omitted`.
+  - **Left out in batches of a quarter of the limit (16 by default),** so the start of the conversation stays the same from
+    turn to turn and the prompt cache keeps working. A conversation that adds one screenshot a turn re-processes its prompt
+    once at picture 65 and once at picture 81, and resumes from the cache on every turn in between.
+  - **The 0.9.8 behaviour on request:** `INK_IMAGE_OVERFLOW=reject` refuses such a request as before.
+  - **Other refusals are unchanged:** a broken picture, an `http(s)` or `file` URL, or a file over 20 MiB is still refused.
+- **Text-only requests:** no change in output or speed.
+- Version 0.9.9.
+
 ## [0.9.8] - 2026-11-25
 
 ### Added
